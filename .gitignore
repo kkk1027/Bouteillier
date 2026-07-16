@@ -1,0 +1,34 @@
+# ROS 2 and colcon generated output
+/build/
+/install/
+/log/
+**/build/
+**/install/
+**/log/
+.colcon/
+
+# PlatformIO generated files
+**/.pio/
+
+# Python caches and packaging output
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Local IDE settings and per-user project files
+*.user
+*.user.*
+
+# Local backups and logs
+*.bak
+*.last_backup
+*.log
+
+# Secrets and machine-specific environment files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pt
