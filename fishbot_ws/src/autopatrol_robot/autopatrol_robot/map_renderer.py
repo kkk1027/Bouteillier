@@ -24,6 +24,11 @@ class MapRenderSettings:
     corner_snap_m: float = 2.10
     duplicate_wall_separation_m: float = 0.45
     duplicate_wall_overlap_m: float = 0.70
+    max_unclosed_gap_m: float = 3.50
+    closure_axis_alignment: float = 0.90
+    near_round_circularity: float = 0.76
+    near_round_aspect: float = 0.84
+    near_round_disk_ratio: float = 0.68
     main_body_anchor_ratio: float = 0.35
     wall_width_m: float = 0.08
     min_round_radius_m: float = 0.10
@@ -39,6 +44,7 @@ class MapRenderStats:
     bridged_gaps: int = 0
     vector_segments: int = 0
     removed_duplicate_segments: int = 0
+    closed_wall_gaps: int = 0
     regularized_shapes: int = 0
     source_width: int = 0
     source_height: int = 0
@@ -254,11 +260,13 @@ class OccupancyMapRenderer:
             joins,
             join_pixels,
             removed_duplicates,
+            closed_gaps,
         ) = self._draw_standard_wall_paths(
             skeleton, resolution, scale, wall_width
         )
         stats.vector_segments = segments
         stats.removed_duplicate_segments = removed_duplicates
+        stats.closed_wall_gaps = closed_gaps
         stats.bridged_gaps += joins
         stats.filled_gap_pixels += join_pixels
         stats.regularized_shapes = self._regularize_round_obstacles(
@@ -290,7 +298,7 @@ class OccupancyMapRenderer:
             maxLineGap=max_gap,
         )
         if lines is None:
-            return canvas, 0, 0, 0, 0
+            return canvas, 0, 0, 0, 0, 0
 
         accepted: list[tuple[int, int, int, int]] = []
         for x1, y1, x2, y2 in lines[:, 0]:
@@ -322,16 +330,108 @@ class OccupancyMapRenderer:
                 cv2.LINE_AA,
             )
 
+        closed_gaps, closed_pixels = self._close_open_wall_gaps(
+            canvas, snapped, resolution, scale, wall_width
+        )
         joins, join_pixels = self._bridge_vector_line_endpoints(
             canvas, snapped, resolution, scale, wall_width
         )
         return (
             canvas,
             len(snapped),
-            corner_joins + final_corner_joins + joins,
-            corner_pixels + final_corner_pixels + join_pixels,
+            corner_joins + final_corner_joins + closed_gaps + joins,
+            corner_pixels + final_corner_pixels + closed_pixels + join_pixels,
             removed_duplicates,
+            closed_gaps,
         )
+
+    def _close_open_wall_gaps(
+        self,
+        canvas: np.ndarray,
+        lines: list[tuple[int, int, int, int]],
+        resolution: float,
+        scale: int,
+        wall_width: int,
+    ) -> tuple[int, int]:
+        """Close compatible open wall endpoints after all topology filtering."""
+        segments = [
+            np.array([[x1, y1], [x2, y2]], dtype=float)
+            for x1, y1, x2, y2 in lines
+        ]
+        if len(segments) < 2:
+            return 0, 0
+        endpoints = []
+        tolerance = max(2.5, wall_width / max(scale, 1) + 1.0)
+        for line_index, segment in enumerate(segments):
+            direction = segment[1] - segment[0]
+            length = float(np.linalg.norm(direction))
+            if length < 1.0:
+                continue
+            direction /= length
+            for endpoint_index, point in enumerate(segment):
+                nearest_wall = min(
+                    self._point_to_segment_distance(point, other[0], other[1])
+                    for other_index, other in enumerate(segments)
+                    if other_index != line_index
+                )
+                if nearest_wall <= tolerance:
+                    continue
+                outward = -direction if endpoint_index == 0 else direction
+                endpoints.append((line_index, endpoint_index, point, outward))
+
+        maximum_gap = max(4.0, self.settings.max_unclosed_gap_m / resolution)
+        candidates = []
+        for first in range(len(endpoints) - 1):
+            first_line, _, first_point, first_outward = endpoints[first]
+            for second in range(first + 1, len(endpoints)):
+                second_line, _, second_point, second_outward = endpoints[second]
+                if first_line == second_line:
+                    continue
+                delta = second_point - first_point
+                distance = float(np.linalg.norm(delta))
+                if distance < tolerance or distance > maximum_gap:
+                    continue
+                axis_alignment = max(abs(delta[0]), abs(delta[1])) / distance
+                if axis_alignment < self.settings.closure_axis_alignment:
+                    continue
+                # The final completion pass only draws straight horizontal or
+                # vertical boundary closures. Diagonal joins are handled by the
+                # earlier geometry snap and must not cut across a room.
+                candidates.append((distance, distance, first, second))
+
+        used = set()
+        closed = 0
+        pixels = 0
+        for _, distance, first, second in sorted(candidates):
+            if first in used or second in used:
+                continue
+            _, _, first_point, _ = endpoints[first]
+            _, _, second_point, _ = endpoints[second]
+            cv2.line(
+                canvas,
+                (int(round(first_point[0] * scale)), int(round(first_point[1] * scale))),
+                (int(round(second_point[0] * scale)), int(round(second_point[1] * scale))),
+                255,
+                wall_width,
+                cv2.LINE_AA,
+            )
+            used.update((first, second))
+            closed += 1
+            pixels += int(round(distance))
+        return closed, pixels
+
+    @staticmethod
+    def _point_to_segment_distance(
+        point: np.ndarray, start: np.ndarray, end: np.ndarray
+    ) -> float:
+        direction = end - start
+        length_squared = float(np.dot(direction, direction))
+        if length_squared < 1e-6:
+            return float(np.linalg.norm(point - start))
+        projection = float(
+            np.clip(np.dot(point - start, direction) / length_squared, 0.0, 1.0)
+        )
+        return float(np.linalg.norm(point - (start + projection * direction)))
 
     def _remove_parallel_duplicates(
         self,
@@ -713,8 +813,15 @@ class OccupancyMapRenderer:
             area = cv2.contourArea(contour)
             circularity = 4.0 * math.pi * area / max(perimeter * perimeter, 1.0)
             (center_x, center_y), radius = cv2.minEnclosingCircle(contour)
+            disk_ratio = area / max(math.pi * radius * radius, 1.0)
+            strong_round = circularity >= 0.82
+            lightly_damaged_round = (
+                circularity >= self.settings.near_round_circularity
+                and aspect >= self.settings.near_round_aspect
+                and disk_ratio >= self.settings.near_round_disk_ratio
+            )
             if (
-                circularity < 0.82
+                not (strong_round or lightly_damaged_round)
                 or radius < min_radius
                 or radius > max_radius
             ):

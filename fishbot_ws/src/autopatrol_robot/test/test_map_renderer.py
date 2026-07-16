@@ -68,6 +68,36 @@ class TestOccupancyMapRenderer(unittest.TestCase):
         self.assertGreaterEqual(stats.bridged_gaps, 1)
         self.assertEqual(components - 1, 1)
 
+    def test_closes_axis_aligned_open_wall_gap(self):
+        canvas = np.zeros((180, 180), dtype=np.uint8)
+        lines = [(20, 20, 20, 80), (23, 150, 23, 90)]
+
+        closed, _ = self.renderer._close_open_wall_gaps(
+            canvas, lines, 0.05, 1, 2
+        )
+
+        self.assertEqual(closed, 1)
+        self.assertGreater(cv2.countNonZero(canvas[78:93, 18:28]), 0)
+
+    def test_does_not_close_diagonal_open_wall_gap(self):
+        canvas = np.zeros((180, 180), dtype=np.uint8)
+        lines = [(20, 20, 20, 80), (60, 100, 60, 160)]
+
+        closed, _ = self.renderer._close_open_wall_gaps(
+            canvas, lines, 0.05, 1, 2)
+
+        self.assertEqual(closed, 0)
+
+    def test_rebuilds_lightly_damaged_round_obstacle(self):
+        grid = np.full((100, 100), -1, dtype=np.int8)
+        grid[5:95, 5:95] = 0
+        cv2.circle(grid, (50, 50), 5, 100, 1)
+        grid[45, 49:52] = 0
+
+        _, info = self.renderer.render(grid.ravel(), 100, 100, 0.05)
+
+        self.assertEqual(info["regularized_shapes"], 1)
+
     def test_removes_nearby_parallel_duplicate_wall_stroke(self):
         lines = [
             (80, 20, 80, 130),
