@@ -18,10 +18,12 @@ class MapRenderSettings:
     min_island_area_m2: float = 0.012
     min_island_length_m: float = 0.20
     max_gap_m: float = 0.22
+    min_straight_wall_length_m: float = 0.60
+    line_merge_gap_m: float = 0.35
     main_body_anchor_ratio: float = 0.35
     wall_width_m: float = 0.08
-    min_round_radius_m: float = 0.15
-    max_round_radius_m: float = 0.80
+    min_round_radius_m: float = 0.10
+    max_round_radius_m: float = 1.25
     endpoint_direction_probe_px: int = 5
     render_scale: int = 2
 
@@ -238,26 +240,93 @@ class OccupancyMapRenderer:
         stats.bridged_gaps = bridges
         stats.filled_gap_pixels += bridge_pixels
 
-        height, width = skeleton.shape
         wall_width = max(
             2, int(round(self.settings.wall_width_m / resolution * scale))
         )
-        scaled_skeleton = cv2.resize(
-            skeleton,
-            (width * scale, height * scale),
-            interpolation=cv2.INTER_NEAREST,
+        output, segments = self._draw_standard_wall_paths(
+            skeleton, resolution, scale, wall_width
         )
-        kernel_size = wall_width if wall_width % 2 else wall_width + 1
-        output = cv2.dilate(
-            scaled_skeleton,
-            cv2.getStructuringElement(
-                cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
-            ),
-        )
+        stats.vector_segments = segments
         stats.regularized_shapes = self._regularize_round_obstacles(
             obstacles, skeleton, output, resolution, scale, wall_width
         )
         return output
+
+    def _draw_standard_wall_paths(
+        self,
+        skeleton: np.ndarray,
+        resolution: float,
+        scale: int,
+        wall_width: int,
+    ) -> tuple[np.ndarray, int]:
+        """Redraw dominant wall strokes as anti-aliased geometric lines."""
+        height, width = skeleton.shape
+        canvas = np.zeros((height * scale, width * scale), dtype=np.uint8)
+        minimum_length = max(
+            8, int(round(self.settings.min_straight_wall_length_m / resolution))
+        )
+        max_gap = max(3, int(round(self.settings.line_merge_gap_m / resolution)))
+        threshold = max(8, int(round(minimum_length * 0.70)))
+        lines = cv2.HoughLinesP(
+            skeleton,
+            rho=1,
+            theta=math.pi / 360.0,
+            threshold=threshold,
+            minLineLength=minimum_length,
+            maxLineGap=max_gap,
+        )
+        if lines is None:
+            return canvas, 0
+
+        accepted: list[tuple[int, int, int, int]] = []
+        for x1, y1, x2, y2 in lines[:, 0]:
+            candidate = (int(x1), int(y1), int(x2), int(y2))
+            if self._is_redundant_line(candidate, accepted):
+                continue
+            accepted.append(candidate)
+            cv2.line(
+                canvas,
+                (candidate[0] * scale, candidate[1] * scale),
+                (candidate[2] * scale, candidate[3] * scale),
+                255,
+                wall_width,
+                cv2.LINE_AA,
+            )
+
+        return canvas, len(accepted)
+
+    @staticmethod
+    def _is_redundant_line(
+        candidate: tuple[int, int, int, int],
+        accepted: list[tuple[int, int, int, int]],
+    ) -> bool:
+        """Avoid redrawing overlapping Hough detections of the same stroke."""
+        x1, y1, x2, y2 = candidate
+        direction = np.array([x2 - x1, y2 - y1], dtype=float)
+        length = float(np.linalg.norm(direction))
+        if length == 0:
+            return True
+        direction /= length
+        midpoint = np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0])
+
+        for saved in accepted:
+            sx1, sy1, sx2, sy2 = saved
+            saved_direction = np.array([sx2 - sx1, sy2 - sy1], dtype=float)
+            saved_length = float(np.linalg.norm(saved_direction))
+            if saved_length == 0:
+                continue
+            saved_direction /= saved_length
+            if abs(float(np.dot(direction, saved_direction))) < 0.985:
+                continue
+            saved_start = np.array([sx1, sy1], dtype=float)
+            offset = midpoint - saved_start
+            perpendicular = abs(
+                saved_direction[0] * offset[1] - saved_direction[1] * offset[0]
+            )
+            projection = float(np.dot(offset, saved_direction))
+            if perpendicular <= 4.0 and -4.0 <= projection <= saved_length + 4.0:
+                return True
+        return False
 
     def _smooth_wall_mask(
         self, obstacles: np.ndarray, resolution: float
@@ -302,7 +371,7 @@ class OccupancyMapRenderer:
             if not width or not height:
                 continue
             aspect = min(width, height) / max(width, height)
-            if aspect < 0.80:
+            if aspect < 0.72:
                 continue
             component = np.zeros_like(obstacles)
             component[labels == label] = 255
@@ -316,14 +385,8 @@ class OccupancyMapRenderer:
             area = cv2.contourArea(contour)
             circularity = 4.0 * math.pi * area / max(perimeter * perimeter, 1.0)
             (center_x, center_y), radius = cv2.minEnclosingCircle(contour)
-            contour_points = contour.reshape(-1, 2).astype(float)
-            distances = np.linalg.norm(
-                contour_points - np.array([center_x, center_y]), axis=1
-            )
-            radial_error = float(np.std(distances) / max(np.mean(distances), 1.0))
             if (
-                circularity < 0.80
-                or radial_error > 0.13
+                circularity < 0.82
                 or radius < min_radius
                 or radius > max_radius
             ):
@@ -345,7 +408,7 @@ class OccupancyMapRenderer:
             dp=1.2,
             minDist=max(12, min_radius * 2),
             param1=50,
-            param2=14,
+            param2=12,
             minRadius=min_radius,
             maxRadius=max_radius,
         )
@@ -371,7 +434,7 @@ class OccupancyMapRenderer:
                 skeleton.shape[0] - 1,
             )
             support = float(np.mean(distance[sample_y, sample_x] <= support_distance))
-            if support < 0.74:
+            if support < 0.70:
                 continue
             if self._replace_with_standard_circle(
                 output,

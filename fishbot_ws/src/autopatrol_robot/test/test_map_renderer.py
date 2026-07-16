@@ -55,6 +55,27 @@ class TestOccupancyMapRenderer(unittest.TestCase):
         )
         self.assertEqual(components - 1, 1)
 
+    def test_redraws_noisy_wall_as_single_straight_stroke(self):
+        obstacles = np.zeros((120, 160), dtype=np.uint8)
+        points = np.array(
+            [
+                (x, 60 + (3 if (x // 4) % 2 else -3))
+                for x in range(20, 141, 4)
+            ],
+            dtype=np.int32,
+        )
+        cv2.polylines(obstacles, [points], False, 255, 1)
+        cleaned, _ = self.renderer._clean_obstacles(obstacles, 0.05)
+        stats = MapRenderStats()
+
+        walls = self.renderer._draw_vector_walls(cleaned, 0.05, 2, stats)
+        y_coordinates, _ = np.where(walls > 0)
+
+        self.assertEqual(stats.vector_segments, 1)
+        self.assertLessEqual(
+            int(y_coordinates.max() - y_coordinates.min() + 1), 10
+        )
+
     def test_removes_isolated_lines_outside_main_map_body(self):
         obstacles = np.zeros((150, 170), dtype=np.uint8)
         cv2.rectangle(obstacles, (40, 25), (145, 125), 255, 1)
