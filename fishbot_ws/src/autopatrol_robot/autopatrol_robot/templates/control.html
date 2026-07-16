@@ -703,7 +703,9 @@
             const renderInfo = data.render_info;
             const mapMeta = document.getElementById('map-coords');
             if (renderInfo) {
-                const summary = `展示清理：去噪 ${renderInfo.removed_components} 处 · 补全 ${renderInfo.filled_gap_pixels} px`;
+                const bridges = renderInfo.bridged_gaps ?? 0;
+                const shapes = renderInfo.regularized_shapes ?? 0;
+                const summary = "展示清理：去噪 " + renderInfo.removed_components + " 处 · 连线 " + bridges + " 处 · 重构 " + shapes + " 处";
                 mapMeta.textContent = summary;
                 addLog(`地图渲染完成 ${mapWidth}x${mapHeight}，${summary}`, 'success');
             } else {

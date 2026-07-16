@@ -6,7 +6,7 @@ import unittest
 import cv2
 import numpy as np
 
-from autopatrol_robot.map_renderer import OccupancyMapRenderer
+from autopatrol_robot.map_renderer import MapRenderStats, OccupancyMapRenderer
 
 
 class TestOccupancyMapRenderer(unittest.TestCase):
@@ -39,6 +39,28 @@ class TestOccupancyMapRenderer(unittest.TestCase):
         self.assertEqual(info["output_width"], 180)
         self.assertEqual(info["output_height"], 120)
         self.assertGreater(info["regularized_shapes"], 0)
+
+    def test_vectorizer_merges_collinear_wall_fragments(self):
+        obstacles = np.zeros((80, 100), dtype=np.uint8)
+        cv2.line(obstacles, (10, 40), (34, 40), 255, 1)
+        cv2.line(obstacles, (40, 40), (90, 40), 255, 1)
+        stats = MapRenderStats()
+
+        vector = self.renderer._draw_vector_walls(obstacles, 0.05, 2, stats)
+
+        self.assertGreater(stats.vector_segments, 0)
+        self.assertGreater(cv2.countNonZero(vector[76:85, 66:84]), 0)
+
+    def test_rebuilds_broken_circle_as_one_standard_circle(self):
+        grid = np.full((140, 140), -1, dtype=np.int8)
+        grid[10:130, 10:130] = 0
+        cv2.circle(grid, (70, 70), 34, 100, 1)
+        grid[66:75, 104:110] = 0
+
+        _, info = self.renderer.render(grid.ravel(), 140, 140, 0.05)
+
+        self.assertEqual(info["regularized_shapes"], 1)
+        self.assertEqual(info["vector_segments"], 0)
 
 
 if __name__ == "__main__":
