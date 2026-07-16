@@ -20,6 +20,7 @@ class MapRenderSettings:
     max_gap_m: float = 0.22
     min_straight_wall_length_m: float = 0.60
     line_merge_gap_m: float = 0.35
+    vector_join_gap_m: float = 0.85
     main_body_anchor_ratio: float = 0.35
     wall_width_m: float = 0.08
     min_round_radius_m: float = 0.10
@@ -243,10 +244,12 @@ class OccupancyMapRenderer:
         wall_width = max(
             2, int(round(self.settings.wall_width_m / resolution * scale))
         )
-        output, segments = self._draw_standard_wall_paths(
+        output, segments, joins, join_pixels = self._draw_standard_wall_paths(
             skeleton, resolution, scale, wall_width
         )
         stats.vector_segments = segments
+        stats.bridged_gaps += joins
+        stats.filled_gap_pixels += join_pixels
         stats.regularized_shapes = self._regularize_round_obstacles(
             obstacles, skeleton, output, resolution, scale, wall_width
         )
@@ -258,8 +261,8 @@ class OccupancyMapRenderer:
         resolution: float,
         scale: int,
         wall_width: int,
-    ) -> tuple[np.ndarray, int]:
-        """Redraw dominant wall strokes as anti-aliased geometric lines."""
+    ) -> tuple[np.ndarray, int, int, int]:
+        """Redraw dominant wall strokes and bridge their geometric endpoints."""
         height, width = skeleton.shape
         canvas = np.zeros((height * scale, width * scale), dtype=np.uint8)
         minimum_length = max(
@@ -276,7 +279,7 @@ class OccupancyMapRenderer:
             maxLineGap=max_gap,
         )
         if lines is None:
-            return canvas, 0
+            return canvas, 0, 0, 0
 
         accepted: list[tuple[int, int, int, int]] = []
         for x1, y1, x2, y2 in lines[:, 0]:
@@ -293,7 +296,82 @@ class OccupancyMapRenderer:
                 cv2.LINE_AA,
             )
 
-        return canvas, len(accepted)
+        joins, join_pixels = self._bridge_vector_line_endpoints(
+            canvas, accepted, resolution, scale, wall_width
+        )
+        return canvas, len(accepted), joins, join_pixels
+
+    def _bridge_vector_line_endpoints(
+        self,
+        canvas: np.ndarray,
+        lines: list[tuple[int, int, int, int]],
+        resolution: float,
+        scale: int,
+        wall_width: int,
+    ) -> tuple[int, int]:
+        """Join compatible Hough endpoints to restore a continuous perimeter."""
+        endpoints = []
+        for line_index, (x1, y1, x2, y2) in enumerate(lines):
+            direction = np.array([x2 - x1, y2 - y1], dtype=float)
+            length = float(np.linalg.norm(direction))
+            if length == 0:
+                continue
+            direction /= length
+            endpoints.extend(
+                [
+                    ((x1, y1), -direction, line_index),
+                    ((x2, y2), direction, line_index),
+                ]
+            )
+
+        max_gap = max(3.0, self.settings.vector_join_gap_m / resolution)
+        candidates = []
+        for first in range(len(endpoints) - 1):
+            first_point, first_direction, first_line = endpoints[first]
+            for second in range(first + 1, len(endpoints)):
+                second_point, second_direction, second_line = endpoints[second]
+                if first_line == second_line:
+                    continue
+                delta = np.array(second_point, dtype=float) - np.array(
+                    first_point, dtype=float
+                )
+                distance = float(np.linalg.norm(delta))
+                if distance < 1.5 or distance > max_gap:
+                    continue
+                direction = delta / distance
+                first_alignment = abs(float(np.dot(first_direction, direction)))
+                second_alignment = abs(
+                    float(np.dot(second_direction, -direction))
+                )
+                aligned = first_alignment >= 0.35 and second_alignment >= 0.35
+                right_angle = (
+                    max(first_alignment, second_alignment) >= 0.85
+                    and min(first_alignment, second_alignment) <= 0.25
+                )
+                if aligned or right_angle:
+                    candidates.append((distance, first, second))
+
+        used = set()
+        joins = 0
+        join_pixels = 0
+        for distance, first, second in sorted(candidates):
+            if first in used or second in used:
+                continue
+            first_point, _, _ = endpoints[first]
+            second_point, _, _ = endpoints[second]
+            cv2.line(
+                canvas,
+                (first_point[0] * scale, first_point[1] * scale),
+                (second_point[0] * scale, second_point[1] * scale),
+                255,
+                wall_width,
+                cv2.LINE_AA,
+            )
+            used.update((first, second))
+            joins += 1
+            join_pixels += int(round(distance))
+
+        return joins, join_pixels
 
     @staticmethod
     def _is_redundant_line(

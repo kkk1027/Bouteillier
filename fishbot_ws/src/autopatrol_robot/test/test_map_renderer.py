@@ -55,6 +55,19 @@ class TestOccupancyMapRenderer(unittest.TestCase):
         )
         self.assertEqual(components - 1, 1)
 
+    def test_joins_detected_wall_lines_across_large_gap(self):
+        obstacles = np.zeros((80, 120), dtype=np.uint8)
+        cv2.line(obstacles, (10, 40), (45, 40), 255, 1)
+        cv2.line(obstacles, (58, 40), (110, 40), 255, 1)
+        cleaned, _ = self.renderer._clean_obstacles(obstacles, 0.05)
+        stats = MapRenderStats()
+
+        walls = self.renderer._draw_vector_walls(cleaned, 0.05, 2, stats)
+        components, _ = cv2.connectedComponents((walls > 0).astype(np.uint8))
+
+        self.assertGreaterEqual(stats.bridged_gaps, 1)
+        self.assertEqual(components - 1, 1)
+
     def test_redraws_noisy_wall_as_single_straight_stroke(self):
         obstacles = np.zeros((120, 160), dtype=np.uint8)
         points = np.array(
