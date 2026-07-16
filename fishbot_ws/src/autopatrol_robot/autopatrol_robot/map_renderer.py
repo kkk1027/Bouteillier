@@ -22,6 +22,8 @@ class MapRenderSettings:
     line_merge_gap_m: float = 0.35
     vector_join_gap_m: float = 0.85
     corner_snap_m: float = 2.10
+    duplicate_wall_separation_m: float = 0.45
+    duplicate_wall_overlap_m: float = 0.70
     main_body_anchor_ratio: float = 0.35
     wall_width_m: float = 0.08
     min_round_radius_m: float = 0.10
@@ -36,6 +38,7 @@ class MapRenderStats:
     filled_gap_pixels: int = 0
     bridged_gaps: int = 0
     vector_segments: int = 0
+    removed_duplicate_segments: int = 0
     regularized_shapes: int = 0
     source_width: int = 0
     source_height: int = 0
@@ -245,10 +248,17 @@ class OccupancyMapRenderer:
         wall_width = max(
             2, int(round(self.settings.wall_width_m / resolution * scale))
         )
-        output, segments, joins, join_pixels = self._draw_standard_wall_paths(
+        (
+            output,
+            segments,
+            joins,
+            join_pixels,
+            removed_duplicates,
+        ) = self._draw_standard_wall_paths(
             skeleton, resolution, scale, wall_width
         )
         stats.vector_segments = segments
+        stats.removed_duplicate_segments = removed_duplicates
         stats.bridged_gaps += joins
         stats.filled_gap_pixels += join_pixels
         stats.regularized_shapes = self._regularize_round_obstacles(
@@ -280,7 +290,7 @@ class OccupancyMapRenderer:
             maxLineGap=max_gap,
         )
         if lines is None:
-            return canvas, 0, 0, 0
+            return canvas, 0, 0, 0, 0
 
         accepted: list[tuple[int, int, int, int]] = []
         for x1, y1, x2, y2 in lines[:, 0]:
@@ -291,6 +301,16 @@ class OccupancyMapRenderer:
 
         snapped, corner_joins, corner_pixels = self._snap_line_corners(
             accepted, resolution
+        )
+        deduplicated, removed_duplicates = self._remove_parallel_duplicates(
+            snapped, resolution
+        )
+        # A removed inner duplicate may have claimed a corner first; snap the
+        # remaining principal walls once more so the exterior boundary closes.
+        snapped, final_corner_joins, final_corner_pixels = self._snap_line_corners(
+            deduplicated,
+            resolution,
+            maximum_extension_m=0.50,
         )
         for candidate in snapped:
             cv2.line(
@@ -308,14 +328,76 @@ class OccupancyMapRenderer:
         return (
             canvas,
             len(snapped),
-            corner_joins + joins,
-            corner_pixels + join_pixels,
+            corner_joins + final_corner_joins + joins,
+            corner_pixels + final_corner_pixels + join_pixels,
+            removed_duplicates,
         )
+
+    def _remove_parallel_duplicates(
+        self,
+        lines: list[tuple[int, int, int, int]],
+        resolution: float,
+    ) -> tuple[list[tuple[int, int, int, int]], int]:
+        """Discard a shorter wall stroke shadowing a longer parallel stroke."""
+        if len(lines) < 2:
+            return lines, 0
+        maximum_separation = max(
+            2.0, self.settings.duplicate_wall_separation_m / resolution
+        )
+        minimum_overlap = max(
+            4.0, self.settings.duplicate_wall_overlap_m / resolution
+        )
+        geometry = [
+            np.array([[x1, y1], [x2, y2]], dtype=float)
+            for x1, y1, x2, y2 in lines
+        ]
+        candidates = []
+        for first in range(len(geometry) - 1):
+            first_direction = geometry[first][1] - geometry[first][0]
+            first_length = float(np.linalg.norm(first_direction))
+            if first_length < 1.0:
+                continue
+            first_unit = first_direction / first_length
+            for second in range(first + 1, len(geometry)):
+                second_direction = geometry[second][1] - geometry[second][0]
+                second_length = float(np.linalg.norm(second_direction))
+                if second_length < 1.0:
+                    continue
+                second_unit = second_direction / second_length
+                if abs(float(np.dot(first_unit, second_unit))) < 0.985:
+                    continue
+                projections = np.dot(geometry[second] - geometry[first][0], first_unit)
+                overlap = max(
+                    0.0,
+                    min(first_length, float(np.max(projections)))
+                    - max(0.0, float(np.min(projections))),
+                )
+                if overlap < minimum_overlap:
+                    continue
+                midpoint = np.mean(geometry[second], axis=0) - geometry[first][0]
+                separation = abs(
+                    first_unit[0] * midpoint[1] - first_unit[1] * midpoint[0]
+                )
+                if separation > maximum_separation:
+                    continue
+                # Preserve the stronger stroke; it is less likely to be a
+                # noisy echo of an exterior wall.
+                remove = second if first_length >= second_length else first
+                keep = first if remove == second else second
+                candidates.append((separation, -overlap, remove, keep))
+
+        removed: set[int] = set()
+        for _, _, remove, keep in sorted(candidates):
+            if remove in removed or keep in removed:
+                continue
+            removed.add(remove)
+        return [line for index, line in enumerate(lines) if index not in removed], len(removed)
 
     def _snap_line_corners(
         self,
         lines: list[tuple[int, int, int, int]],
         resolution: float,
+        maximum_extension_m: float | None = None,
     ) -> tuple[list[tuple[int, int, int, int]], int, int]:
         """Extend compatible walls to a shared geometric corner.
 
@@ -330,7 +412,12 @@ class OccupancyMapRenderer:
             np.array([[x1, y1], [x2, y2]], dtype=float)
             for x1, y1, x2, y2 in lines
         ]
-        maximum_extension = max(4.0, self.settings.corner_snap_m / resolution)
+        extension_limit_m = (
+            self.settings.corner_snap_m
+            if maximum_extension_m is None
+            else maximum_extension_m
+        )
+        maximum_extension = max(4.0, extension_limit_m / resolution)
         candidates = []
         for first in range(len(geometry) - 1):
             first_line = geometry[first]

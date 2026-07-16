@@ -68,6 +68,20 @@ class TestOccupancyMapRenderer(unittest.TestCase):
         self.assertGreaterEqual(stats.bridged_gaps, 1)
         self.assertEqual(components - 1, 1)
 
+    def test_removes_nearby_parallel_duplicate_wall_stroke(self):
+        lines = [
+            (80, 20, 80, 130),
+            (87, 42, 87, 126),
+            (20, 142, 64, 142),
+        ]
+
+        kept, removed = self.renderer._remove_parallel_duplicates(lines, 0.05)
+
+        self.assertEqual(removed, 1)
+        self.assertIn((80, 20, 80, 130), kept)
+        self.assertNotIn((87, 42, 87, 126), kept)
+        self.assertIn((20, 142, 64, 142), kept)
+
     def test_snaps_offset_perpendicular_walls_to_a_clean_corner(self):
         obstacles = np.zeros((140, 160), dtype=np.uint8)
         cv2.line(obstacles, (30, 86), (30, 34), 255, 1)
