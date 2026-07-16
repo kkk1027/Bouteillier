@@ -1,4 +1,4 @@
-"""Aggressive display-only vector rendering for static occupancy maps."""
+"""Clean display-only rendering for static occupancy maps."""
 from __future__ import annotations
 
 import base64
@@ -15,12 +15,12 @@ class MapRenderSettings:
     """Metric thresholds for conservative cleanup with object preservation."""
 
     occupied_threshold: int = 65
-    min_island_area_m2: float = 0.010
-    min_island_length_m: float = 0.18
+    min_island_area_m2: float = 0.012
+    min_island_length_m: float = 0.20
     max_gap_m: float = 0.22
     wall_width_m: float = 0.08
-    min_round_radius_m: float = 0.10
-    max_round_radius_m: float = 1.25
+    min_round_radius_m: float = 0.15
+    max_round_radius_m: float = 0.80
     endpoint_direction_probe_px: int = 5
     render_scale: int = 2
 
@@ -91,14 +91,117 @@ class OccupancyMapRenderer:
         )
         closed = cv2.morphologyEx(filtered, cv2.MORPH_CLOSE, kernel)
         closed, removed_after_close = self._filter_islands(closed, resolution)
+        body, removed_outside_body = self._retain_main_map_body(closed, resolution)
 
         stats = MapRenderStats(
-            removed_components=removed + removed_after_close,
+            removed_components=removed + removed_after_close + removed_outside_body,
             filled_gap_pixels=max(
                 0, int(cv2.countNonZero(closed) - cv2.countNonZero(filtered))
             ),
         )
-        return closed, stats
+        return body, stats
+
+    def _retain_main_map_body(
+        self, mask: np.ndarray, resolution: float
+    ) -> tuple[np.ndarray, int]:
+        """Discard disconnected fragments that lie outside the principal map body."""
+        count, labels, components, _ = cv2.connectedComponentsWithStats(
+            mask, connectivity=8
+        )
+        if count <= 2:
+            return mask, 0
+
+        records = []
+        for label in range(1, count):
+            records.append(
+                (
+                    label,
+                    int(components[label, cv2.CC_STAT_LEFT]),
+                    int(components[label, cv2.CC_STAT_TOP]),
+                    int(components[label, cv2.CC_STAT_WIDTH]),
+                    int(components[label, cv2.CC_STAT_HEIGHT]),
+                    int(components[label, cv2.CC_STAT_AREA]),
+                )
+            )
+
+        parent = list(range(count))
+
+        def find(label: int) -> int:
+            while parent[label] != label:
+                parent[label] = parent[parent[label]]
+                label = parent[label]
+            return label
+
+        def union(first: int, second: int) -> None:
+            first_root = find(first)
+            second_root = find(second)
+            if first_root != second_root:
+                parent[second_root] = first_root
+
+        cluster_distance = max(3.0, 0.22 / resolution)
+        for index, first in enumerate(records):
+            for second in records[index + 1:]:
+                if self._bbox_distance(first[1:5], second[1:5]) <= cluster_distance:
+                    union(first[0], second[0])
+
+        groups: dict[int, list[tuple[int, int, int, int, int, int]]] = {}
+        for record in records:
+            groups.setdefault(find(record[0]), []).append(record)
+
+        def group_score(group: list[tuple[int, int, int, int, int, int]]) -> int:
+            return sum(record[5] for record in group)
+
+        def group_box(group: list[tuple[int, int, int, int, int, int]]) -> tuple[int, int, int, int]:
+            left = min(record[1] for record in group)
+            top = min(record[2] for record in group)
+            right = max(record[1] + record[3] for record in group)
+            bottom = max(record[2] + record[4] for record in group)
+            return left, top, right - left, bottom - top
+
+        main_root, main_group = max(groups.items(), key=lambda item: group_score(item[1]))
+        selected_roots = {main_root}
+        main_score = group_score(main_group)
+        main_box = group_box(main_group)
+        for root, group in groups.items():
+            if root == main_root:
+                continue
+            if (
+                group_score(group) >= main_score * 0.15
+                and self._bbox_distance(group_box(group), main_box) <= cluster_distance * 4
+            ):
+                selected_roots.add(root)
+
+        body_groups = [groups[root] for root in selected_roots]
+        body_box = group_box([record for group in body_groups for record in group])
+        envelope_margin = cluster_distance * 1.5
+        retained = np.zeros_like(mask)
+        removed = 0
+        for record in records:
+            root = find(record[0])
+            if (
+                root in selected_roots
+                or self._bbox_distance(record[1:5], body_box) <= envelope_margin
+            ):
+                retained[labels == record[0]] = 255
+            else:
+                removed += 1
+
+        return retained, removed
+
+    @staticmethod
+    def _bbox_distance(
+        first: tuple[int, int, int, int],
+        second: tuple[int, int, int, int],
+    ) -> float:
+        first_left, first_top, first_width, first_height = first
+        second_left, second_top, second_width, second_height = second
+        first_right = first_left + first_width
+        first_bottom = first_top + first_height
+        second_right = second_left + second_width
+        second_bottom = second_top + second_height
+        gap_x = max(first_left - second_right, second_left - first_right, 0)
+        gap_y = max(first_top - second_bottom, second_top - first_bottom, 0)
+        return math.hypot(gap_x, gap_y)
 
     def _filter_islands(
         self, mask: np.ndarray, resolution: float
@@ -164,8 +267,9 @@ class OccupancyMapRenderer:
         scale: int,
         stats: MapRenderStats,
     ) -> np.ndarray:
-        """Keep every cleaned wall, then replace only confirmed round obstacles."""
-        skeleton = self._skeletonize(obstacles)
+        """Render joined, denoised walls at a uniform width."""
+        smoothed = self._smooth_wall_mask(obstacles, resolution)
+        skeleton = self._skeletonize(smoothed)
         skeleton, bridges, bridge_pixels = self._bridge_skeleton_gaps(
             skeleton, resolution
         )
@@ -193,6 +297,23 @@ class OccupancyMapRenderer:
         )
         return output
 
+    def _smooth_wall_mask(
+        self, obstacles: np.ndarray, resolution: float
+    ) -> np.ndarray:
+        """Join sub-cell breaks and suppress stair-step noise before thinning."""
+        radius = max(1, int(round(0.06 / resolution)))
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1)
+        )
+        joined = cv2.morphologyEx(obstacles, cv2.MORPH_CLOSE, kernel)
+        thickened = cv2.dilate(
+            joined,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        )
+        softened = cv2.GaussianBlur(thickened, (5, 5), 0)
+        _, smoothed = cv2.threshold(softened, 100, 255, cv2.THRESH_BINARY)
+        return cv2.morphologyEx(smoothed, cv2.MORPH_CLOSE, kernel)
+
     def _regularize_round_obstacles(
         self,
         obstacles: np.ndarray,
@@ -219,7 +340,7 @@ class OccupancyMapRenderer:
             if not width or not height:
                 continue
             aspect = min(width, height) / max(width, height)
-            if aspect < 0.72:
+            if aspect < 0.86:
                 continue
             component = np.zeros_like(obstacles)
             component[labels == label] = 255
@@ -233,8 +354,14 @@ class OccupancyMapRenderer:
             area = cv2.contourArea(contour)
             circularity = 4.0 * math.pi * area / max(perimeter * perimeter, 1.0)
             (center_x, center_y), radius = cv2.minEnclosingCircle(contour)
+            contour_points = contour.reshape(-1, 2).astype(float)
+            distances = np.linalg.norm(
+                contour_points - np.array([center_x, center_y]), axis=1
+            )
+            radial_error = float(np.std(distances) / max(np.mean(distances), 1.0))
             if (
-                circularity < 0.82
+                circularity < 0.85
+                or radial_error > 0.10
                 or radius < min_radius
                 or radius > max_radius
             ):
@@ -256,7 +383,7 @@ class OccupancyMapRenderer:
             dp=1.2,
             minDist=max(12, min_radius * 2),
             param1=50,
-            param2=12,
+            param2=16,
             minRadius=min_radius,
             maxRadius=max_radius,
         )
@@ -282,7 +409,7 @@ class OccupancyMapRenderer:
                 skeleton.shape[0] - 1,
             )
             support = float(np.mean(distance[sample_y, sample_x] <= support_distance))
-            if support < 0.70:
+            if support < 0.82:
                 continue
             if self._replace_with_standard_circle(
                 output,
@@ -330,12 +457,17 @@ class OccupancyMapRenderer:
         endpoints = np.argwhere((skeleton > 0) & (neighbors == 2))
         if len(endpoints) < 2:
             return skeleton, 0, 0
+        _, component_labels = cv2.connectedComponents(
+            (skeleton > 0).astype(np.uint8), connectivity=8
+        )
 
         max_distance = max(2.0, self.settings.max_gap_m / resolution)
         candidates = []
         for first in range(len(endpoints) - 1):
             y1, x1 = endpoints[first]
-            inward_first = self._endpoint_inward_vector(skeleton, x1, y1)
+            inward_first = self._endpoint_inward_vector(
+                skeleton, x1, y1, component_labels
+            )
             if inward_first is None:
                 continue
             for second in range(first + 1, len(endpoints)):
@@ -344,7 +476,9 @@ class OccupancyMapRenderer:
                 distance = float(np.linalg.norm(delta))
                 if distance < 2.0 or distance > max_distance:
                     continue
-                inward_second = self._endpoint_inward_vector(skeleton, x2, y2)
+                inward_second = self._endpoint_inward_vector(
+                    skeleton, x2, y2, component_labels
+                )
                 if inward_second is None:
                     continue
                 direction = delta / distance
@@ -371,12 +505,17 @@ class OccupancyMapRenderer:
         return stitched, bridges, bridge_pixels
 
     def _endpoint_inward_vector(
-        self, skeleton: np.ndarray, x: int, y: int
+        self,
+        skeleton: np.ndarray,
+        x: int,
+        y: int,
+        component_labels: np.ndarray,
     ) -> np.ndarray | None:
         radius = self.settings.endpoint_direction_probe_px
         height, width = skeleton.shape
         best_vector = None
         best_distance = 0.0
+        component_label = component_labels[y, x]
         for dy in range(-radius, radius + 1):
             for dx in range(-radius, radius + 1):
                 if dx == 0 and dy == 0:
@@ -385,7 +524,7 @@ class OccupancyMapRenderer:
                 target_y = y + dy
                 if not (0 <= target_x < width and 0 <= target_y < height):
                     continue
-                if skeleton[target_y, target_x] == 0:
+                if component_labels[target_y, target_x] != component_label:
                     continue
                 distance = math.hypot(dx, dy)
                 if distance > best_distance:

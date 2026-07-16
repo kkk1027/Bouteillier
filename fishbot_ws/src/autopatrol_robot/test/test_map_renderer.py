@@ -50,6 +50,32 @@ class TestOccupancyMapRenderer(unittest.TestCase):
 
         self.assertGreater(cv2.countNonZero(walls[76:85, 20:184]), 0)
         self.assertGreater(cv2.countNonZero(walls[76:85, 64:80]), 0)
+        components, _ = cv2.connectedComponents(
+            (walls[70:90, 10:190] > 0).astype(np.uint8)
+        )
+        self.assertEqual(components - 1, 1)
+
+    def test_removes_isolated_lines_outside_main_map_body(self):
+        obstacles = np.zeros((150, 170), dtype=np.uint8)
+        cv2.rectangle(obstacles, (40, 25), (145, 125), 255, 1)
+        cv2.line(obstacles, (5, 8), (26, 8), 255, 1)
+        cv2.line(obstacles, (9, 135), (9, 148), 255, 1)
+
+        cleaned, stats = self.renderer._clean_obstacles(obstacles, 0.05)
+
+        self.assertGreaterEqual(stats.removed_components, 2)
+        self.assertEqual(cv2.countNonZero(cleaned[0:20, 0:32]), 0)
+        self.assertEqual(cv2.countNonZero(cleaned[128:150, 0:20]), 0)
+        self.assertGreater(cv2.countNonZero(cleaned[24:127, 39:147]), 0)
+
+    def test_does_not_regularize_square_as_round_obstacle(self):
+        grid = np.full((100, 100), -1, dtype=np.int8)
+        grid[5:95, 5:95] = 0
+        cv2.rectangle(grid, (38, 38), (62, 62), 100, -1)
+
+        _, info = self.renderer.render(grid.ravel(), 100, 100, 0.05)
+
+        self.assertEqual(info["regularized_shapes"], 0)
 
     def test_rebuilds_round_obstacle_as_standard_circle(self):
         grid = np.full((100, 100), -1, dtype=np.int8)
