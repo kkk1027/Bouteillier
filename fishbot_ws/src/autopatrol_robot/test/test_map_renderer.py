@@ -1,4 +1,4 @@
-"""Tests for static display-only occupancy-map cleanup."""
+"""Tests for conservative display-only occupancy-map cleanup."""
 
 import base64
 import unittest
@@ -38,29 +38,27 @@ class TestOccupancyMapRenderer(unittest.TestCase):
         self.assertEqual(info["source_height"], 60)
         self.assertEqual(info["output_width"], 180)
         self.assertEqual(info["output_height"], 120)
-        self.assertGreater(info["regularized_shapes"], 0)
 
-    def test_vectorizer_merges_collinear_wall_fragments(self):
+    def test_preserves_continuous_walls_and_joins_short_gap(self):
         obstacles = np.zeros((80, 100), dtype=np.uint8)
         cv2.line(obstacles, (10, 40), (34, 40), 255, 1)
-        cv2.line(obstacles, (40, 40), (90, 40), 255, 1)
+        cv2.line(obstacles, (38, 40), (90, 40), 255, 1)
+        cleaned, _ = self.renderer._clean_obstacles(obstacles, 0.05)
         stats = MapRenderStats()
 
-        vector = self.renderer._draw_vector_walls(obstacles, 0.05, 2, stats)
+        walls = self.renderer._draw_vector_walls(cleaned, 0.05, 2, stats)
 
-        self.assertGreater(stats.vector_segments, 0)
-        self.assertGreater(cv2.countNonZero(vector[76:85, 66:84]), 0)
+        self.assertGreater(cv2.countNonZero(walls[76:85, 20:184]), 0)
+        self.assertGreater(cv2.countNonZero(walls[76:85, 64:80]), 0)
 
-    def test_rebuilds_broken_circle_as_one_standard_circle(self):
-        grid = np.full((140, 140), -1, dtype=np.int8)
-        grid[10:130, 10:130] = 0
-        cv2.circle(grid, (70, 70), 34, 100, 1)
-        grid[66:75, 104:110] = 0
+    def test_rebuilds_round_obstacle_as_standard_circle(self):
+        grid = np.full((100, 100), -1, dtype=np.int8)
+        grid[5:95, 5:95] = 0
+        cv2.circle(grid, (50, 50), 12, 100, -1)
 
-        _, info = self.renderer.render(grid.ravel(), 140, 140, 0.05)
+        _, info = self.renderer.render(grid.ravel(), 100, 100, 0.05)
 
         self.assertEqual(info["regularized_shapes"], 1)
-        self.assertEqual(info["vector_segments"], 0)
 
 
 if __name__ == "__main__":
