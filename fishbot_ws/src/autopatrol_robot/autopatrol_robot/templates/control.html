@@ -697,13 +697,22 @@
             mapWidth = data.width;
             mapHeight = data.height;
             resetView();
-            document.getElementById('map-state-text').textContent = '已加载';
+            document.getElementById('map-state-text').textContent = '已优化';
             document.getElementById('close-map').disabled = false;
-            addLog(`地图加载成功 ${mapWidth}x${mapHeight}`, 'success');
+
+            const renderInfo = data.render_info;
+            const mapMeta = document.getElementById('map-coords');
+            if (renderInfo) {
+                const summary = `展示清理：去噪 ${renderInfo.removed_components} 处 · 补全 ${renderInfo.filled_gap_pixels} px`;
+                mapMeta.textContent = summary;
+                addLog(`地图渲染完成 ${mapWidth}x${mapHeight}，${summary}`, 'success');
+            } else {
+                mapMeta.textContent = '地图已加载';
+                addLog(`地图加载成功 ${mapWidth}x${mapHeight}`, 'success');
+            }
         };
         img.src = 'data:image/png;base64,' + data.image;
     });
-    
     socket.on('robot_pose', (data) => {
         robotX = data.x;
         robotY = data.y;

@@ -11,12 +11,10 @@ import subprocess
 import signal
 import os
 import time
-import base64
+import hashlib
 import json
 import numpy as np
 from enum import Enum
-from PIL import Image
-import io
 import psutil
 from agent_graph import agent as agent_graph
 print("agent_graph 导入成功，类型:", type(agent_graph))  # 添加调试
@@ -27,6 +25,8 @@ from autopatrol_robot.navigation_service import (
     NavigationService,
     set_global_nav_service,
 )
+
+from autopatrol_robot.map_renderer import OccupancyMapRenderer
 
 ros_available = threading.Lock()
 ros_busy = False
@@ -153,6 +153,7 @@ class MapManager:
         self.workspace_dir = os.environ.get('FISHBOT_WS', '/home/ke/chapt9_update/fishbot_ws')
         self.load_timer = None
         self.map_image_base64 = None
+        self.map_render_info = None
         self.map_resolution = 0.0
         self.map_origin_x = 0.0
         self.map_origin_y = 0.0
@@ -239,15 +240,17 @@ class MapManager:
         
         self.current_state = MapState.NOT_LOADED
         self.map_image_base64 = None
+        self.map_render_info = None
         
         if status_callback:
             status_callback("closed", "地图已关闭")
         
         return True, "地图已关闭"
     
-    def set_map_data(self, image_base64, resolution, origin_x, origin_y, width, height):
+    def set_map_data(self, image_base64, resolution, origin_x, origin_y, width, height, render_info=None):
         """设置地图数据"""
         self.map_image_base64 = image_base64
+        self.map_render_info = render_info
         self.map_resolution = resolution
         self.map_origin_x = origin_x
         self.map_origin_y = origin_y
@@ -263,7 +266,8 @@ class MapManager:
                 'origin_x': self.map_origin_x,
                 'origin_y': self.map_origin_y,
                 'width': self.map_width,
-                'height': self.map_height
+                'height': self.map_height,
+                'render_info': self.map_render_info
             }
         return None
     
@@ -272,7 +276,8 @@ class MapManager:
         return {
             'state': self.current_state.value,
             'is_loaded': self.current_state == MapState.LOADED,
-            'has_map': self.map_image_base64 is not None
+            'has_map': self.map_image_base64 is not None,
+            'render_info': self.map_render_info
         }
 
 # ==================== 连接管理函数 ====================
@@ -352,6 +357,7 @@ def force_cleanup_all():
     is_connected = False
     map_manager.current_state = MapState.NOT_LOADED
     map_manager.map_image_base64 = None
+    map_manager.map_render_info = None
     
     # 9. 等待进程完全退出
     time.sleep(1)
@@ -366,6 +372,9 @@ class CarController(Node):
         self.last_command_time = time.time()
         self.map_manager = map_manager
         self.socketio = socketio
+        self.map_renderer = OccupancyMapRenderer()
+        self._map_fingerprint = None
+        self._map_render_lock = threading.Lock()
         
         # 订阅地图
         self.map_subscription = self.create_subscription(
@@ -396,53 +405,64 @@ class CarController(Node):
         self.socketio.emit('battery_status', {'percent': self.current_battery})
         self.get_logger().debug(f'电池电量: {self.current_battery}%')
     def map_callback(self, msg):
-        """地图回调函数 - 保持原始分辨率"""
+        """Render a cleaned display image without changing the navigation map."""
         try:
             width = msg.info.width
             height = msg.info.height
             resolution = msg.info.resolution
             origin_x = msg.info.origin.position.x
             origin_y = msg.info.origin.position.y
-            
-            self.get_logger().info(f"接收地图: {width}x{height}, 分辨率: {resolution}m/px")
-            
-            img_array = np.zeros((height, width), dtype=np.uint8)
-            data = np.array(msg.data, dtype=np.int8)
-            data_reshaped = data.reshape((height, width))
-            
-            img_array = np.where(data_reshaped == -1, 127, img_array)
-            img_array = np.where(data_reshaped == 0, 255, img_array)
-            img_array = np.where(data_reshaped == 100, 0, img_array)
-            
-            mask = (data_reshaped > 0) & (data_reshaped < 100)
-            img_array[mask] = 255 - (data_reshaped[mask] * 255 / 100).astype(np.uint8)
-            
-            img = Image.fromarray(img_array, mode='L')
-            
-            buffer = io.BytesIO()
-            img.save(buffer, format='PNG', compress_level=6)
-            img_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
-            
+            raw_data = np.asarray(msg.data, dtype=np.int8)
+            signature = f"{width}:{height}:{resolution:.9f}".encode("ascii")
+            fingerprint = hashlib.blake2b(
+                signature + raw_data.tobytes(), digest_size=16
+            ).hexdigest()
+
+            with self._map_render_lock:
+                if (
+                    fingerprint == self._map_fingerprint
+                    and self.map_manager.map_image_base64 is not None
+                ):
+                    return
+
+                self.get_logger().info(
+                    f"渲染导入地图: {width}x{height}, 分辨率: {resolution}m/px"
+                )
+                image_base64, render_info = self.map_renderer.render(
+                    raw_data, width, height, resolution
+                )
+                self._map_fingerprint = fingerprint
+
             self.map_manager.set_map_data(
-                img_base64, resolution, origin_x, origin_y, width, height
+                image_base64,
+                resolution,
+                origin_x,
+                origin_y,
+                width,
+                height,
+                render_info,
             )
-            
-            self.socketio.emit('map_data', {
-                'image': img_base64,
-                'resolution': resolution,
-                'origin_x': origin_x,
-                'origin_y': origin_y,
-                'width': width,
-                'height': height
-            })
-            
-            self.get_logger().info(f"地图已发送: {width}x{height}, 分辨率: {resolution}m/px")
-            
-        except Exception as e:
-            self.get_logger().error(f"地图处理失败: {str(e)}")
+            self.socketio.emit(
+                "map_data",
+                {
+                    "image": image_base64,
+                    "resolution": resolution,
+                    "origin_x": origin_x,
+                    "origin_y": origin_y,
+                    "width": width,
+                    "height": height,
+                    "render_info": render_info,
+                },
+            )
+            self.get_logger().info(
+                "地图展示渲染完成: "
+                f"去除孤岛 {render_info['removed_components']} 个, "
+                f"补全像素 {render_info['filled_gap_pixels']}"
+            )
+        except Exception as exc:
+            self.get_logger().error(f"地图展示渲染失败: {exc}")
             import traceback
             traceback.print_exc()
-    
     def pose_callback(self, msg):
         """机器人位姿回调"""
         try:
