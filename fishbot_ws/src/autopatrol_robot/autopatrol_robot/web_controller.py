@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import PoseWithCovarianceStamped
@@ -384,12 +385,17 @@ class CarController(Node):
         self._map_fingerprint = None
         self._map_render_lock = threading.Lock()
         
-        # 订阅地图
+        # /map 由 map_server 以 TRANSIENT_LOCAL 发布；匹配该 QoS 才能在网页重启后取得已加载地图。
+        map_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
         self.map_subscription = self.create_subscription(
             OccupancyGrid,
             '/map',
             self.map_callback,
-            10
+            map_qos,
         )
         self.battery_subscription = self.create_subscription(
             Float32,
@@ -940,7 +946,10 @@ def soft_reboot():
 
 def run_flask():
     """运行 Flask 服务器（flask_socketio 内置多线程，无需额外配置）"""
-    socketio.run(app, host='0.0.0.0', port=5000, debug=False)
+    socketio.run(
+        app, host='0.0.0.0', port=5000, debug=False,
+        allow_unsafe_werkzeug=True
+    )
 
 def main():
     global car_controller, ros_busy, nav_service
