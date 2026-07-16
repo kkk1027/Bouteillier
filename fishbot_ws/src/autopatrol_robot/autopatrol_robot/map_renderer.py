@@ -21,6 +21,7 @@ class MapRenderSettings:
     min_straight_wall_length_m: float = 0.60
     line_merge_gap_m: float = 0.35
     vector_join_gap_m: float = 0.85
+    corner_snap_m: float = 2.10
     main_body_anchor_ratio: float = 0.35
     wall_width_m: float = 0.08
     min_round_radius_m: float = 0.10
@@ -287,6 +288,11 @@ class OccupancyMapRenderer:
             if self._is_redundant_line(candidate, accepted):
                 continue
             accepted.append(candidate)
+
+        snapped, corner_joins, corner_pixels = self._snap_line_corners(
+            accepted, resolution
+        )
+        for candidate in snapped:
             cv2.line(
                 canvas,
                 (candidate[0] * scale, candidate[1] * scale),
@@ -297,9 +303,166 @@ class OccupancyMapRenderer:
             )
 
         joins, join_pixels = self._bridge_vector_line_endpoints(
-            canvas, accepted, resolution, scale, wall_width
+            canvas, snapped, resolution, scale, wall_width
         )
-        return canvas, len(accepted), joins, join_pixels
+        return (
+            canvas,
+            len(snapped),
+            corner_joins + joins,
+            corner_pixels + join_pixels,
+        )
+
+    def _snap_line_corners(
+        self,
+        lines: list[tuple[int, int, int, int]],
+        resolution: float,
+    ) -> tuple[list[tuple[int, int, int, int]], int, int]:
+        """Extend compatible walls to a shared geometric corner.
+
+        Hough returns independent strokes.  Joining their nearest pixels creates
+        diagonal patches; extending them to their line intersection preserves a
+        clean horizontal/vertical (or arbitrary-angle) corner instead.
+        """
+        if len(lines) < 2:
+            return lines, 0, 0
+
+        geometry = [
+            np.array([[x1, y1], [x2, y2]], dtype=float)
+            for x1, y1, x2, y2 in lines
+        ]
+        maximum_extension = max(4.0, self.settings.corner_snap_m / resolution)
+        candidates = []
+        for first in range(len(geometry) - 1):
+            first_line = geometry[first]
+            first_direction = first_line[1] - first_line[0]
+            first_length = float(np.linalg.norm(first_direction))
+            if first_length < 1.0:
+                continue
+            for second in range(first + 1, len(geometry)):
+                second_line = geometry[second]
+                second_direction = second_line[1] - second_line[0]
+                second_length = float(np.linalg.norm(second_direction))
+                if second_length < 1.0:
+                    continue
+                cross = float(
+                    first_direction[0] * second_direction[1]
+                    - first_direction[1] * second_direction[0]
+                )
+                # Near-parallel fragments are handled by the endpoint merger.
+                if abs(cross) / (first_length * second_length) < 0.35:
+                    continue
+                intersection = self._line_intersection(
+                    first_line[0], first_direction, second_line[0], second_direction
+                )
+                if intersection is None:
+                    continue
+                if not (
+                    -2.0 <= intersection[0] <= max(line[:, 0].max() for line in geometry) + 2.0
+                    and -2.0 <= intersection[1] <= max(line[:, 1].max() for line in geometry) + 2.0
+                ):
+                    continue
+                first_endpoint, first_extension = self._corner_extension(
+                    first_line, intersection
+                )
+                second_endpoint, second_extension = self._corner_extension(
+                    second_line, intersection
+                )
+                if first_endpoint is None and second_endpoint is None:
+                    continue
+                if (
+                    first_extension > maximum_extension
+                    or second_extension > maximum_extension
+                ):
+                    continue
+                candidates.append(
+                    (
+                        first_extension + second_extension,
+                        first,
+                        first_endpoint,
+                        second,
+                        second_endpoint,
+                        intersection,
+                    )
+                )
+
+        used_endpoints: set[tuple[int, int]] = set()
+        joins = 0
+        pixels = 0
+        for _, first, first_endpoint, second, second_endpoint, intersection in sorted(candidates):
+            requested = [
+                (first, first_endpoint),
+                (second, second_endpoint),
+            ]
+            if any(
+                endpoint is not None and (line, endpoint) in used_endpoints
+                for line, endpoint in requested
+            ):
+                continue
+            changed = False
+            for line, endpoint in requested:
+                if endpoint is None:
+                    continue
+                distance = float(np.linalg.norm(geometry[line][endpoint] - intersection))
+                if distance < 1.0:
+                    continue
+                geometry[line][endpoint] = intersection
+                used_endpoints.add((line, endpoint))
+                pixels += int(round(distance))
+                changed = True
+            if changed:
+                joins += 1
+
+        snapped = [
+            (
+                int(round(line[0, 0])),
+                int(round(line[0, 1])),
+                int(round(line[1, 0])),
+                int(round(line[1, 1])),
+            )
+            for line in geometry
+        ]
+        return snapped, joins, pixels
+
+    @staticmethod
+    def _line_intersection(
+        first_point: np.ndarray,
+        first_direction: np.ndarray,
+        second_point: np.ndarray,
+        second_direction: np.ndarray,
+    ) -> np.ndarray | None:
+        denominator = float(
+            first_direction[0] * second_direction[1]
+            - first_direction[1] * second_direction[0]
+        )
+        if abs(denominator) < 1e-6:
+            return None
+        delta = second_point - first_point
+        multiplier = float(
+            (delta[0] * second_direction[1] - delta[1] * second_direction[0])
+            / denominator
+        )
+        return first_point + first_direction * multiplier
+
+    @staticmethod
+    def _corner_extension(
+        line: np.ndarray, intersection: np.ndarray
+    ) -> tuple[int | None, float]:
+        """Return a line endpoint to extend, or no endpoint when it already touches."""
+        direction = line[1] - line[0]
+        length = float(np.linalg.norm(direction))
+        if length < 1e-6:
+            return None, float("inf")
+        unit = direction / length
+        projection = float(np.dot(intersection - line[0], unit))
+        if 0.0 <= projection <= length:
+            return None, 0.0
+        endpoint = 0 if projection < 0.0 else 1
+        other = 1 - endpoint
+        outward = intersection - line[endpoint]
+        inward = line[other] - line[endpoint]
+        if float(np.dot(outward, inward)) > 0.1:
+            return None, float("inf")
+        return endpoint, float(np.linalg.norm(outward))
 
     def _bridge_vector_line_endpoints(
         self,

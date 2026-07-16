@@ -68,6 +68,22 @@ class TestOccupancyMapRenderer(unittest.TestCase):
         self.assertGreaterEqual(stats.bridged_gaps, 1)
         self.assertEqual(components - 1, 1)
 
+    def test_snaps_offset_perpendicular_walls_to_a_clean_corner(self):
+        obstacles = np.zeros((140, 160), dtype=np.uint8)
+        cv2.line(obstacles, (30, 86), (30, 34), 255, 1)
+        cv2.line(obstacles, (46, 20), (120, 20), 255, 1)
+        cleaned, _ = self.renderer._clean_obstacles(obstacles, 0.05)
+        stats = MapRenderStats()
+
+        walls = self.renderer._draw_vector_walls(cleaned, 0.05, 2, stats)
+        components, _ = cv2.connectedComponents((walls > 0).astype(np.uint8))
+
+        # The two detected strokes must meet at the geometric corner (30, 20),
+        # not through a diagonal patch between their nearest noisy endpoints.
+        self.assertEqual(components - 1, 1)
+        self.assertGreater(cv2.countNonZero(walls[36:45, 56:68]), 0)
+        self.assertGreaterEqual(stats.bridged_gaps, 1)
+
     def test_redraws_noisy_wall_as_single_straight_stroke(self):
         obstacles = np.zeros((120, 160), dtype=np.uint8)
         points = np.array(
