@@ -10,12 +10,20 @@ import threading
 import subprocess
 import signal
 import os
+import sys
 import time
 import hashlib
 import json
 import numpy as np
 from enum import Enum
 import psutil
+
+# Allow this module to run directly from the source tree during development.
+if not __package__:
+    source_package_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if source_package_root not in sys.path:
+        sys.path.insert(0, source_package_root)
+
 from agent_graph import agent as agent_graph
 print("agent_graph 导入成功，类型:", type(agent_graph))  # 添加调试
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
