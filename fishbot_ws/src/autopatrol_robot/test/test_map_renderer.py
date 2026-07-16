@@ -68,6 +68,28 @@ class TestOccupancyMapRenderer(unittest.TestCase):
         self.assertEqual(cv2.countNonZero(cleaned[128:150, 0:20]), 0)
         self.assertGreater(cv2.countNonZero(cleaned[24:127, 39:147]), 0)
 
+    def test_removes_fragment_outside_hull_but_keeps_inner_obstacle(self):
+        obstacles = np.zeros((150, 150), dtype=np.uint8)
+        cv2.line(obstacles, (30, 20), (30, 125), 255, 1)
+        cv2.line(obstacles, (30, 125), (125, 125), 255, 1)
+        cv2.line(obstacles, (108, 28), (108, 44), 255, 1)
+        cv2.circle(obstacles, (58, 92), 3, 255, 1)
+
+        cleaned, _ = self.renderer._clean_obstacles(obstacles, 0.05)
+
+        self.assertEqual(cv2.countNonZero(cleaned[24:48, 104:112]), 0)
+        self.assertGreater(cv2.countNonZero(cleaned[88:97, 54:63]), 0)
+
+    def test_retains_short_segment_that_joins_two_body_edges(self):
+        obstacles = np.zeros((100, 160), dtype=np.uint8)
+        cv2.line(obstacles, (20, 50), (70, 50), 255, 1)
+        cv2.line(obstacles, (90, 50), (140, 50), 255, 1)
+        cv2.line(obstacles, (74, 50), (86, 50), 255, 1)
+
+        cleaned, _ = self.renderer._clean_obstacles(obstacles, 0.05)
+
+        self.assertGreater(cv2.countNonZero(cleaned[49:52, 73:88]), 0)
+
     def test_does_not_regularize_square_as_round_obstacle(self):
         grid = np.full((100, 100), -1, dtype=np.int8)
         grid[5:95, 5:95] = 0
@@ -76,6 +98,15 @@ class TestOccupancyMapRenderer(unittest.TestCase):
         _, info = self.renderer.render(grid.ravel(), 100, 100, 0.05)
 
         self.assertEqual(info["regularized_shapes"], 0)
+
+    def test_rebuilds_nearly_round_ellipse_as_standard_circle(self):
+        grid = np.full((100, 100), -1, dtype=np.int8)
+        grid[5:95, 5:95] = 0
+        cv2.ellipse(grid, (50, 50), (12, 10), 0, 0, 360, 100, -1)
+
+        _, info = self.renderer.render(grid.ravel(), 100, 100, 0.05)
+
+        self.assertEqual(info["regularized_shapes"], 1)
 
     def test_rebuilds_round_obstacle_as_standard_circle(self):
         grid = np.full((100, 100), -1, dtype=np.int8)

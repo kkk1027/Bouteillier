@@ -18,6 +18,7 @@ class MapRenderSettings:
     min_island_area_m2: float = 0.012
     min_island_length_m: float = 0.20
     max_gap_m: float = 0.22
+    main_body_anchor_ratio: float = 0.35
     wall_width_m: float = 0.08
     min_round_radius_m: float = 0.15
     max_round_radius_m: float = 0.80
@@ -104,104 +105,65 @@ class OccupancyMapRenderer:
     def _retain_main_map_body(
         self, mask: np.ndarray, resolution: float
     ) -> tuple[np.ndarray, int]:
-        """Discard disconnected fragments that lie outside the principal map body."""
-        count, labels, components, _ = cv2.connectedComponentsWithStats(
+        """Keep the dominant map outline and obstacles that lie inside it."""
+        count, labels, components, centroids = cv2.connectedComponentsWithStats(
             mask, connectivity=8
         )
         if count <= 2:
             return mask, 0
 
-        records = []
-        for label in range(1, count):
-            records.append(
-                (
-                    label,
-                    int(components[label, cv2.CC_STAT_LEFT]),
-                    int(components[label, cv2.CC_STAT_TOP]),
-                    int(components[label, cv2.CC_STAT_WIDTH]),
-                    int(components[label, cv2.CC_STAT_HEIGHT]),
-                    int(components[label, cv2.CC_STAT_AREA]),
-                )
+        areas = components[1:, cv2.CC_STAT_AREA]
+        largest_area = int(np.max(areas))
+        minimum_anchor_area = max(
+            int(round(largest_area * self.settings.main_body_anchor_ratio)),
+            int(round(0.08 / resolution)),
+        )
+        anchor_labels = [
+            label
+            for label in range(1, count)
+            if int(components[label, cv2.CC_STAT_AREA]) >= minimum_anchor_area
+        ]
+        if not anchor_labels:
+            anchor_labels = [int(np.argmax(areas)) + 1]
+
+        body_mask = np.zeros_like(mask)
+        for label in anchor_labels:
+            body_mask[labels == label] = 255
+        points = np.column_stack(np.where(body_mask > 0))[:, ::-1].astype(np.int32)
+        if len(points) < 3:
+            return mask, 0
+        body_hull = cv2.convexHull(points.reshape(-1, 1, 2))
+
+        bridge_distance = max(4.0, 0.75 / resolution)
+        anchor_distances = []
+        for anchor_label in anchor_labels:
+            anchor_mask = np.where(labels == anchor_label, 0, 255).astype(
+                np.uint8
+            )
+            anchor_distances.append(
+                cv2.distanceTransform(anchor_mask, cv2.DIST_L2, 3)
             )
 
-        parent = list(range(count))
-
-        def find(label: int) -> int:
-            while parent[label] != label:
-                parent[label] = parent[parent[label]]
-                label = parent[label]
-            return label
-
-        def union(first: int, second: int) -> None:
-            first_root = find(first)
-            second_root = find(second)
-            if first_root != second_root:
-                parent[second_root] = first_root
-
-        cluster_distance = max(3.0, 0.22 / resolution)
-        for index, first in enumerate(records):
-            for second in records[index + 1:]:
-                if self._bbox_distance(first[1:5], second[1:5]) <= cluster_distance:
-                    union(first[0], second[0])
-
-        groups: dict[int, list[tuple[int, int, int, int, int, int]]] = {}
-        for record in records:
-            groups.setdefault(find(record[0]), []).append(record)
-
-        def group_score(group: list[tuple[int, int, int, int, int, int]]) -> int:
-            return sum(record[5] for record in group)
-
-        def group_box(group: list[tuple[int, int, int, int, int, int]]) -> tuple[int, int, int, int]:
-            left = min(record[1] for record in group)
-            top = min(record[2] for record in group)
-            right = max(record[1] + record[3] for record in group)
-            bottom = max(record[2] + record[4] for record in group)
-            return left, top, right - left, bottom - top
-
-        main_root, main_group = max(groups.items(), key=lambda item: group_score(item[1]))
-        selected_roots = {main_root}
-        main_score = group_score(main_group)
-        main_box = group_box(main_group)
-        for root, group in groups.items():
-            if root == main_root:
-                continue
-            if (
-                group_score(group) >= main_score * 0.15
-                and self._bbox_distance(group_box(group), main_box) <= cluster_distance * 4
-            ):
-                selected_roots.add(root)
-
-        body_groups = [groups[root] for root in selected_roots]
-        body_box = group_box([record for group in body_groups for record in group])
-        envelope_margin = cluster_distance * 1.5
         retained = np.zeros_like(mask)
         removed = 0
-        for record in records:
-            root = find(record[0])
-            if (
-                root in selected_roots
-                or self._bbox_distance(record[1:5], body_box) <= envelope_margin
-            ):
-                retained[labels == record[0]] = 255
+        for label in range(1, count):
+            component = labels == label
+            center_x, center_y = centroids[label]
+            is_anchor = label in anchor_labels
+            is_inside_body = cv2.pointPolygonTest(
+                body_hull, (float(center_x), float(center_y)), False
+            ) >= 0
+            nearby_anchors = sum(
+                np.min(distance[component]) <= bridge_distance
+                for distance in anchor_distances
+            )
+            completes_body_edge = nearby_anchors >= 2
+            if is_anchor or is_inside_body or completes_body_edge:
+                retained[component] = 255
             else:
                 removed += 1
 
         return retained, removed
-
-    @staticmethod
-    def _bbox_distance(
-        first: tuple[int, int, int, int],
-        second: tuple[int, int, int, int],
-    ) -> float:
-        first_left, first_top, first_width, first_height = first
-        second_left, second_top, second_width, second_height = second
-        first_right = first_left + first_width
-        first_bottom = first_top + first_height
-        second_right = second_left + second_width
-        second_bottom = second_top + second_height
-        gap_x = max(first_left - second_right, second_left - first_right, 0)
-        gap_y = max(first_top - second_bottom, second_top - first_bottom, 0)
-        return math.hypot(gap_x, gap_y)
 
     def _filter_islands(
         self, mask: np.ndarray, resolution: float
@@ -340,7 +302,7 @@ class OccupancyMapRenderer:
             if not width or not height:
                 continue
             aspect = min(width, height) / max(width, height)
-            if aspect < 0.86:
+            if aspect < 0.80:
                 continue
             component = np.zeros_like(obstacles)
             component[labels == label] = 255
@@ -360,8 +322,8 @@ class OccupancyMapRenderer:
             )
             radial_error = float(np.std(distances) / max(np.mean(distances), 1.0))
             if (
-                circularity < 0.85
-                or radial_error > 0.10
+                circularity < 0.80
+                or radial_error > 0.13
                 or radius < min_radius
                 or radius > max_radius
             ):
@@ -383,7 +345,7 @@ class OccupancyMapRenderer:
             dp=1.2,
             minDist=max(12, min_radius * 2),
             param1=50,
-            param2=16,
+            param2=14,
             minRadius=min_radius,
             maxRadius=max_radius,
         )
@@ -409,7 +371,7 @@ class OccupancyMapRenderer:
                 skeleton.shape[0] - 1,
             )
             support = float(np.mean(distance[sample_y, sample_x] <= support_distance))
-            if support < 0.82:
+            if support < 0.74:
                 continue
             if self._replace_with_standard_circle(
                 output,
