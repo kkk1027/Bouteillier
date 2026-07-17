@@ -5,7 +5,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import PoseWithCovarianceStamped
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, Response, jsonify, render_template, request
 from flask_socketio import SocketIO, emit
 import threading
 import subprocess
@@ -18,6 +18,7 @@ import json
 import numpy as np
 from enum import Enum
 import psutil
+from pathlib import Path
 
 # Allow this module to run directly from the source tree during development.
 if not __package__:
@@ -35,7 +36,10 @@ from autopatrol_robot.navigation_service import (
     set_global_nav_service,
 )
 
-from autopatrol_robot.map_renderer import OccupancyMapRenderer
+from autopatrol_robot.map_artifact import (
+    OccupancyMapArtifactProcessor,
+    load_nav2_map,
+)
 
 ros_available = threading.Lock()
 ros_busy = False
@@ -160,17 +164,51 @@ class MapManager:
         self.current_process = None
         self.current_state = MapState.NOT_LOADED
         self.workspace_dir = os.environ.get('FISHBOT_WS', '/home/ke/chapt9_update/fishbot_ws')
+        default_map = Path(self.workspace_dir) / 'src' / 'fishbot_navigation2' / 'maps' / 'fishbot_map1.yaml'
+        self.static_map_yaml = Path(os.environ.get('FISHBOT_MAP_YAML', str(default_map)))
+        self.map_artifact_processor = OccupancyMapArtifactProcessor()
+        self.map_source = 'none'
         self.load_timer = None
         self.map_image_base64 = None
         self.map_render_info = None
         self.map_resolution = 0.0
+        self.map_artifact = None
         self.map_origin_x = 0.0
         self.map_origin_y = 0.0
         self.map_width = 0
         self.map_height = 0
         
+    def load_static_map_artifact(self):
+        """Build the browser artifact from the same YAML used by Nav2."""
+        try:
+            source = load_nav2_map(self.static_map_yaml)
+            artifact = self.map_artifact_processor.process(
+                source.data,
+                source.width,
+                source.height,
+                source.resolution,
+                source.origin_x,
+                source.origin_y,
+                source.frame_id,
+            )
+        except Exception as error:
+            return False, f"地图展示产物生成失败: {error}"
+
+        self.set_map_data(
+            artifact.png_base64,
+            source.resolution,
+            source.origin_x,
+            source.origin_y,
+            source.width,
+            source.height,
+            artifact.manifest['quality'],
+            artifact,
+            source='static',
+        )
+        return True, f"已载入展示地图: {self.static_map_yaml.name}"
+
     def load_map(self, status_callback=None):
-        """载入地图"""
+        """Load one saved map for Nav2 and render the matching display artifact."""
         if self.current_state == MapState.LOADING:
             return False, "地图正在加载中"
         
@@ -178,14 +216,21 @@ class MapManager:
             return False, "地图已加载"
         
         self.current_state = MapState.LOADING
+        artifact_ready, artifact_message = self.load_static_map_artifact()
+        if not artifact_ready:
+            self.current_state = MapState.ERROR
+            if status_callback:
+                status_callback("error", artifact_message)
+            return False, artifact_message
+
         if status_callback:
             status_callback("loading", "正在加载地图...")
         
-        # 构建命令
+        # Nav2 and the browser now read the same map YAML.
         command = f"""
         source /opt/ros/humble/setup.bash && \
         source {self.workspace_dir}/install/setup.bash && \
-        ros2 launch fishbot_navigation2 navigation2.launch.py use_sim_time:=False
+        ros2 launch fishbot_navigation2 navigation2.launch.py use_sim_time:=False map:={self.static_map_yaml}
         """
         
         try:
@@ -251,20 +296,35 @@ class MapManager:
         self.map_image_base64 = None
         self.map_render_info = None
         
+        self.map_artifact = None
+        self.map_source = 'none'
         if status_callback:
             status_callback("closed", "地图已关闭")
         
         return True, "地图已关闭"
     
-    def set_map_data(self, image_base64, resolution, origin_x, origin_y, width, height, render_info=None):
-        """设置地图数据"""
+    def set_map_data(
+        self,
+        image_base64,
+        resolution,
+        origin_x,
+        origin_y,
+        width,
+        height,
+        render_info=None,
+        artifact=None,
+        source='live',
+    ):
+        """设置地图数据。source 用于避免实时话题覆盖已选择的静态地图。"""
         self.map_image_base64 = image_base64
         self.map_render_info = render_info
         self.map_resolution = resolution
         self.map_origin_x = origin_x
+        self.map_artifact = artifact
         self.map_origin_y = origin_y
         self.map_width = width
         self.map_height = height
+        self.map_source = source
     
     def get_map_data(self):
         """获取地图数据"""
@@ -276,7 +336,9 @@ class MapManager:
                 'origin_y': self.map_origin_y,
                 'width': self.map_width,
                 'height': self.map_height,
-                'render_info': self.map_render_info
+                'render_info': self.map_render_info,
+                'artifact': self.map_artifact.manifest if self.map_artifact else None,
+                'source': self.map_source,
             }
         return None
     
@@ -286,7 +348,8 @@ class MapManager:
             'state': self.current_state.value,
             'is_loaded': self.current_state == MapState.LOADED,
             'has_map': self.map_image_base64 is not None,
-            'render_info': self.map_render_info
+            'render_info': self.map_render_info,
+            'source': self.map_source,
         }
 
 # ==================== 连接管理函数 ====================
@@ -368,6 +431,8 @@ def force_cleanup_all():
     map_manager.map_image_base64 = None
     map_manager.map_render_info = None
     
+    map_manager.map_artifact = None
+    map_manager.map_source = 'none'
     # 9. 等待进程完全退出
     time.sleep(1)
     
@@ -381,7 +446,7 @@ class CarController(Node):
         self.last_command_time = time.time()
         self.map_manager = map_manager
         self.socketio = socketio
-        self.map_renderer = OccupancyMapRenderer()
+        self.map_artifact_processor = OccupancyMapArtifactProcessor()
         self._map_fingerprint = None
         self._map_render_lock = threading.Lock()
         
@@ -420,6 +485,9 @@ class CarController(Node):
         self.get_logger().debug(f'电池电量: {self.current_battery}%')
     def map_callback(self, msg):
         """Render a cleaned display image without changing the navigation map."""
+        # A user-selected saved map must keep its matching static display artifact.
+        if self.map_manager.map_source == 'static':
+            return
         try:
             width = msg.info.width
             height = msg.info.height
@@ -442,9 +510,17 @@ class CarController(Node):
                 self.get_logger().info(
                     f"渲染导入地图: {width}x{height}, 分辨率: {resolution}m/px"
                 )
-                image_base64, render_info = self.map_renderer.render(
-                    raw_data, width, height, resolution
+                artifact = self.map_artifact_processor.process(
+                    raw_data,
+                    width,
+                    height,
+                    resolution,
+                    origin_x,
+                    origin_y,
+                    msg.header.frame_id or 'map',
                 )
+                image_base64 = artifact.png_base64
+                render_info = artifact.manifest['quality']
                 self._map_fingerprint = fingerprint
 
             self.map_manager.set_map_data(
@@ -455,6 +531,8 @@ class CarController(Node):
                 width,
                 height,
                 render_info,
+                artifact,
+                source='live',
             )
             self.socketio.emit(
                 "map_data",
@@ -466,6 +544,8 @@ class CarController(Node):
                     "width": width,
                     "height": height,
                     "render_info": render_info,
+                    "artifact": artifact.manifest,
+                    "source": "live",
                 },
             )
             self.get_logger().info(
@@ -873,6 +953,9 @@ def load_map():
         success, message = map_manager.load_map(on_map_status)
         
         if success:
+            map_data = map_manager.get_map_data()
+            if map_data:
+                socketio.emit('map_data', map_data)
             return jsonify({
                 'status': 'success',
                 'message': message,
@@ -900,6 +983,33 @@ def close_map():
             
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
+@app.route('/map_artifact', methods=['GET'])
+def map_artifact_manifest():
+    """Return the portable JSON manifest for browser and mini-program Canvas."""
+    artifact = map_manager.map_artifact
+    if artifact is None:
+        return jsonify({'status': 'error', 'message': '暂无地图工件'}), 404
+    return jsonify(artifact.manifest)
+
+
+@app.route('/map_artifact.png', methods=['GET'])
+def map_artifact_png():
+    """Return the current rendered PNG without a base64 decode on the client."""
+    artifact = map_manager.map_artifact
+    if artifact is None:
+        return jsonify({'status': 'error', 'message': '暂无地图工件'}), 404
+    return Response(artifact.png_bytes, mimetype='image/png')
+
+
+@app.route('/map_artifact.svg', methods=['GET'])
+def map_artifact_svg():
+    """Return a self-contained SVG for clients preferring one scalable asset."""
+    artifact = map_manager.map_artifact
+    if artifact is None:
+        return jsonify({'status': 'error', 'message': '暂无地图工件'}), 404
+    return Response(artifact.svg, mimetype='image/svg+xml')
+
+
 @app.route('/map_status', methods=['GET'])
 def map_status():
     """获取地图状态"""

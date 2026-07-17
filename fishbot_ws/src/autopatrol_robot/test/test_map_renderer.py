@@ -88,7 +88,7 @@ class TestOccupancyMapRenderer(unittest.TestCase):
 
         self.assertEqual(closed, 0)
 
-    def test_rebuilds_lightly_damaged_round_obstacle(self):
+    def test_rebuilds_damaged_round_internal_obstacle(self):
         grid = np.full((100, 100), -1, dtype=np.int8)
         grid[5:95, 5:95] = 0
         cv2.circle(grid, (50, 50), 5, 100, 1)
@@ -96,7 +96,51 @@ class TestOccupancyMapRenderer(unittest.TestCase):
 
         _, info = self.renderer.render(grid.ravel(), 100, 100, 0.05)
 
-        self.assertEqual(info["regularized_shapes"], 1)
+        self.assertGreaterEqual(info["interior_circles"], 1)
+
+    def test_rebuilds_closed_principal_contour_and_fills_internal_holes(self):
+        grid = np.full((120, 160), -1, dtype=np.int8)
+        grid[15:105, 20:145] = 0
+        # This black notch reaches the exterior, so it must remain a concavity.
+        grid[15:58, 92:114] = -1
+        # This obstacle is internal and is intentionally filled in this pass.
+        cv2.circle(grid, (62, 74), 7, 100, -1)
+
+        encoded, info = self.renderer.render(grid.ravel(), 160, 120, 0.05)
+        image = cv2.imdecode(
+            np.frombuffer(base64.b64decode(encoded), dtype=np.uint8),
+            cv2.IMREAD_COLOR,
+        )
+
+        self.assertTrue(info["primary_contour_closed"])
+        self.assertEqual(info["closed_wall_gaps"], 1)
+        self.assertGreaterEqual(info["ignored_interior_obstacles"], 1)
+        # Circle centre becomes part of the white primary body.
+        self.assertGreater(int(image[74 * 2, 62 * 2].mean()), 180)
+        # The exterior-connected notch remains black.
+        self.assertLess(int(image[32 * 2, 102 * 2].mean()), 100)
+
+    def test_inferrs_body_from_walls_when_full_grid_is_free(self):
+        grid = np.zeros((120, 160), dtype=np.int8)
+        cv2.rectangle(grid, (30, 20), (130, 100), 100, 1)
+        # Simulate typical mapping breaks in an otherwise free background.
+        grid[20, 74:78] = 0
+        grid[57:62, 30] = 0
+        cv2.circle(grid, (78, 62), 6, 100, 1)
+
+        encoded, info = self.renderer.render(grid.ravel(), 160, 120, 0.05)
+        image = cv2.imdecode(
+            np.frombuffer(base64.b64decode(encoded), dtype=np.uint8),
+            cv2.IMREAD_COLOR,
+        )
+
+        self.assertEqual(info["boundary_mode"], "wall-inference")
+        self.assertTrue(info["primary_contour_closed"])
+        self.assertGreater(info["wall_inference_radius_m"], 0)
+        # The enclosing rectangle is recovered, while its interior obstacle is
+        # deferred from this exterior-only layer.
+        self.assertGreater(int(image[62 * 2, 78 * 2].mean()), 180)
+        self.assertLess(int(image[8 * 2, 8 * 2].mean()), 100)
 
     def test_removes_nearby_parallel_duplicate_wall_stroke(self):
         lines = [
@@ -184,32 +228,34 @@ class TestOccupancyMapRenderer(unittest.TestCase):
 
         self.assertGreater(cv2.countNonZero(cleaned[49:52, 73:88]), 0)
 
-    def test_does_not_regularize_square_as_round_obstacle(self):
+    def test_rebuilds_square_as_rectangle_not_circle(self):
         grid = np.full((100, 100), -1, dtype=np.int8)
         grid[5:95, 5:95] = 0
         cv2.rectangle(grid, (38, 38), (62, 62), 100, -1)
 
         _, info = self.renderer.render(grid.ravel(), 100, 100, 0.05)
 
-        self.assertEqual(info["regularized_shapes"], 0)
+        self.assertEqual(info["interior_circles"], 0)
+        self.assertGreaterEqual(info["interior_rectangles"], 1)
 
-    def test_rebuilds_nearly_round_ellipse_as_standard_circle(self):
+    def test_rebuilds_ellipse_internal_obstacle(self):
         grid = np.full((100, 100), -1, dtype=np.int8)
         grid[5:95, 5:95] = 0
         cv2.ellipse(grid, (50, 50), (12, 10), 0, 0, 360, 100, -1)
 
         _, info = self.renderer.render(grid.ravel(), 100, 100, 0.05)
 
-        self.assertEqual(info["regularized_shapes"], 1)
+        self.assertEqual(info["interior_circles"], 0)
+        self.assertGreaterEqual(info["interior_ellipses"], 1)
 
-    def test_rebuilds_round_obstacle_as_standard_circle(self):
+    def test_rebuilds_round_internal_obstacle(self):
         grid = np.full((100, 100), -1, dtype=np.int8)
         grid[5:95, 5:95] = 0
         cv2.circle(grid, (50, 50), 12, 100, -1)
 
         _, info = self.renderer.render(grid.ravel(), 100, 100, 0.05)
 
-        self.assertEqual(info["regularized_shapes"], 1)
+        self.assertGreaterEqual(info["interior_circles"], 1)
 
 
 if __name__ == "__main__":

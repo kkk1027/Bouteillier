@@ -294,6 +294,8 @@
     let mapResolution = 0.05;
     let mapOriginX = 0, mapOriginY = 0;
     let mapWidth = 0, mapHeight = 0;
+    // Artifact images may be rendered at a larger pixel scale than the ROS grid.
+    let mapRenderScale = 1;
     let robotX = 0, robotY = 0, robotTheta = 0;
     let scale = 1.0, offsetX = 0, offsetY = 0;
     let isDragging = false, dragStartX = 0, dragStartY = 0;
@@ -460,8 +462,8 @@
     
     // ==================== 地图功能 ====================
     function worldToPixel(worldX, worldY) {
-        let px = (worldX - mapOriginX) / mapResolution;
-        let py = (worldY - mapOriginY) / mapResolution;
+        let px = ((worldX - mapOriginX) / mapResolution) * mapRenderScale;
+        let py = ((worldY - mapOriginY) / mapResolution) * mapRenderScale;
         return { x: px, y: py };
     }
     
@@ -694,8 +696,10 @@
             mapResolution = data.resolution;
             mapOriginX = data.origin_x;
             mapOriginY = data.origin_y;
-            mapWidth = data.width;
-            mapHeight = data.height;
+            const render = (data.artifact && data.artifact.render) || {};
+            mapRenderScale = Number(render.scale) || 1;
+            mapWidth = Number(render.width) || img.naturalWidth || data.width * mapRenderScale;
+            mapHeight = Number(render.height) || img.naturalHeight || data.height * mapRenderScale;
             resetView();
             document.getElementById('map-state-text').textContent = '已优化';
             document.getElementById('close-map').disabled = false;
@@ -705,7 +709,20 @@
             if (renderInfo) {
                 const bridges = renderInfo.bridged_gaps ?? 0;
                 const shapes = renderInfo.regularized_shapes ?? 0;
-                const summary = "展示清理：去噪 " + renderInfo.removed_components + " 处 · 连线 " + bridges + " 处 · 重构 " + shapes + " 处";
+                const circles = renderInfo.interior_circles ?? 0;
+                const ellipses = renderInfo.interior_ellipses ?? 0;
+                const rectangles = renderInfo.interior_rectangles ?? 0;
+                const lines = renderInfo.interior_lines ?? 0;
+                const interiorTotal = circles + ellipses + rectangles + lines
+                    + (renderInfo.interior_irregulars ?? 0);
+                const interior = interiorTotal > 0
+                    ? " · 内部障碍 " + interiorTotal + " 个（圆 " + circles
+                        + " · 椭圆 " + ellipses + " · 矩形 " + rectangles
+                        + " · 线段 " + lines + "）"
+                    : "";
+                const summary = "展示清理：去噪 " + renderInfo.removed_components
+                    + " 处 · 连线 " + bridges + " 处 · 重构 " + shapes + " 处"
+                    + interior;
                 mapMeta.textContent = summary;
                 addLog(`地图渲染完成 ${mapWidth}x${mapHeight}，${summary}`, 'success');
             } else {

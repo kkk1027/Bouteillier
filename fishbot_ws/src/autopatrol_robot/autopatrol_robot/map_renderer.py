@@ -9,10 +9,12 @@ from typing import Sequence
 import cv2
 import numpy as np
 
+from autopatrol_robot.interior_obstacle_renderer import InteriorObstacleRenderer
+
 
 @dataclass(frozen=True)
 class MapRenderSettings:
-    """Metric thresholds for conservative cleanup with object preservation."""
+    """Metric thresholds for the display-only principal map boundary."""
 
     occupied_threshold: int = 65
     min_island_area_m2: float = 0.012
@@ -34,6 +36,15 @@ class MapRenderSettings:
     min_round_radius_m: float = 0.10
     max_round_radius_m: float = 1.25
     endpoint_direction_probe_px: int = 5
+    principal_close_gap_m: float = 0.20
+    principal_simplify_m: float = 0.20
+    principal_axis_ratio: float = 1.65
+    principal_outline_width_m: float = 0.06
+    wall_inference_bridge_steps_m: tuple[float, ...] = (
+        0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75,
+    )
+    wall_inference_min_body_ratio: float = 0.05
+    wall_inference_min_body_m2: float = 1.0
     render_scale: int = 2
 
 
@@ -46,6 +57,18 @@ class MapRenderStats:
     removed_duplicate_segments: int = 0
     closed_wall_gaps: int = 0
     regularized_shapes: int = 0
+    primary_contour_vertices: int = 0
+    primary_contour_closed: bool = False
+    ignored_interior_obstacles: int = 0
+    interior_obstacle_candidates: int = 0
+    interior_removed_components: int = 0
+    interior_circles: int = 0
+    interior_ellipses: int = 0
+    interior_rectangles: int = 0
+    interior_lines: int = 0
+    interior_irregulars: int = 0
+    boundary_mode: str = "free-space"
+    wall_inference_radius_m: float = 0.0
     source_width: int = 0
     source_height: int = 0
     output_width: int = 0
@@ -60,6 +83,7 @@ class OccupancyMapRenderer:
 
     def __init__(self, settings: MapRenderSettings | None = None):
         self.settings = settings or MapRenderSettings()
+        self.interior_obstacle_renderer = InteriorObstacleRenderer()
 
     def render(
         self,
@@ -75,16 +99,27 @@ class OccupancyMapRenderer:
             raise ValueError(f"非法地图分辨率: {resolution}")
 
         grid = grid.reshape((height, width))
-        known = (grid >= 0).astype(np.uint8) * 255
         free = (
             (grid >= 0) & (grid < self.settings.occupied_threshold)
         ).astype(np.uint8) * 255
+        unknown = (grid < 0).astype(np.uint8) * 255
         obstacles = (
             grid >= self.settings.occupied_threshold
         ).astype(np.uint8) * 255
-
-        cleaned, stats = self._clean_obstacles(obstacles, resolution)
-        image = self._render_floorplan(known, free, cleaned, resolution, stats)
+        stats = MapRenderStats()
+        if self._can_use_free_space_boundary(free, unknown):
+            primary_floor, primary_contour = self._build_primary_floor_mask(
+                free, resolution, stats
+            )
+        else:
+            primary_floor, primary_contour = (
+                self._build_wall_inferred_floor_mask(
+                    obstacles, resolution, stats
+                )
+            )
+        image = self._render_floorplan(
+            primary_floor, primary_contour, obstacles, resolution, stats
+        )
         success, encoded = cv2.imencode(
             ".png", image, [cv2.IMWRITE_PNG_COMPRESSION, 6]
         )
@@ -92,6 +127,266 @@ class OccupancyMapRenderer:
             raise RuntimeError("地图 PNG 编码失败")
 
         return base64.b64encode(encoded.tobytes()).decode("ascii"), stats.to_dict()
+
+    def _can_use_free_space_boundary(
+        self, free: np.ndarray, unknown: np.ndarray
+    ) -> bool:
+        """Use the free-space outline only when an exterior unknown region exists."""
+        if cv2.countNonZero(unknown) == 0:
+            return False
+        border = np.concatenate(
+            (free[0], free[-1], free[1:-1, 0], free[1:-1, -1])
+        )
+        return float(np.count_nonzero(border)) / max(len(border), 1) < 0.85
+
+    def _build_primary_floor_mask(
+        self,
+        free: np.ndarray,
+        resolution: float,
+        stats: MapRenderStats,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Build one closed exterior contour for the dominant free-space body.
+
+        Raw maps contain broken wall pixels, small black holes and isolated white
+        speckles. Treating every occupied pixel as a wall exposes those defects
+        as unrelated segments. This view instead uses the largest traversable
+        area and its exterior boundary. Holes inside the body are deliberately
+        filled; internal obstacles will be added as a later, separate layer.
+        """
+        stats.boundary_mode = "free-space"
+        close_radius = max(
+            1, int(round(self.settings.principal_close_gap_m / resolution))
+        )
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (close_radius * 2 + 1, close_radius * 2 + 1)
+        )
+        joined = cv2.morphologyEx(free, cv2.MORPH_CLOSE, kernel)
+        stats.filled_gap_pixels = max(
+            0, int(cv2.countNonZero(joined) - cv2.countNonZero(free))
+        )
+
+        count, labels, components, _ = cv2.connectedComponentsWithStats(
+            joined, connectivity=8
+        )
+        if count <= 1:
+            return np.zeros_like(free), np.empty((0, 1, 2), dtype=np.int32)
+
+        areas = components[1:, cv2.CC_STAT_AREA]
+        primary_label = int(np.argmax(areas)) + 1
+        stats.removed_components = max(0, count - 2)
+        primary = np.where(labels == primary_label, 255, 0).astype(np.uint8)
+
+        return self._finalize_primary_component(primary, resolution, stats)
+
+    def _build_wall_inferred_floor_mask(
+        self,
+        obstacles: np.ndarray,
+        resolution: float,
+        stats: MapRenderStats,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Recover the main enclosed area when a map has no unknown exterior.
+
+        Some live OccupancyGrid publishers report every unobserved cell as free.
+        In that case the free-space component reaches all four image edges and
+        cannot identify a map body.  This fallback seals the wall mask
+        progressively, flood-fills the true exterior, then keeps only a
+        substantial enclosed region.
+        """
+        stats.boundary_mode = "wall-inference"
+        filtered, removed = self._filter_islands(obstacles, resolution)
+        stats.removed_components = removed
+        minimum_area = max(
+            int(
+                round(
+                    self.settings.wall_inference_min_body_m2
+                    / (resolution * resolution)
+                )
+            ),
+            int(
+                round(
+                    filtered.size * self.settings.wall_inference_min_body_ratio
+                )
+            ),
+        )
+        best_component = None
+        best_area = 0
+        best_radius = 0
+
+        for bridge_m in self.settings.wall_inference_bridge_steps_m:
+            radius = max(1, int(round(bridge_m / resolution)))
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1)
+            )
+            # Expand thin occupancy strokes before closing gaps. Closing a
+            # one-pixel wall directly can erode it and reopen the exterior.
+            support = cv2.dilate(
+                filtered, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            )
+            sealed = cv2.morphologyEx(support, cv2.MORPH_CLOSE, kernel)
+            enclosed = self._extract_enclosed_free_space(sealed)
+            count, labels, components, _ = cv2.connectedComponentsWithStats(
+                enclosed, connectivity=8
+            )
+            if count <= 1:
+                continue
+            areas = components[1:, cv2.CC_STAT_AREA]
+            label = int(np.argmax(areas)) + 1
+            area = int(components[label, cv2.CC_STAT_AREA])
+            if area > best_area:
+                best_area = area
+                best_component = np.where(
+                    labels == label, 255, 0
+                ).astype(np.uint8)
+                best_radius = radius
+            if area >= minimum_area:
+                stats.wall_inference_radius_m = bridge_m
+                stats.filled_gap_pixels = max(
+                    0,
+                    int(cv2.countNonZero(sealed) - cv2.countNonZero(support)),
+                )
+                return self._finalize_primary_component(
+                    np.where(labels == label, 255, 0).astype(np.uint8),
+                    resolution,
+                    stats,
+                )
+
+        if best_component is None:
+            return (
+                np.zeros_like(obstacles),
+                np.empty((0, 1, 2), dtype=np.int32),
+            )
+        # A small enclosed body is better than reverting to the full free grid,
+        # but it remains observable in the quality metadata for later tuning.
+        stats.wall_inference_radius_m = best_radius * resolution
+        return self._finalize_primary_component(
+            best_component, resolution, stats
+        )
+
+    @staticmethod
+    def _extract_enclosed_free_space(barrier: np.ndarray) -> np.ndarray:
+        """Return traversable cells not connected to any image border."""
+        traversable = np.where(barrier == 0, 255, 0).astype(np.uint8)
+        border_points = np.column_stack(
+            (
+                np.concatenate(
+                    (
+                        np.arange(traversable.shape[1]),
+                        np.arange(traversable.shape[1]),
+                        np.zeros(max(traversable.shape[0] - 2, 0), dtype=int),
+                        np.full(
+                            max(traversable.shape[0] - 2, 0),
+                            traversable.shape[1] - 1,
+                            dtype=int,
+                        ),
+                    )
+                ),
+                np.concatenate(
+                    (
+                        np.zeros(traversable.shape[1], dtype=int),
+                        np.full(
+                            traversable.shape[1],
+                            traversable.shape[0] - 1,
+                            dtype=int,
+                        ),
+                        np.arange(1, traversable.shape[0] - 1),
+                        np.arange(1, traversable.shape[0] - 1),
+                    )
+                ),
+            )
+        )
+        seed = next(
+            (
+                (int(x), int(y))
+                for x, y in border_points
+                if traversable[int(y), int(x)] > 0
+            ),
+            None,
+        )
+        if seed is None:
+            return np.zeros_like(barrier)
+        flooded = traversable.copy()
+        cv2.floodFill(flooded, None, seed, 128)
+        return np.where(
+            (traversable > 0) & (flooded != 128), 255, 0
+        ).astype(np.uint8)
+
+    def _finalize_primary_component(
+        self,
+        primary: np.ndarray,
+        resolution: float,
+        stats: MapRenderStats,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Simplify one primary region into a filled, closed exterior contour."""
+        contours, _ = cv2.findContours(
+            primary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+        )
+        if not contours:
+            return (
+                np.zeros_like(primary),
+                np.empty((0, 1, 2), dtype=np.int32),
+            )
+        contour = max(contours, key=cv2.contourArea)
+        epsilon = max(1.5, self.settings.principal_simplify_m / resolution)
+        simplified = cv2.approxPolyDP(contour, epsilon, True)
+        regularized = self._regularize_primary_contour(simplified)
+        if len(regularized) < 3:
+            regularized = simplified
+
+        floor = np.zeros_like(primary)
+        cv2.fillPoly(floor, [regularized], 255, lineType=cv2.LINE_AA)
+        stats.primary_contour_vertices = len(regularized)
+        stats.primary_contour_closed = len(regularized) >= 3
+        stats.closed_wall_gaps = int(stats.primary_contour_closed)
+        stats.vector_segments = len(regularized)
+
+        raw_contours, hierarchy = cv2.findContours(
+            primary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if hierarchy is not None:
+            stats.ignored_interior_obstacles = sum(
+                1 for index in range(len(raw_contours))
+                if hierarchy[0][index][3] >= 0
+            )
+        return floor, regularized
+
+    def _regularize_primary_contour(self, contour: np.ndarray) -> np.ndarray:
+        """Snap near-horizontal and near-vertical boundary runs to clean axes."""
+        points = contour.reshape(-1, 2).astype(float)
+        if len(points) < 3:
+            return contour.astype(np.int32)
+
+        axis_ratio = self.settings.principal_axis_ratio
+        orientations: list[str | None] = []
+        for index in range(len(points)):
+            start = points[index]
+            end = points[(index + 1) % len(points)]
+            delta_x, delta_y = end - start
+            horizontal = abs(delta_x) >= abs(delta_y) * axis_ratio
+            vertical = abs(delta_y) >= abs(delta_x) * axis_ratio
+            orientations.append("h" if horizontal else "v" if vertical else None)
+
+        # Shared edge coordinates make perpendicular runs meet at exact corners.
+        # Diagonal or curved runs keep their geometry.
+        for _ in range(2):
+            updated = points.copy()
+            for index in range(len(points)):
+                horizontal_values = []
+                vertical_values = []
+                previous = (index - 1) % len(points)
+                for edge in (previous, index):
+                    start = points[edge]
+                    end = points[(edge + 1) % len(points)]
+                    if orientations[edge] == "h":
+                        horizontal_values.append((start[1] + end[1]) / 2.0)
+                    elif orientations[edge] == "v":
+                        vertical_values.append((start[0] + end[0]) / 2.0)
+                if horizontal_values:
+                    updated[index, 1] = float(np.mean(horizontal_values))
+                if vertical_values:
+                    updated[index, 0] = float(np.mean(vertical_values))
+            points = updated
+
+        return np.rint(points).astype(np.int32).reshape(-1, 1, 2)
 
     def _clean_obstacles(
         self, obstacles: np.ndarray, resolution: float
@@ -207,31 +502,68 @@ class OccupancyMapRenderer:
 
     def _render_floorplan(
         self,
-        known: np.ndarray,
-        free: np.ndarray,
+        primary_floor: np.ndarray,
+        primary_contour: np.ndarray,
         obstacles: np.ndarray,
         resolution: float,
         stats: MapRenderStats,
     ) -> np.ndarray:
         scale = self.settings.render_scale
-        height, width = obstacles.shape
+        height, width = primary_floor.shape
         output_size = (width * scale, height * scale)
         stats.source_width = width
         stats.source_height = height
         stats.output_width, stats.output_height = output_size
 
-        known_large = cv2.resize(known, output_size, interpolation=cv2.INTER_NEAREST)
-        free_large = cv2.resize(free, output_size, interpolation=cv2.INTER_NEAREST)
-        canvas = np.full((height * scale, width * scale, 3), (45, 40, 31), dtype=np.uint8)
-        canvas[known_large > 0] = (205, 220, 215)
-        canvas[free_large > 0] = (232, 242, 236)
-
-        wall_layer = self._draw_vector_walls(obstacles, resolution, scale, stats)
-        halo = cv2.dilate(
-            wall_layer, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        canvas = np.full(
+            # This BGR tuple passes through an RGB conversion before PNG encoding.
+            # Its encoded browser color is the Canvas background: #0a0e1a.
+            (height * scale, width * scale, 3), (10, 14, 26), dtype=np.uint8
         )
-        canvas[halo > 0] = (179, 199, 193)
-        canvas[wall_layer > 0] = (49, 76, 76)
+        floor_large = cv2.resize(
+            primary_floor, output_size, interpolation=cv2.INTER_NEAREST
+        )
+        canvas[floor_large > 0] = (232, 242, 236)
+
+        outline_width = max(
+            2,
+            int(
+                round(
+                    self.settings.principal_outline_width_m / resolution * scale
+                )
+            ),
+        )
+        wall_color = (49, 76, 76)
+        if len(primary_contour) >= 3:
+            outline = primary_contour.astype(np.int32) * scale
+            cv2.polylines(
+                canvas,
+                [outline],
+                True,
+                wall_color,
+                outline_width,
+                cv2.LINE_AA,
+            )
+
+        interior_stats = self.interior_obstacle_renderer.draw(
+            obstacles,
+            primary_floor,
+            resolution,
+            scale,
+            canvas,
+            wall_color,
+            outline_width,
+        )
+        stats.interior_obstacle_candidates = interior_stats.candidates
+        stats.interior_removed_components = interior_stats.removed_components
+        stats.interior_circles = interior_stats.circles
+        stats.interior_ellipses = interior_stats.ellipses
+        stats.interior_rectangles = interior_stats.rectangles
+        stats.interior_lines = interior_stats.lines
+        stats.interior_irregulars = interior_stats.irregulars
+        stats.regularized_shapes += interior_stats.regularized_shapes
+        stats.filled_gap_pixels += interior_stats.filled_gap_pixels
+        stats.removed_components += interior_stats.removed_components
 
         return cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
 

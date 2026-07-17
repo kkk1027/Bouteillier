@@ -25,6 +25,8 @@ setup(
             'patrol_node=autopatrol_robot.patrol_node:main',
             'patrol_nodeA=autopatrol_robot.patrol_nodeA:main',
             'patrol_nodeB=autopatrol_robot.patrol_nodeB:main',
+            'map_artifact_node=autopatrol_robot.map_artifact_node:main',
+            'map_artifact_export=autopatrol_robot.map_artifact:main_export',
         ],
     },
 )
