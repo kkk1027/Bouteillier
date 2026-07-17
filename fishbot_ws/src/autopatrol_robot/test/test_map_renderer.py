@@ -39,6 +39,16 @@ class TestOccupancyMapRenderer(unittest.TestCase):
         self.assertEqual(info["output_width"], 180)
         self.assertEqual(info["output_height"], 120)
 
+    def test_primary_floor_mask_has_no_antialiased_edge_values(self):
+        grid = np.full((80, 120), -1, dtype=np.int8)
+        grid[10:70, 15:105] = 0
+        free = (grid == 0).astype(np.uint8) * 255
+        stats = MapRenderStats()
+
+        floor, _ = self.renderer._build_primary_floor_mask(free, 0.05, stats)
+
+        self.assertTrue(set(np.unique(floor)).issubset({0, 255}))
+
     def test_preserves_continuous_walls_and_joins_short_gap(self):
         obstacles = np.zeros((80, 100), dtype=np.uint8)
         cv2.line(obstacles, (10, 40), (34, 40), 255, 1)
@@ -115,8 +125,8 @@ class TestOccupancyMapRenderer(unittest.TestCase):
         self.assertTrue(info["primary_contour_closed"])
         self.assertEqual(info["closed_wall_gaps"], 1)
         self.assertGreaterEqual(info["ignored_interior_obstacles"], 1)
-        # Circle centre becomes part of the white primary body.
-        self.assertGreater(int(image[74 * 2, 62 * 2].mean()), 180)
+        # Closed internal obstacles are now filled with the wall color.
+        self.assertLess(int(image[74 * 2, 62 * 2].mean()), 100)
         # The exterior-connected notch remains black.
         self.assertLess(int(image[32 * 2, 102 * 2].mean()), 100)
 
@@ -137,9 +147,9 @@ class TestOccupancyMapRenderer(unittest.TestCase):
         self.assertEqual(info["boundary_mode"], "wall-inference")
         self.assertTrue(info["primary_contour_closed"])
         self.assertGreater(info["wall_inference_radius_m"], 0)
-        # The enclosing rectangle is recovered, while its interior obstacle is
-        # deferred from this exterior-only layer.
-        self.assertGreater(int(image[62 * 2, 78 * 2].mean()), 180)
+        # The enclosing rectangle is recovered and its closed internal
+        # obstacle is filled by the independent interior layer.
+        self.assertLess(int(image[62 * 2, 78 * 2].mean()), 100)
         self.assertLess(int(image[8 * 2, 8 * 2].mean()), 100)
 
     def test_removes_nearby_parallel_duplicate_wall_stroke(self):

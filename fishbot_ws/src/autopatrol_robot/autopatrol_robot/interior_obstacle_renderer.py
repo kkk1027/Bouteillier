@@ -41,6 +41,7 @@ class InteriorObstacleStats:
     rectangles: int = 0
     lines: int = 0
     irregulars: int = 0
+    filled_closed_shapes: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -105,14 +106,18 @@ class InteriorObstacleRenderer:
                 center_x, center_y, radius = geometry
                 accepted_circles.append((center_x, center_y, radius))
                 stats.circles += 1
+                stats.filled_closed_shapes += 1
             elif kind == "ellipse":
                 stats.ellipses += 1
+                stats.filled_closed_shapes += 1
             elif kind == "rectangle":
                 stats.rectangles += 1
+                stats.filled_closed_shapes += 1
             elif kind == "line":
                 stats.lines += 1
             else:
                 stats.irregulars += 1
+                stats.filled_closed_shapes += 1
 
         # Hough only supplements damaged arcs that were not already rebuilt from
         # a connected component. The sampled support blocks false detections.
@@ -133,6 +138,7 @@ class InteriorObstacleRenderer:
             )
             accepted_circles.append((center_x, center_y, radius))
             stats.circles += 1
+            stats.filled_closed_shapes += 1
 
         return stats
 
@@ -392,20 +398,26 @@ class InteriorObstacleRenderer:
     ) -> None:
         if kind == "circle":
             center_x, center_y, radius = geometry
+            center = (int(round(center_x * scale)), int(round(center_y * scale)))
+            scaled_radius = int(round(radius * scale))
+            cv2.circle(canvas, center, scaled_radius, color, -1, cv2.LINE_AA)
             cv2.circle(
-                canvas,
-                (int(round(center_x * scale)), int(round(center_y * scale))),
-                int(round(radius * scale)),
-                color,
-                line_width,
-                cv2.LINE_AA,
+                canvas, center, scaled_radius, color, line_width, cv2.LINE_AA
             )
         elif kind == "ellipse":
             (center_x, center_y), axes, angle = geometry
+            center = (int(round(center_x * scale)), int(round(center_y * scale)))
+            scaled_axes = (
+                int(round(axes[0] * scale / 2.0)),
+                int(round(axes[1] * scale / 2.0)),
+            )
+            cv2.ellipse(
+                canvas, center, scaled_axes, angle, 0, 360, color, -1, cv2.LINE_AA
+            )
             cv2.ellipse(
                 canvas,
-                (int(round(center_x * scale)), int(round(center_y * scale))),
-                (int(round(axes[0] * scale / 2.0)), int(round(axes[1] * scale / 2.0))),
+                center,
+                scaled_axes,
                 angle,
                 0,
                 360,
@@ -415,6 +427,7 @@ class InteriorObstacleRenderer:
             )
         elif kind == "rectangle":
             points = np.rint(geometry * scale).astype(np.int32).reshape(-1, 1, 2)
+            cv2.fillPoly(canvas, [points], color, lineType=cv2.LINE_AA)
             cv2.polylines(canvas, [points], True, color, line_width, cv2.LINE_AA)
         elif kind == "line":
             start, end = geometry
@@ -428,4 +441,5 @@ class InteriorObstacleRenderer:
             )
         else:
             points = np.rint(geometry * scale).astype(np.int32).reshape(-1, 1, 2)
+            cv2.fillPoly(canvas, [points], color, lineType=cv2.LINE_AA)
             cv2.polylines(canvas, [points], True, color, line_width, cv2.LINE_AA)

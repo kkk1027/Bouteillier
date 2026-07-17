@@ -34,6 +34,9 @@ class TestInteriorObstacleRenderer(unittest.TestCase):
         self.assertGreaterEqual(stats.circles, 1)
         self.assertGreaterEqual(stats.rectangles, 1)
         self.assertGreaterEqual(stats.lines, 1)
+        self.assertGreaterEqual(stats.filled_closed_shapes, 2)
+        self.assertTrue(np.array_equal(self.canvas[96, 96], (49, 76, 76)))
+        self.assertTrue(np.array_equal(self.canvas[98, 200], (49, 76, 76)))
         self.assertGreater(int(np.count_nonzero(self.canvas[76:120, 76:120])), 0)
         self.assertGreater(int(np.count_nonzero(self.canvas[170:208, 80:260])), 0)
 

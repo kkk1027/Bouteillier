@@ -58,6 +58,7 @@ ros2 launch autopatrol_robot map_artifact.launch.py \
    - 删除小面积、短长度和孤立噪点。
    - 仅在局部小距离内补齐同一候选的断口。
    - 按严格条件重建标准圆、椭圆、矩形、线段或保守的简化多边形。
+   - 对已确认闭合的圆、椭圆、矩形和多边形，以与边线相同的颜色填充；开放线段不填充。
 3. `MapArtifact` 统一导出 PNG、SVG 和 JSON；三者必须来自同一次处理结果。
 
 不要调用已保留的旧私有辅助函数（例如 `_draw_vector_walls`）作为新的业务入口；它们只用于历史兼容测试。
@@ -68,7 +69,7 @@ ros2 launch autopatrol_robot map_artifact.launch.py \
 
 - `primary_contour_closed` 必须为 `true`，否则不应作为最终已建图展示结果发布。
 - `boundary_mode` 为 `free-space` 或 `wall-inference`。后者表示输入 `/map` 没有可用的未知区域，使用了墙体推断，应记录该事实。
-- `interior_*` 字段记录内部候选、剔除量和各形状类别数量。
+- `interior_*` 字段记录内部候选、剔除量和各形状类别数量；`interior_filled_shapes` 记录已填充的闭合障碍物数量。
 - `removed_components`、`filled_gap_pixels`、`bridged_gaps` 用于排查是否出现过度清理或过度补线。
 
 建议验收规则：

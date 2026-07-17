@@ -67,6 +67,7 @@ class MapRenderStats:
     interior_rectangles: int = 0
     interior_lines: int = 0
     interior_irregulars: int = 0
+    interior_filled_shapes: int = 0
     boundary_mode: str = "free-space"
     wall_inference_radius_m: float = 0.0
     source_width: int = 0
@@ -333,7 +334,9 @@ class OccupancyMapRenderer:
             regularized = simplified
 
         floor = np.zeros_like(primary)
-        cv2.fillPoly(floor, [regularized], 255, lineType=cv2.LINE_AA)
+        # The floor mask must stay binary: anti-aliased edge values become
+        # full floor pixels after scaling and leak past the dark outline.
+        cv2.fillPoly(floor, [regularized], 255, lineType=cv2.LINE_8)
         stats.primary_contour_vertices = len(regularized)
         stats.primary_contour_closed = len(regularized) >= 3
         stats.closed_wall_gaps = int(stats.primary_contour_closed)
@@ -520,8 +523,9 @@ class OccupancyMapRenderer:
             # Its encoded browser color is the Canvas background: #0a0e1a.
             (height * scale, width * scale, 3), (10, 14, 26), dtype=np.uint8
         )
+        floor_binary = np.where(primary_floor >= 128, 255, 0).astype(np.uint8)
         floor_large = cv2.resize(
-            primary_floor, output_size, interpolation=cv2.INTER_NEAREST
+            floor_binary, output_size, interpolation=cv2.INTER_NEAREST
         )
         canvas[floor_large > 0] = (232, 242, 236)
 
@@ -561,6 +565,7 @@ class OccupancyMapRenderer:
         stats.interior_rectangles = interior_stats.rectangles
         stats.interior_lines = interior_stats.lines
         stats.interior_irregulars = interior_stats.irregulars
+        stats.interior_filled_shapes = interior_stats.filled_closed_shapes
         stats.regularized_shapes += interior_stats.regularized_shapes
         stats.filled_gap_pixels += interior_stats.filled_gap_pixels
         stats.removed_components += interior_stats.removed_components

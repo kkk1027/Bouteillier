@@ -715,10 +715,11 @@
                 const lines = renderInfo.interior_lines ?? 0;
                 const interiorTotal = circles + ellipses + rectangles + lines
                     + (renderInfo.interior_irregulars ?? 0);
+                const filledShapes = renderInfo.interior_filled_shapes ?? 0;
                 const interior = interiorTotal > 0
                     ? " · 内部障碍 " + interiorTotal + " 个（圆 " + circles
                         + " · 椭圆 " + ellipses + " · 矩形 " + rectangles
-                        + " · 线段 " + lines + "）"
+                        + " · 线段 " + lines + " · 填充 " + filledShapes + "）"
                     : "";
                 const summary = "展示清理：去噪 " + renderInfo.removed_components
                     + " 处 · 连线 " + bridges + " 处 · 重构 " + shapes + " 处"
