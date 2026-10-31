@@ -320,6 +320,7 @@ class AmclTracer(Node):
         # ---- 变化量与跳变判定 ----
         d_pose = d_yaw = None
         d_mo = d_ob = None
+        d_mo_yaw = d_ob_yaw = None
         evt = ''
         if self.prev is not None:
             px, py, pa, pmo, pob = self.prev
@@ -327,23 +328,46 @@ class AmclTracer(Node):
             d_yaw = abs(math.degrees(_wrap(yaw - pa)))
             if mo is not None and pmo is not None:
                 d_mo = math.hypot(mo[0] - pmo[0], mo[1] - pmo[1])
+                d_mo_yaw = abs(math.degrees(_wrap(mo[2] - pmo[2])))
             if ob is not None and pob is not None:
                 d_ob = math.hypot(ob[0] - pob[0], ob[1] - pob[1])
+                d_ob_yaw = abs(math.degrees(_wrap(ob[2] - pob[2])))
 
-            if d_pose > self.jump_dist or (d_yaw or 0) > math.degrees(self.jump_yaw):
+            # ==========================================================
+            # 跳变判定（2026-10-31 修订：必须把**纯旋转**排除掉）
+            # ----------------------------------------------------------
+            # 旧逻辑只看平量是否变化，结果车原地转圈时 pose yaw 每秒
+            # 变 20°，远超 5°/采样的阈值，于是每次采样都记一条「跳变」，
+            # 而 map→odom / odom→base 的**平移量**几乎没变 → 归因成
+            # 「未知」。实测 20 秒内刷出 15 条假跳变，把真问题（120s
+            # 超时全局重撒）埋在噪声里。
+            #
+            # 正确做法：真正的定位跳变必然体现在 **map→odom** 上
+            # （那是 AMCL 的修正量）。车自己转时 odom→base 变、map→odom
+            # 不变；所以只认 map→odom 的平移**或 yaw** 突变。
+            # ==========================================================
+            jump_mo = ((d_mo is not None and d_mo > self.jump_dist * 0.7)
+                       or (d_mo_yaw is not None
+                           and d_mo_yaw > math.degrees(self.jump_yaw)))
+            jump_ob = ((d_ob is not None and d_ob > self.jump_dist * 0.7)
+                       or (d_ob_yaw is not None
+                           and d_ob_yaw > math.degrees(self.jump_yaw)))
+
+            if jump_mo or jump_ob:
                 src = []
-                if d_mo is not None and d_mo > self.jump_dist * 0.7:
+                if jump_mo:
                     src.append('AMCL')
-                if d_ob is not None and d_ob > self.jump_dist * 0.7:
+                if jump_ob:
                     src.append('EKF')
-                tag = '+'.join(src) or '未知'
+                tag = '+'.join(src)
                 self.jump_count += 1
                 evt = 'JUMP[%s] %.2fm/%.1f°' % (tag, d_pose, d_yaw or 0)
-                self._event('跳变 #%d  %s  来源=%s  (map→odom=%s, odom→base=%s)'
-                            % (self.jump_count, evt,
-                               tag,
-                               '%.2f' % d_mo if d_mo is not None else '缺失',
-                               '%.2f' % d_ob if d_ob is not None else '缺失'))
+                self._event(
+                    '跳变 #%d  %s  来源=%s  '
+                    '(map→odom %.2fm/%.1f°, odom→base %.2fm/%.1f°)'
+                    % (self.jump_count, evt, tag,
+                       d_mo or 0.0, d_mo_yaw or 0.0,
+                       d_ob or 0.0, d_ob_yaw or 0.0))
 
         self.prev = (x, y, yaw, mo, ob)
 

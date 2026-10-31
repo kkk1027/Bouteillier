@@ -255,6 +255,8 @@ class AutoLocalizer(Node):
         self._nomotion_suspended = False
         # 上次塔缩恢复的时刻（冷却期用，见 collapse_cooldown_sec）
         self._last_collapse_time = None
+        # 是否已就「粒子好但地图校验不过」告警过
+        self._blocked_by_map_warned = False
         # 激光健康度：用于区分「车没动」与「根本没激光」
         self._scan_count = 0
         self._last_scan_time = None
@@ -653,6 +655,18 @@ class AutoLocalizer(Node):
         return (std_xy <= self.good_enough_cov_xy
                 and std_yaw <= self.good_enough_cov_yaw)
 
+    def _cov_below_converge(self) -> bool:
+        """协方差是否已达到**收敛判据**（但可能被地图校验卡住）。
+
+        用于区分「粒子云真的没收敛」与「粒子云很好但地图校验不过」：
+        前者需要重撒，后者绝不能重撒（会把正确位姿扔掉）。
+        """
+        if self._latest_cov is None:
+            return False
+        var_x, var_y, var_yaw = self._latest_cov
+        return (math.sqrt(max(0.0, max(var_x, var_y))) <= self.converge_cov_xy
+                and math.sqrt(max(0.0, var_yaw)) <= self.converge_cov_yaw)
+
     def _maybe_request_nomotion(self, now) -> None:
         # ==========================================================
         # 收敛后是否继续请求 nomotion 更新
@@ -743,9 +757,28 @@ class AutoLocalizer(Node):
 
         width, height, res, ox, oy = self._map_dims
         x, y, _ = self._latest_pose
-        # 世界坐标 -> 栅格索引（PGM 行 0 在顶部，故 y 需要翻转）
+        # ==========================================================
+        # ★ 世界坐标 -> OccupancyGrid 索引（2026-10-31 修过一个致命 bug）
+        # ----------------------------------------------------------
+        # 这里**不能**做 Y 翻转！
+        #
+        # `_map_data` 来自 /map（OccupancyGrid），而 map_server 加载 PGM 时
+        # 已经翻过一次：data[x + (height - y_img - 1) * width]。也就是说
+        # OccupancyGrid 的 data 行号就是**世界坐标系自下往上**的行号，
+        # 直接等于 int((y - origin_y) / res)。
+        #
+        # 旧代码照搬了「直接读 PGM 文件」的写法，又翻了一次：
+        #     row = height - 1 - int((y - oy) / res)
+        # 结果读到的是**上下镜像**的像素。
+        #
+        # 实测后果（room1 地图，67.9% 是未知灰）：
+        #   真实位姿 (0.34, -0.07) 正确地落在一片全 254(空闲) 的区域，
+        #   镜像后读到的却是上方 205(未知) 的像素，于是判「假收敛」，
+        #   永远不收敛 → 120s 超时 → 全局重撒 → 位姿瞬移 1.8m，
+        #   然后每 120 秒循环一次。本次 trace 里的 1.83m 跳变就是这个。
+        # ==========================================================
         col = int((x - ox) / res)
-        row = height - 1 - int((y - oy) / res)
+        row = int((y - oy) / res)
 
         if not (0 <= col < width and 0 <= row < height):
             return False, '位姿在地图范围之外 (%.2f, %.2f)' % (x, y)
@@ -755,7 +788,8 @@ class AutoLocalizer(Node):
             return False, '位姿落在未知区域（地图没覆盖这里）'
         if val >= 65:
             return False, '位姿落在障碍物上（物理上不可能）'
-        return True, '位姿位于已知空闲区域（栅格值 %d）'
+        return True, '位姿位于已知空闲区域（栅格值 %d / 栅格 %d,%d）' % (
+            val, col, row)
 
     def _check_collapse(self, now) -> bool:
         """检测并处理粒子塔缩。返回 True 表示当前正处于塔缩状态。
@@ -952,6 +986,42 @@ class AutoLocalizer(Node):
         if self.state == self.STATE_CONVERGED:
             return
         if elapsed < self.timeout_sec:
+            return
+        # ==========================================================
+        # ★ 粒子云已经够集中时，绝不能再全局重撒（2026-10-31）
+        # ----------------------------------------------------------
+        # 之前只要「没进 CONVERGED」就无脑重撒。但没进 CONVERGED 有
+        # 两种完全不同的原因：
+        #   (a) 粒子云真的没收敛      → 重撒是对的
+        #   (b) 粒子云已经很集中，只是**地图校验**不通过（例如位姿落在
+        #       未知区）            → 重撒是灾难
+        #
+        # 情况 (b) 实测后果：σ_xy=0.027m 的极好估计被撒满全图，
+        # 位姿瞬间跳 1.83m，然后重新收敛、再次超时、再次跳走 ——
+        # 每 120 秒循环一次。用户看到的就是「车自己隔一会儿蹦一下」。
+        #
+        # 所以：σ 已达标的场合，只告警不重撒，也不终止（保留监控）。
+        # 真正的修法是换一张覆盖完整的地图。
+        # ==========================================================
+        if self._cov_below_converge():
+            if not self._blocked_by_map_warned:
+                self._blocked_by_map_warned = True
+                _, why = self._check_pose_on_map()
+                self.get_logger().error(
+                    '⚠️ 粒子云已经很集中（σ_xy=%.3fm σ_yaw=%.1f°），却无法'
+                    '判定收敛：%s\n'
+                    '   这不是定位算法的问题，而是**地图覆盖不全**：位姿落在'
+                    '地图未知/障碍区域。\n'
+                    '   已**不做**全局重撒 —— 那会把这个本来正确的位姿直接'
+                    '扔掉，造成米级瞬移。\n'
+                    '   正确做法：换一张建图时覆盖完整的图，或重新建图。'
+                    % (math.sqrt(max(0.0, max(self._latest_cov[0],
+                                              self._latest_cov[1]))),
+                       math.degrees(math.sqrt(max(0.0,
+                                                  self._latest_cov[2]))), why))
+            # 不重撒、不终止，继续盯着（若换图/移动后恢复正常会自动收敛）
+            self._start_time = self.get_clock().now()
+            self._converged_since = None
             return
         # 超时不等于定位失败：粒子云没收敛往往只是这一轮撒得不好。
         # 重撒一次粒子通常就能成功，所以先重试再放弃。
