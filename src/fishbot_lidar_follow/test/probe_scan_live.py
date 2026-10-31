@@ -26,8 +26,8 @@ from sensor_msgs.msg import LaserScan
 from fishbot_lidar_follow import geometry as GEO
 
 # 与 config/lidar_follow.yaml 默认值一致
-LOCK_MAX = 0.50   # 单簇锁定门槛（实机标定：0.44m 时点云最稳）
-TRACK_MAX = 1.20
+LOCK_MAX = 0.80   # 正前方单簇锁定门槛（距离整体 +0.30m）
+TRACK_MAX = 1.50
 SECTOR_DEG = 30.0
 ANG_GAP = math.radians(2.5)
 RNG_GAP = 0.15
@@ -40,15 +40,24 @@ MAX_TARGET_JUMP = 0.30
 
 # ---- 双腿配对（与节点默认值一致）----
 PAIR_ENABLE = True
-PAIR_LOCK_MAX = 1.00
-PAIR_TRACK_MAX = 1.20
-PAIR_MAX_SEP = 0.60
+PAIR_LOCK_MAX = 1.30
+PAIR_TRACK_MAX = 1.50
+PAIR_MAX_SEP = 0.42
 PAIR_MIN_SEP = 0.05
 PAIR_MAX_DIFF = 0.35
 PAIR_MIN_POINTS = 2
 PAIR_MAX_SPAN = 45.0
 PAIR_MAX_LATERAL = 0.50
 PAIR_MAX_ALONG = 0.25
+PAIR_REJECT_MULTI = True
+PAIR_MULTI_RADIUS = 0.70
+# 防误锁
+SHAPE_FILTER = True
+SINGLE_MAX_SPAN = 35.0
+SINGLE_MAX_POINTS = 45
+EDGE_MARGIN_DEG = 4.0
+SIDE_SECTOR_DEG = 30.0
+LOCK_MAX_SIDE = 0.55
 LOCK_SECTOR_DEG = 75.0
 MAX_ANGLE_JUMP = math.radians(25.0)
 CONFIRM_FRAMES = 3
@@ -123,9 +132,18 @@ class LiveMonitor(Node):
             pair_max_span_deg=PAIR_MAX_SPAN,
             pair_max_lateral_sep=PAIR_MAX_LATERAL,
             pair_max_along_sep=PAIR_MAX_ALONG,
+            pair_reject_multi=PAIR_REJECT_MULTI,
+            pair_multi_radius=PAIR_MULTI_RADIUS,
             leg_fallback=LEG_FALLBACK,
             leg_max_points=LEG_MAX_POINTS,
-            leg_max_dist_diff=LEG_MAX_DIFF)
+            leg_max_dist_diff=LEG_MAX_DIFF,
+            shape_filter_enable=SHAPE_FILTER,
+            single_max_span_deg=SINGLE_MAX_SPAN,
+            single_max_points=SINGLE_MAX_POINTS,
+            edge_margin_deg=EDGE_MARGIN_DEG,
+            sector_half_rad=half,
+            lock_max_range_side=LOCK_MAX_SIDE,
+            side_sector_rad=math.radians(SIDE_SECTOR_DEG))
 
         rear_ok = GEO.rear_is_clear(
             all_clusters, math.radians(REAR_DEG), REAR_RANGE)
@@ -184,8 +202,8 @@ class LiveMonitor(Node):
                 self.lock_cand = None
                 print('\n🔒🔒 %s  【锁定成功】%s %.2fm / %+.1f°（%d点）%s 🔒🔒'
                       % (ts, kind, d, math.degrees(a), n, extra))
-            state = ('RETREAT 后退' if d < 0.50 else
-                     'HOLD 不动' if d <= 0.65 else
+            state = ('RETREAT 后退' if d < 0.80 else
+                     'HOLD 不动' if d <= 0.95 else
                      'APPROACH 前进')
             print('%s ✅ 锁定 %.2fm %+6.1f° %2d点 %s| %-14s | 后方%s | 前方近%.2fm'
                   % (ts, d, math.degrees(a), n, kind, state,
@@ -221,8 +239,9 @@ def main():
 
     print('=' * 74)
     print('实时雷达监视  —— 只读，不会让小车动')
-    print('  单簇锁定门槛 %.2fm  |  双腿对锁定门槛 %.2fm（两点间距 <=%.2fm）'
-          % (LOCK_MAX, PAIR_LOCK_MAX, PAIR_MAX_SEP))
+    print('  单簇锁定门槛 %.2fm(正前) / %.2fm(侧方)  |  '
+          '双腿对 %.2fm（间距 <=%.2fm）'
+          % (LOCK_MAX, LOCK_MAX_SIDE, PAIR_LOCK_MAX, PAIR_MAX_SEP))
     print('  搜索扇区 ±%.0f°（%s）  跟踪上限 %.2fm  确认 %d 帧'
           % (LOCK_SECTOR_DEG,
              '双腿配对已开' if PAIR_ENABLE else '双腿配对已关',

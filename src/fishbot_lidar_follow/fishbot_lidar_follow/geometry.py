@@ -97,7 +97,61 @@ def cluster_points(pts, angle_gap_rad, range_gap):
             # 簇的角度宽度。人腿很窄（几度），墙/柜子很宽（几十度），
             # 配对时用它把「墙」排除掉。
             'span': max(angs) - min(angs),
+            # 簇的角度边界。用来看它是不是「被扇区边界切出来的」——
+            # 墙横跨整个扇区，两端一定顶在边界上；
+            # 真人和椅子在扇区中间，两侧都是空的。
+            'min_angle': min(angs),
+            'max_angle': max(angs),
         })
+    return out
+
+
+def shape_filter(clusters, max_span_deg, max_points,
+                 edge_margin_rad, sector_half_rad):
+    """首次锁定前的「形状」过滤，专治墙体和大型家具误锁。
+
+    为什么需要：光靠距离门槛拦不住墙。车稍微贴近一面墙，
+    墙上就会聚出一个几十度宽、几十个点、距离 0.4m 的簇，
+    距离条件完全满足 —— 于是锁定一面墙，然后朝着它往前冲。
+
+    三条判据（针对墙的物理特征）：
+
+      1. **角度宽度** <= max_span_deg
+         墙/柜子横跨视野，宽度几十度；人是窄的。
+
+      2. **点数** <= max_points
+         宽度大 + 5Hz 下每度 1.15 个点，墙会堆出上百个点。
+         也能排掉「巨型家具」。
+
+      3. **不顶到扇区边界**（两端各留 edge_margin_rad）
+         这是最有判别力的一条：扇区外的东西看不见，
+         如果某簇的边界正好落在扇区边缘，说明它很可能
+         一直延伸出去（墙、大衣柜、床）。
+         真人站在扇区中间，两侧都是空的。
+
+    只在**未锁定**时使用。已锁定的目标走近后变宽是正常的，
+    不能因为这就把目标丢了。
+    """
+    if not clusters:
+        return []
+
+    span_limit = math.radians(max_span_deg)
+    out = []
+    for c in clusters:
+        if max_points > 0 and c['n'] > max_points:
+            continue
+        if c.get('span', 0.0) > span_limit:
+            continue
+        if (edge_margin_rad > 0.0
+                and sector_half_rad < math.pi - 1e-6):
+            lo = c.get('min_angle')
+            hi = c.get('max_angle')
+            if lo is not None and hi is not None:
+                if hi > sector_half_rad - edge_margin_rad:
+                    continue
+                if lo < -sector_half_rad + edge_margin_rad:
+                    continue
+        out.append(c)
     return out
 
 
@@ -258,7 +312,8 @@ def _pair_of(a, b):
 def find_leg_pairs(clusters, max_range, max_sep, min_sep,
                    max_dist_diff, min_points_total,
                    max_span_deg=45.0, max_clusters=24,
-                   max_lateral_sep=0.50, max_along_sep=0.25):
+                   max_lateral_sep=0.50, max_along_sep=0.25,
+                   reject_multi=False, multi_radius=0.70):
     """在候选簇里找所有合格的「双腿对」，按中点距离升序返回。
 
     判定条件（全部满足才算一对）：
@@ -276,14 +331,17 @@ def find_leg_pairs(clusters, max_range, max_sep, min_sep,
         7. 两点的**纵向**错位 <= max_along_sep
            —— 并排站时两腿几乎前后对齐；侧身站时也会前后重叠。
            真正一前一后差 30cm 以上的，只能是两个不相关的物体。
-
-    第 6、7 条专治「帧间随机跳动的噪声点凑成一对」：
-    噪声两点既可能横向张得很开，也可能一前一后错得很开。
+        8. 不存在「互相靠近的多对」（reject_multi）
+           —— 一个人只有一双腿。如果扇区里同时出现两双以上、
+           而且彼此挨得很近，那是椅子/桌子/货架的四条腿，
+           不是人。见下面 _reject_multi_leg。
 
     参数：
         max_range        两个点各自的距离上限（未锁定时会传 1.0m，
                          因为人可能在 1m 外才被认出来）
         max_clusters     最多看最近的多少个簇（O(n^2) 性能保护）
+        reject_multi     开启多腿共现拒绝
+        multi_radius     两对中点距离小于此值即判为同一多腿物体
     """
     if len(clusters) < 2:
         return []
@@ -326,8 +384,36 @@ def find_leg_pairs(clusters, max_range, max_sep, min_sep,
                 continue
             pairs.append(p)
 
+    if reject_multi and len(pairs) > 1:
+        if _reject_multi_leg(pairs, multi_radius):
+            return []
+
     pairs.sort(key=lambda p: p['dist'])
     return pairs
+
+
+def _reject_multi_leg(pairs, radius):
+    """检测「互相靠近的多对」—— 那是四条腿的家具，不是人。
+
+    一个人只有一双腿。扇区里如果同时出现两双以上、而且中点彼此
+    挨得很近（< radius），只可能是椅子、桌子、货架这类多腿物体。
+
+    为什么单靠间距拦不住椅脚：
+        车正对一把椅子时，通常只能看到前面两条腿 ——
+        「两个小簇、间距 0.45m、同深度、横向对齐」，
+        和人腿的几何特征完全一样，2D 雷达看不出高度差别。
+        但是换个角度，四条腿会同时进视野，这时就能识别出来。
+
+    这个判据的代价：如果人正好站在一把椅子旁边，也会被拒绝。
+    所以它是**保守的**——宁可这次不锁定，也不朝椅子冲过去。
+    """
+    for i in range(len(pairs)):
+        for j in range(i + 1, len(pairs)):
+            ax, ay = to_xy(pairs[i]['dist'], pairs[i]['angle'])
+            bx, by = to_xy(pairs[j]['dist'], pairs[j]['angle'])
+            if math.hypot(ax - bx, ay - by) < radius:
+                return True
+    return False
 
 
 def find_single_leg(clusters, ref_dist, ref_angle, max_range,
@@ -428,9 +514,18 @@ def select_follow_target(clusters, locked, ref_dist, ref_angle,
                          pair_max_span_deg=45.0,
                          pair_max_lateral_sep=0.50,
                          pair_max_along_sep=0.25,
+                         pair_reject_multi=True,
+                         pair_multi_radius=0.70,
                          leg_fallback=True,
                          leg_max_points=4,
-                         leg_max_dist_diff=0.35):
+                         leg_max_dist_diff=0.35,
+                         shape_filter_enable=True,
+                         single_max_span_deg=35.0,
+                         single_max_points=45,
+                         edge_margin_deg=4.0,
+                         sector_half_rad=None,
+                         lock_max_range_side=None,
+                         side_sector_rad=None):
     """统一的跟随目标选择：**双腿对优先**，其次单簇，最后单腿兜底。
 
     三条路径并行求候选，最后按「谁更近 / 谁更像上次目标」决胜：
@@ -438,6 +533,15 @@ def select_follow_target(clusters, locked, ref_dist, ref_angle,
         未锁定：双腿对 / 单簇 → 取距离更近的候选
         已锁定：双腿对 / 单簇 → 取与卡尔曼预测更接近的候选
         两者都没有且已锁定 → 单腿兜底（仅用距离，角度走预测）
+
+    「防误锁」共有五道关卡（全部只在**首次锁定**时起作用，
+    已锁定后的跟踪不受影响，否则目标走近变宽就会被误丢）：
+
+        1. 形状过滤  —— 宽度/点数/是否顶到扇区边界（拦墙、大衣柜）
+        2. 分区距离门槛 —— 正前方松、侧方紧（拦从侧面进来的墙）
+        3. 多腿共现拒绝 —— 两双以上靠近的「腿」是家具
+        4. 5 帧时间确认（在节点里）—— 拦一闪而过的杂散点
+        5. 1 秒稳定观察期（在节点里）—— 即使误锁也不动
 
     返回 dict：
         {'dist','angle','n','kind','sep','angle_valid'}
@@ -447,14 +551,41 @@ def select_follow_target(clusters, locked, ref_dist, ref_angle,
     if not clusters:
         return None
 
+    # ---------- 0. 未锁定时的防误锁预处理 ----------
+    scan_clusters = clusters
+    if not locked:
+        # 形状过滤：宽度/点数/顶边（拦墙）
+        if shape_filter_enable:
+            scan_clusters = shape_filter(
+                clusters, single_max_span_deg, single_max_points,
+                math.radians(edge_margin_deg),
+                sector_half_rad if sector_half_rad is not None
+                else math.pi)
+        if not scan_clusters:
+            return None
+
     # ---------- A. 单簇路径（实体目标：纸箱、椅子、人侧身站）----------
     single = None
     if not locked:
-        s = select_target(clusters, False, 0.0, 0.0,
-                          lock_max_range, track_max_range,
-                          min_points=min_points)
-        if s is not None:
-            single = {'dist': s[0], 'angle': s[1], 'n': s[2],
+        # 分区距离门槛：正前方放宽，侧方收紧。
+        # 原因：车贴墙时墙会从 ±40~75° 方向进来，
+        # 如果侧方也用同样的 0.80m 门槛就会锁到墙。
+        cand = []
+        for c in scan_clusters:
+            if c['n'] < min_points:
+                continue
+            if (lock_max_range_side is not None
+                    and side_sector_rad is not None
+                    and abs(c['angle']) > side_sector_rad):
+                lim = lock_max_range_side
+            else:
+                lim = lock_max_range
+            if c['dist'] > lim:
+                continue
+            cand.append(c)
+        if cand:
+            c = min(cand, key=lambda x: x['dist'])
+            single = {'dist': c['dist'], 'angle': c['angle'], 'n': c['n'],
                       'kind': 'single', 'sep': 0.0, 'angle_valid': True}
     else:
         s = select_target(clusters, True, ref_dist, ref_angle,
@@ -469,13 +600,15 @@ def select_follow_target(clusters, locked, ref_dist, ref_angle,
     pair = None
     if pair_enable:
         pairs = find_leg_pairs(
-            clusters,
+            scan_clusters,
             pair_track_max_range if locked else pair_lock_max_range,
             pair_max_sep, pair_min_sep,
             pair_max_dist_diff, pair_min_points,
             max_span_deg=pair_max_span_deg,
             max_lateral_sep=pair_max_lateral_sep,
-            max_along_sep=pair_max_along_sep)
+            max_along_sep=pair_max_along_sep,
+            reject_multi=pair_reject_multi and not locked,
+            multi_radius=pair_multi_radius)
 
         if locked:
             pairs = [p for p in pairs
@@ -493,7 +626,7 @@ def select_follow_target(clusters, locked, ref_dist, ref_angle,
 
     # ---------- C. 单腿兜底（只看到一条腿）----------
     if pair is None and single is None and locked and leg_fallback:
-        return find_single_leg(clusters, ref_dist, ref_angle,
+        return find_single_leg(scan_clusters, ref_dist, ref_angle,
                                pair_track_max_range,
                                max_points=leg_max_points,
                                max_dist_diff=leg_max_dist_diff,

@@ -150,15 +150,54 @@ DEFAULT_PARAMS = {
     'control_rate': 20.0,
 
     # 目标识别
-    # lock_max_range 实机标定：雷达在车体正中心，用户量的「前方40cm」
-    # 若从车头算，雷达读数会多出车体半径。实测物体在 0.44m 时点云
-    # 24~28 点、单簇、极稳，但 0.40 差 4cm 锁不上 → 调到 0.50。
-    # 上限：不能超过 retreat_enter(0.50)，否则锁定后立刻触发后退。
-    'lock_max_range': 0.50,
-    'track_max_range': 1.20,
+    # ★ 2026-10-31 用户反馈「跟随距离太近」，全部距离阈值整体 +0.30m。
+    # lock_max_range 同时要 <= retreat_enter，否则锁定瞬间就触发后退。
+    'lock_max_range': 0.80,
+    'track_max_range': 1.50,
     'sector_half_angle_deg': 30.0,
     'cluster_angle_gap_deg': 2.5,
     'cluster_range_gap': 0.15,
+
+    # ============================================================
+    # 防误锁（墙、椅脚）
+    # ------------------------------------------------------------
+    # 全部只在**首次锁定**时生效。已锁定后的跟踪不受影响，
+    # 否则目标走近变宽就会被误丢。
+    # ============================================================
+
+    # ---- 关卡 1：形状过滤（拦墙、大衣柜）----
+    'shape_filter_enable': True,
+    # 簇的角度宽度上限。墙/柜子横跨视野，通常几十度；人是窄的。
+    'single_max_span_deg': 35.0,
+    # 簇的点数上限。宽度大 + 5Hz 下每度 1.15 个点，
+    # 0.8m 处的墙会堆出上百个点。也能排掉「巨型家具」。
+    'single_max_points': 45,
+    # 簇不能顶到搜索扇区边界（两端各留这么多度）。
+    # ★ 最有判别力的一条：扇区外的东西看不见，如果某簇的边界
+    #   正好落在扇区边缘，说明它很可能一直延伸出去（墙/床/衣柜）。
+    #   真人站在扇区中间，两侧都是空的。
+    'edge_margin_deg': 4.0,
+
+    # ---- 关卡 2：分区距离门槛 ----
+    # 正前方（±side_sector_deg）用宽门槛，侧方用紧门槛。
+    # 原因：车贴墙时墙会从 ±40~75° 方向进来，
+    # 如果侧方也用 0.80m 就会锁到墙。
+    'side_sector_deg': 30.0,
+    'lock_max_range_side': 0.55,
+
+    # ---- 关卡 3：多腿共现拒绝（拦椅脚/桌腿）----
+    # 一个人只有一双腿。扇区里同时出现两双以上、而且中点彼此
+    # 挨得很近，那是四条腿的家具。
+    #
+    # 为什么单靠间距拦不住：车正对一把椅子时只能看到前面两条腿，
+    # 「两个小簇、间距 0.45m、同深度、横向对齐」，和人腿几何上
+    # 完全一样 —— 2D 雷达看不出高度差别。但换个角度四条腿会
+    # 同时进视野，这时就能识别。
+    #
+    # 代价：人正好站在椅子旁边时也会被拒绝。
+    # 这是保守选择 —— 宁可这次不锁，也不朝椅子冲。
+    'pair_reject_multi': True,
+    'pair_multi_radius': 0.70,
 
     # ---- 双腿成对锁定 ----
     # 雷达装在车体下沿，扫不到人躯干，只有两条小腿。
@@ -166,11 +205,13 @@ DEFAULT_PARAMS = {
     # 会把它们全部当噪声丢掉 —— 这就是「能跟但锁不上」的根因。
     # 这里改成：找「相邻的两个小簇」，取两点中点当目标。
     'pair_enable': True,
-    # 成对的两个点各自的距离上限（用户要求：不超过 1m）
-    'pair_lock_max_range': 1.00,
-    'pair_track_max_range': 1.20,
-    # 两点的直线距离必须落在 [pair_min_sep, pair_max_sep] 内
-    'pair_max_sep': 0.60,
+    # 成对的两个点各自的距离上限
+    'pair_lock_max_range': 1.30,
+    'pair_track_max_range': 1.50,
+    # 两点的直线距离必须落在 [pair_min_sep, pair_max_sep] 内。
+    # ★ 上限从 0.60 收到 0.42：人站姿腿距很少超过 0.40m，
+    #   而椅子脚间距通常 0.45~0.60m，收窄能耗掉一批椅脚误锁。
+    'pair_max_sep': 0.42,
     # 太小说明是同一个物体被切成两簇，不必当中点处理
     'pair_min_sep': 0.05,
     # 两条腿基本在同一深度；一近一远的是「腿 + 墙」，不是一双腿
@@ -249,17 +290,23 @@ DEFAULT_PARAMS = {
     # 剩下的远簇只差 0.54m，不拦住就会切换目标并前进。
     'max_target_jump': 0.30,
 
-    # 距离死区
-    'approach_enter': 0.65,
-    'approach_exit': 0.55,
-    'retreat_enter': 0.50,
-    'retreat_exit': 0.55,
-    'desired_distance': 0.575,
+    # 距离死区（三态滞回）
+    # ★ 整体 +0.30m：用户反馈「跟随保持的距离太近了」
+    #   原来跟到 0.575m（雷达在车体中心，换算到车头约 0.475m）
+    #   现在跟到 0.875m（车头约 0.775m），后退/前进同步拉远。
+    'approach_enter': 0.95,
+    'approach_exit': 0.85,
+    'retreat_enter': 0.80,
+    'retreat_exit': 0.85,
+    'desired_distance': 0.875,
     'distance_deadband': 0.02,
 
     # 角度
     'angle_deadband_deg': 2.0,
     'align_before_move_deg': 15.0,
+    # 距离小于此值时，角度偏大就先原地转正再走，不边走边冲。
+    # 超过此距离允许边走边转（远处转过去很慢）。
+    'align_before_move_max_dist': 1.20,
 
     # 速度
     'max_linear': 0.22,
@@ -293,7 +340,9 @@ DEFAULT_PARAMS = {
     # 安全
     'rear_check_range': 0.40,
     'rear_sector_half_angle_deg': 40.0,
-    'front_guard_range': 0.32,
+    # 前进时前方这个范围内有障碍就刹车（比目标更近的东西）。
+    # ★ 随跟随距离整体 +0.30
+    'front_guard_range': 0.62,
     'scan_timeout': 0.60,
     'lost_frame_threshold': 3,
 
@@ -400,6 +449,15 @@ class LidarFollowNode(Node):
         self.min_cluster_points = int(g('min_cluster_points'))
         self.max_target_jump = float(g('max_target_jump'))
 
+        self.shape_filter_enable = bool(g('shape_filter_enable'))
+        self.single_max_span_deg = float(g('single_max_span_deg'))
+        self.single_max_points = int(g('single_max_points'))
+        self.edge_margin = math.radians(float(g('edge_margin_deg')))
+        self.side_sector_rad = math.radians(float(g('side_sector_deg')))
+        self.lock_max_range_side = float(g('lock_max_range_side'))
+        self.pair_reject_multi = bool(g('pair_reject_multi'))
+        self.pair_multi_radius = float(g('pair_multi_radius'))
+
         self.pair_enable = bool(g('pair_enable'))
         self.pair_lock_max_range = float(g('pair_lock_max_range'))
         self.pair_track_max_range = float(g('pair_track_max_range'))
@@ -435,6 +493,8 @@ class LidarFollowNode(Node):
         self.angle_deadband = math.radians(float(g('angle_deadband_deg')))
         self.align_before_move = math.radians(
             float(g('align_before_move_deg')))
+        self.align_before_move_max_dist = float(
+            g('align_before_move_max_dist'))
 
         self.max_linear = float(g('max_linear'))
         self.max_reverse = float(g('max_reverse'))
@@ -520,6 +580,35 @@ class LidarFollowNode(Node):
                 'lock_confirm_frames(%d) < 1，首次锁定不做时间确认，'
                 '容易被单帧噪声骗到' % self.lock_confirm_frames)
 
+        # ---- 防误锁参数自检 ----
+        if self.shape_filter_enable:
+            if self.single_max_span_deg <= 0.0:
+                self.get_logger().warn(
+                    'single_max_span_deg(%.0f) <= 0，形状过滤等于关闭，'
+                    '墙体会被当成目标' % self.single_max_span_deg)
+            if self.single_max_points <= self.min_cluster_points:
+                self.get_logger().error(
+                    'single_max_points(%d) <= min_cluster_points(%d)，'
+                    '单簇目标会被上下限夹死，永远不会锁定'
+                    % (self.single_max_points, self.min_cluster_points))
+            if self.edge_margin > self.lock_sector_rad:
+                self.get_logger().error(
+                    'edge_margin_deg(%.0f°) 大于搜索扇区半角(%.0f°)，'
+                    '所有簇都会被当成「顶到边界」而拒绝'
+                    % (math.degrees(self.edge_margin),
+                       math.degrees(self.lock_sector_rad)))
+
+        if self.lock_max_range_side >= self.lock_max_range:
+            self.get_logger().warn(
+                'lock_max_range_side(%.2f) >= lock_max_range(%.2f)，'
+                '侧方门槛不比正前方严格，分区防误锁不起作用'
+                % (self.lock_max_range_side, self.lock_max_range))
+
+        if self.pair_max_sep > 0.55:
+            self.get_logger().warn(
+                'pair_max_sep(%.2f) > 0.55，椅子脚间距常在 0.45~0.60m，'
+                '容易被误配成一双腿' % self.pair_max_sep)
+
     def _log_startup(self):
         self.get_logger().info('=' * 58)
         self.get_logger().info('雷达跟随节点已启动')
@@ -544,6 +633,22 @@ class LidarFollowNode(Node):
             '  扇区     : 搜索 ±%.0f° / 安全 ±%.0f°  (后方 ±%.0f°)'
             % (math.degrees(self.lock_sector_rad),
                math.degrees(self.sector_rad), math.degrees(self.rear_rad)))
+        # 防误锁生效情况一目了然
+        bits = []
+        if self.shape_filter_enable:
+            bits.append('形状(宽<=%.0f°,点<=%d,离边%.0f°)'
+                        % (self.single_max_span_deg,
+                           self.single_max_points,
+                           math.degrees(self.edge_margin)))
+        if self.lock_max_range_side < self.lock_max_range:
+            bits.append('分区(±%.0f°内%.2fm/外%.2fm)'
+                        % (math.degrees(self.side_sector_rad),
+                           self.lock_max_range,
+                           self.lock_max_range_side))
+        if self.pair_reject_multi:
+            bits.append('多腿拒绝(%.2fm内)' % self.pair_multi_radius)
+        self.get_logger().info(
+            '  防误锁   : %s' % (' / '.join(bits) if bits else '全部关闭'))
         self.get_logger().info('=' * 58)
 
     # --------------------------------------------------------
@@ -625,9 +730,18 @@ class LidarFollowNode(Node):
             pair_max_span_deg=self.pair_max_span_deg,
             pair_max_lateral_sep=self.pair_max_lateral_sep,
             pair_max_along_sep=self.pair_max_along_sep,
+            pair_reject_multi=self.pair_reject_multi,
+            pair_multi_radius=self.pair_multi_radius,
             leg_fallback=self.leg_fallback_enable,
             leg_max_points=self.leg_max_points,
-            leg_max_dist_diff=self.leg_max_dist_diff)
+            leg_max_dist_diff=self.leg_max_dist_diff,
+            shape_filter_enable=self.shape_filter_enable,
+            single_max_span_deg=self.single_max_span_deg,
+            single_max_points=self.single_max_points,
+            edge_margin_deg=math.degrees(self.edge_margin),
+            sector_half_rad=search_rad,
+            lock_max_range_side=self.lock_max_range_side,
+            side_sector_rad=self.side_sector_rad)
 
         if pick is None:
             self._handle_no_target(stamp)
@@ -874,7 +988,8 @@ class LidarFollowNode(Node):
                 v_ang = 0.0      # HOLD 且已对准 → 完全不动
 
         # 角度偏太大时先转正，别一边大角度转一边冲
-        if abs(e_a) > self.align_before_move and d < 0.90:
+        if (abs(e_a) > self.align_before_move
+                and d < self.align_before_move_max_dist):
             lin = 0.0
             reason = '先对准 %.0f°' % math.degrees(e_a)
         else:

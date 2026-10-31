@@ -19,8 +19,8 @@ sim_node.py
     ros2 run fishbot_lidar_follow lidar_follow_sim --scenario walk_away
 
 场景：
-    walk_away    目标从 0.35m 慢慢退到 1.1m（测前进）
-    walk_close   目标从 1.1m 慢慢逼近到 0.35m（测后退）
+    walk_away    目标慢慢退到 1.3m（测前进）
+    walk_close   目标从 1.3m 慢慢逼近到 0.35m（测后退）
     sideways     目标在 0.8m 处左右横移（测转向）
     dropout      目标出现 → 消失 → 再出现（测丢帧容忍）
     static       目标静止在 0.6m（测死区不抖）
@@ -38,11 +38,11 @@ from sensor_msgs.msg import LaserScan
 
 
 SCENARIOS = {
-    'walk_away': '目标从 0.35m 退到 1.10m —— 应该先锁定然后前进',
-    'walk_close': '目标从 1.10m 逼近到 0.35m —— 应该先锁定然后后退',
-    'sideways': '目标在 0.80m 处左右摆动 ±20° —— 应该跟着转',
+    'walk_away': '目标退到 1.30m —— 应该先锁定然后前进',
+    'walk_close': '目标从 1.30m 逼近到 0.35m —— 应该先锁定然后后退',
+    'sideways': '目标在死区中心左右摆动 ±20° —— 应该跟着转',
     'dropout': '目标出现→消失→再出现 —— 丢失时应该停车',
-    'static': '目标静止在 0.60m —— 应该停在死区不动',
+    'static': '目标静止在死区中心 —— 应该完全不动',
     'legs_walk': '两条腿（每条 1 个点）先退开再走近 —— 测双腿配对锁定',
     'legs_side': '两条腿整体左右转动 ±25° —— 测配对后跟转',
     'legs_occlude': '每 4 帧里有 1 帧只剩一条腿 —— 测遮挡容忍',
@@ -53,6 +53,14 @@ SCENARIOS = {
 
 # 腿的横向间距（米）。两条腿间距 22cm，接近真实站姿
 LEG_HALF_GAP = 0.11
+
+# 死区中心。必须与 config 里 desired_distance 一致，
+# 场景把目标挪到这里时车应该完全不动。
+DEAD_CENTER = 0.875
+
+# 双腿场景锁定期的距离。必须 < lock_max_range(0.80) 才能锁上，
+# 又不能离死区太远，否则锁定后会持续后退。
+ACQUIRE_LEGS = 0.72
 
 # 噪声场景的随机种子。固定下来让测试可复现，
 # 但每步都换一个新的 Random 实例，避免出现规律性重复
@@ -208,7 +216,7 @@ class LidarFollowSim(Node):
             # 因为首次锁定不允许靠一条腿 ——
             # 一条腿无法区分「人」和「一根桌腿」，必须成对才认。
             if s.startswith('legs'):
-                return _legs(0.62, LEG_HALF_GAP)
+                return _legs(ACQUIRE_LEGS, LEG_HALF_GAP)
             if s == 'noise':
                 return self._noise()
             if s == 'noise_random':
@@ -218,59 +226,59 @@ class LidarFollowSim(Node):
         tt = t - HOLD_SEC     # 扣除锁定期后经过的时间
 
         if s == 'walk_away':
-            # 0.35 → 1.10，用时 8 秒
+            # 0.35 → 1.30，用时 8 秒（新死区上沿 0.95，必须退够远）
             frac = min(1.0, tt / 8.0)
-            return [(0.35 + 0.75 * frac, 0.0)]
+            return [(0.35 + 0.95 * frac, 0.0)]
 
         if s == 'walk_close':
-            # 先退到 1.10（3 秒），再逼近回 0.35（5 秒）
+            # 先退到 1.30（3 秒），再逼近回 0.35（5 秒）
             if tt < 3.0:
                 frac = min(1.0, tt / 3.0)
-                return [(0.35 + 0.75 * frac, 0.0)]
+                return [(0.35 + 0.95 * frac, 0.0)]
             frac = min(1.0, (tt - 3.0) / 5.0)
-            return [(1.10 - 0.75 * frac, 0.0)]
+            return [(1.30 - 0.95 * frac, 0.0)]
 
         if s == 'sideways':
-            # 先退到 0.80（2 秒），然后在 ±20° 之间摇摆，周期 4 秒
+            # 先退到死区中心（2 秒），然后在 ±20° 之间摇摆，周期 4 秒
             if tt < 2.0:
                 frac = min(1.0, tt / 2.0)
-                return [(0.35 + 0.45 * frac, 0.0)]
+                return [(0.35 + (DEAD_CENTER - 0.35) * frac, 0.0)]
             a = 20.0 * math.sin(2 * math.pi * (tt - 2.0) / 4.0)
-            return [(0.80, a)]
+            return [(DEAD_CENTER, a)]
 
         if s == 'dropout':
-            # 先在 0.35 锁定，退到 0.70；然后消失 3 秒再出现
+            # 先在 0.35 锁定，退到 1.10；然后消失 3 秒再出现
             if tt < 2.0:
                 frac = min(1.0, tt / 2.0)
-                return [(0.35 + 0.35 * frac, 0.0)]
+                return [(0.35 + 0.75 * frac, 0.0)]
             if 2.0 <= tt < 5.0:
                 return []       # 消失
-            return [(0.70, 0.0)]   # 重新出现
+            return [(1.10, 0.0)]   # 重新出现
 
         if s == 'static':
-            # 静止在 0.60（死区中心），验证不抖动
+            # 静止在死区中心，验证不抖动
             if tt < 1.5:
                 frac = min(1.0, tt / 1.5)
-                return [(0.35 + 0.25 * frac, 0.0)]
-            return [(0.60, 0.0)]
+                return [(0.35 + (DEAD_CENTER - 0.35) * frac, 0.0)]
+            return [(DEAD_CENTER, 0.0)]
 
         # ---------------- 双腿工况 ----------------
         # 人在低处雷达里只有两条小腿，每条腿 1~3 个点。
         # 这是「能跟但锁不上」的真实场景。
 
         if s == 'legs_walk':
-            # 0.62 → 1.05（4 秒，人往后退 → 车应该前进）
-            # 1.05 → 0.45（5 秒，人走近  → 车应该后退）
+            # 0.72 → 1.30（4 秒，人往后退 → 车应该前进）
+            # 1.30 → 0.55（5 秒，人走近  → 车应该后退）
             if tt < 4.0:
-                depth = 0.62 + 0.43 * min(1.0, tt / 4.0)
+                depth = 0.72 + 0.58 * min(1.0, tt / 4.0)
             else:
-                depth = 1.05 - 0.60 * min(1.0, (tt - 4.0) / 5.0)
+                depth = 1.30 - 0.75 * min(1.0, (tt - 4.0) / 5.0)
             return _legs(depth, LEG_HALF_GAP)
 
         if s == 'legs_side':
             # 人整体左右转，腿跟着一起转（不是分开走）
             yaw = 25.0 * math.sin(2 * math.pi * tt / 6.0)
-            return _legs(0.80, LEG_HALF_GAP, yaw_deg=yaw)
+            return _legs(DEAD_CENTER, LEG_HALF_GAP, yaw_deg=yaw)
 
         if s == 'legs_occlude':
             # 两条腿大部分时间都在，每 4 帧里有 1 帧只看得见一条。
@@ -278,13 +286,13 @@ class LidarFollowSim(Node):
             # 注意：完全只剩一条腿时走「单腿兜底」，只用距离跟，
             # 角度交给卡尔曼预测 —— 否则不可能既要跟又不抽。
             hide = 0 if int(tt / 0.8) % 4 == 3 else None
-            return _legs(0.62, LEG_HALF_GAP, hide=hide)
+            return _legs(DEAD_CENTER, LEG_HALF_GAP, hide=hide)
 
         if s == 'legs_single':
             # 先用双腿锁定，然后只剩一条腿，同时距离缓慢变大。
             # 如果单腿兜底真的在工作，距离会跟着变大并触发 APPROACH；
             # 如果不工作，会连续丢帧停车。
-            depth = 0.62 + 0.30 * min(1.0, tt / 6.0)
+            depth = DEAD_CENTER + 0.30 * min(1.0, tt / 6.0)
             return _legs(depth, LEG_HALF_GAP, hide=0)
 
         if s == 'noise':

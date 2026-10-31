@@ -146,6 +146,23 @@ DEFAULTS['lock_settle_time'] = 0.0
 # +2 是留余量（第 1 帧只建立候选，不算命中）。
 LOCK_N = int(DEFAULTS['lock_confirm_frames']) + 2
 
+# ---- 距离常量全部从参数派生 ----
+# 绝对不要把 0.85 / 1.20 这类数字写死在用例里：
+# 参数一调（比如这次整体 +0.30m），写死的用例就会静默失效。
+P_LOCK = DEFAULTS['lock_max_range']           # 首次锁定门槛
+P_APP = DEFAULTS['approach_enter']            # 进入前进
+P_RET = DEFAULTS['retreat_enter']             # 进入后退
+P_TRK = DEFAULTS['track_max_range']           # 跟踪上限
+P_ALIGN = DEFAULTS['align_before_move_max_dist']  # 先转正的距离上限
+
+P_NEAR = 0.38            # 「贴近」，用于先建立锁定
+P_MID = (P_APP + P_RET) / 2.0          # 死区中心
+P_FAR = P_APP + 0.35                   # 应该前进
+P_TOOFAR = P_TRK + 0.30                # 超出跟踪上限
+P_ALIGN_FAR = P_ALIGN + 0.15           # 允许边走边转的距离
+P_BEYOND_LOCK = P_LOCK + 0.10          # 超过锁定门槛
+P_VERY_NEAR = P_RET - 0.45             # 应该后退
+
 
 def build_node(**overrides):
     params = dict(DEFAULTS)
@@ -274,40 +291,43 @@ def reset(node):
 def test_lock_rules():
     print('\n[1] 目标锁定规则')
 
-    # 目标在 0.9m，超出 lock_max_range(0.40) → 不应锁定
+    # 目标超过首次锁定门槛 → 不应锁定
     node, rec, _, _ = build_node()
     reset(node)
-    feed(node, FakeScan([(0.90, 0.0)]))
-    check('0.90m 目标超过首次锁定范围，不锁定', not node.locked,
+    feed(node, FakeScan([(P_BEYOND_LOCK, 0.0)]))
+    check('%.2fm 目标超过首次锁定门槛 %.2fm，不锁定'
+          % (P_BEYOND_LOCK, P_LOCK), not node.locked,
           'locked=%s' % node.locked)
 
-    # 目标在 0.35m → 应锁定（需连续 3 帧确认）
+    # 目标在 P_NEAR → 应锁定（需连续 N 帧确认）
     node, rec, _, _ = build_node()
     reset(node)
-    feed(node, FakeScan([(0.35, 0.0)]))
+    feed(node, FakeScan([(P_NEAR, 0.0)]))
     check('单帧不锁定（时间确认生效）', not node.locked,
           'hits=%d' % node.lock_hits)
-    feed(node, FakeScan([(0.35, 0.0)]), times=LOCK_N)
-    check('0.35m 目标在 50cm 内，连续 %d 帧后锁定' % LOCK_N, node.locked,
+    feed(node, FakeScan([(P_NEAR, 0.0)]), times=LOCK_N)
+    check('%.2fm 目标在门槛 %.2fm 内，连续 %d 帧后锁定'
+          % (P_NEAR, P_LOCK, LOCK_N), node.locked,
           'locked=%s dist=%.2f' % (node.locked, node.target_dist))
 
-    # 锁定后目标退到 1.0m，仍应继续跟踪（track_max_range=1.20）
+    # 锁定后目标退到跟踪上限以内，仍应继续跟踪
     node, rec, _, _ = build_node()
     reset(node)
-    feed(node, FakeScan([(0.35, 0.0)]), times=LOCK_N)
+    feed(node, FakeScan([(P_NEAR, 0.0)]), times=LOCK_N)
     for _ in range(20):
-        feed(node, FakeScan([(1.00, 0.0)]))
-    check('锁定后目标退到 1.00m 仍保持跟踪', node.locked and node.target_valid,
+        feed(node, FakeScan([(P_TRK - 0.10, 0.0)]))
+    check('锁定后目标退到 %.2fm 仍保持跟踪' % (P_TRK - 0.10),
+          node.locked and node.target_valid,
           'locked=%s valid=%s dist=%.2f'
           % (node.locked, node.target_valid, node.target_dist))
 
-    # 目标跑到 1.5m（超过 track_max_range）→ 丢失
+    # 目标超过跟踪上限 → 丢失
     node, rec, _, _ = build_node()
     reset(node)
-    feed(node, FakeScan([(0.35, 0.0)]), times=LOCK_N)
+    feed(node, FakeScan([(P_NEAR, 0.0)]), times=LOCK_N)
     for _ in range(10):
-        feed(node, FakeScan([(1.50, 0.0)]))
-    check('目标超出跟踪范围后判定丢失', not node.target_valid,
+        feed(node, FakeScan([(P_TOOFAR, 0.0)]))
+    check('目标超出跟踪范围 %.2fm 后判定丢失' % P_TRK, not node.target_valid,
           'valid=%s' % node.target_valid)
 
     # 搜索扇区外的目标不锁定。
@@ -315,14 +335,14 @@ def test_lock_rules():
     # 所以用 +85° 来测「扇区外」。
     node, rec, _, _ = build_node()
     reset(node)
-    feed(node, FakeScan([(0.35, 85.0)]), times=LOCK_N)
+    feed(node, FakeScan([(P_NEAR, 85.0)]), times=LOCK_N)
     check('±75° 搜索扇区外的目标不锁定', not node.locked,
           'locked=%s' % node.locked)
 
     # 但 ±75° 扇区内的侧面目标应该能锁定
     node, rec, _, _ = build_node()
     reset(node)
-    feed(node, FakeScan([(0.35, 60.0)]), times=LOCK_N)
+    feed(node, FakeScan([(P_NEAR, 60.0)]), times=LOCK_N)
     check('+60° 侧面目标能被锁定（宽搜索扇区生效）', node.locked,
           'locked=%s dist=%.2f ang=%.0f°'
           % (node.locked, node.target_dist,
@@ -332,13 +352,13 @@ def test_lock_rules():
 def test_approach_hold_retreat():
     print('\n[2] 前进 / 停 / 后退')
 
-    # ---- 先锁定，再让目标退到 0.85m → 前进 ----
+    # ---- 先锁定，再让目标退远 → 前进 ----
     node, rec, _, _ = build_node()
     reset(node)
-    lock_target(node, 0.38)
-    settle(node, 0.85)
+    lock_target(node, P_NEAR)
+    settle(node, P_FAR)
     m = tick(node, rec)
-    check('锁定后目标退到 0.85m → 前进',
+    check('锁定后目标退到 %.2fm → 前进' % P_FAR,
           m is not None and m.linear.x > 0.0,
           '线速度=%.3f 状态=%s 距离=%.2f'
           % (m.linear.x if m else 0, node.state, node.target_dist))
@@ -346,23 +366,24 @@ def test_approach_hold_retreat():
           m is not None and m.linear.x <= 0.22 + 1e-6,
           '%.3f' % (m.linear.x if m else 0))
 
-    # ---- 锁定后目标退到 0.60m（死区内）→ 停 ----
+    # ---- 锁定后目标停在死区内 → 停 ----
     node, rec, _, _ = build_node()
     reset(node)
-    lock_target(node, 0.38)
-    settle(node, 0.60)
+    lock_target(node, P_NEAR)
+    settle(node, P_MID)
     m = tick(node, rec, n=25)
-    check('目标 0.60m 在死区内 → 停',
+    check('目标 %.2fm 在死区 %.2f~%.2f 内 → 停' % (P_MID, P_RET, P_APP),
           m is not None and abs(m.linear.x) < 1e-6,
           '线速度=%.3f 状态=%s 距离=%.2f'
           % (m.linear.x if m else 0, node.state, node.target_dist))
 
-    # ---- 目标 0.35m（锁定后就一直很近）→ 后退 ----
+    # ---- 目标一直很近 → 后退 ----
     node, rec, _, _ = build_node()
     reset(node)
-    settle(node, 0.35)
+    settle(node, P_VERY_NEAR)
     m = tick(node, rec, n=20)
-    check('目标 0.35m → 后退', m is not None and m.linear.x < 0.0,
+    check('目标 %.2fm → 后退' % P_VERY_NEAR,
+          m is not None and m.linear.x < 0.0,
           '线速度=%.3f 状态=%s' % (m.linear.x if m else 0, node.state))
     check('  后退速度不超过 %.2f' % 0.12,
           m is not None and abs(m.linear.x) <= 0.12 + 1e-6,
@@ -372,11 +393,11 @@ def test_approach_hold_retreat():
 def test_angle_control():
     print('\n[3] 角度对准')
 
-    # ---- 目标在左 +20°，距离 0.85 → 先转向，不前进 ----
+    # ---- 目标在左 +20°，距离在「先转正」范围内 → 先转向，不前进 ----
     node, rec, _, _ = build_node()
     reset(node)
-    lock_target(node, 0.38, 0.0)
-    settle(node, 0.85, 20.0)
+    lock_target(node, P_NEAR, 0.0)
+    settle(node, P_MID, 20.0)
     m = tick(node, rec)
     check('目标偏左 20° → 原地左转',
           m is not None and m.angular.z > 0.0,
@@ -387,8 +408,8 @@ def test_angle_control():
     # ---- 目标在右 -20° → 右转 ----
     node, rec, _, _ = build_node()
     reset(node)
-    lock_target(node, 0.38, 0.0)
-    settle(node, 0.85, -20.0)
+    lock_target(node, P_NEAR, 0.0)
+    settle(node, P_MID, -20.0)
     m = tick(node, rec)
     check('目标偏右 20° → 原地右转',
           m is not None and m.angular.z < 0.0,
@@ -397,20 +418,20 @@ def test_angle_control():
     # ---- 目标在 +1°，死区内 → 不转 ----
     node, rec, _, _ = build_node()
     reset(node)
-    lock_target(node, 0.38, 0.0)
-    settle(node, 0.85, 1.0)
+    lock_target(node, P_NEAR, 0.0)
+    settle(node, P_MID, 1.0)
     m = tick(node, rec)
     check('角度误差 1° 在死区内 → 不转向',
           m is not None and abs(m.angular.z) < 1e-6,
           '角速度=%.3f' % (m.angular.z if m else 0))
 
-    # ---- 目标在 +20° 但很远(1.1m) → 允许边走边转 ----
+    # ---- 目标在 +20° 但很远 → 允许边走边转 ----
     node, rec, _, _ = build_node()
     reset(node)
-    lock_target(node, 0.38, 0.0)
-    settle(node, 1.10, 20.0)
+    lock_target(node, P_NEAR, 0.0)
+    settle(node, P_ALIGN_FAR, 20.0)
     m = tick(node, rec)
-    check('目标偏 20° 但距离 1.1m → 允许边走边转',
+    check('目标偏 20° 但距离 %.2fm → 允许边走边转' % P_ALIGN_FAR,
           m is not None and m.linear.x > 0.0 and m.angular.z > 0.0,
           '线=%.3f 角=%.3f' % (m.linear.x if m else 0, m.angular.z if m else 0))
 
@@ -429,7 +450,7 @@ def test_safety():
     # ---- 雷达超时（有过数据但断了很久）→ 停 ----
     node, rec, _, _ = build_node()
     reset(node)
-    feed(node, FakeScan([(0.85, 0.0)]), times=LOCK_N)
+    feed(node, FakeScan([(P_NEAR, 0.0)]), times=LOCK_N)
     node.last_scan_time -= 2.0        # 假装 2 秒没数据
     m = tick(node, rec, n=3)
     check('雷达超时 → 输出 0', m is not None and abs(m.linear.x) < 1e-6,
@@ -438,8 +459,8 @@ def test_safety():
     # ---- 目标丢失 → 停 ----
     node, rec, _, _ = build_node()
     reset(node)
-    lock_target(node, 0.38)
-    settle(node, 0.85, times=8)
+    lock_target(node, P_NEAR)
+    settle(node, P_FAR, times=8)
     # 连续喂空场景（所有点都很远）
     for _ in range(10):
         feed(node, FakeScan([]))
@@ -452,7 +473,7 @@ def test_safety():
     reset(node)
     # 目标很近（想后退）+ 后方 0.30m 有障碍
     for _ in range(18):
-        feed(node, FakeScan([(0.35, 0.0), (0.30, 180.0)]))
+        feed(node, FakeScan([(P_VERY_NEAR, 0.0), (0.30, 180.0)]))
     m = tick(node, rec, n=20)
     check('后退时后方 0.30m 有障碍 → 不后退',
           m is not None and abs(m.linear.x) < 1e-6,
@@ -462,22 +483,24 @@ def test_safety():
     node, rec, _, _ = build_node()
     reset(node)
     for _ in range(18):
-        feed(node, FakeScan([(0.35, 0.0)]))
+        feed(node, FakeScan([(P_VERY_NEAR, 0.0)]))
     m = tick(node, rec, n=20)
     check('后方无障碍 → 正常后退',
           m is not None and m.linear.x < 0.0,
           '线=%.3f 状态=%s' % (m.linear.x if m else 0, node.state))
 
     # ---- 前进时前方突现更近的障碍 → 刹车 ----
-    # 目标在 0.85m，另有一个 0.31m 的东西挡在 12° 方向
+    # 目标在 P_FAR（应该前进），另有一个 0.50m 的东西挡在 12° 方向。
+    # 0.50 必须小于 front_guard_range，否则不会触发刹车。
+    GUARD_NEAR = DEFAULTS['front_guard_range'] - 0.12
     node, rec, _, _ = build_node()
     reset(node)
-    lock_target(node, 0.38, 0.0)
-    settle(node, 0.85, 0.0)
+    lock_target(node, P_NEAR, 0.0)
+    settle(node, P_FAR, 0.0)
     for _ in range(10):
-        feed(node, FakeScan([(0.85, 0.0), (0.31, 12.0)]))
+        feed(node, FakeScan([(P_FAR, 0.0), (GUARD_NEAR, 12.0)]))
     m = tick(node, rec, n=10)
-    check('前方 0.31m 突现障碍 → 不前进',
+    check('前方 %.2fm 突现障碍 → 不前进' % GUARD_NEAR,
           m is not None and abs(m.linear.x) < 1e-6,
           '线=%.3f 状态=%s 距离=%.2f'
           % (m.linear.x if m else 0, node.state, node.target_dist))
@@ -488,8 +511,8 @@ def test_short_dropout():
 
     node, rec, _, _ = build_node()
     reset(node)
-    lock_target(node, 0.38)
-    settle(node, 0.85, times=10)
+    lock_target(node, P_NEAR)
+    settle(node, P_FAR, times=10)
     check('先正常锁定', node.locked and node.target_valid,
           'locked=%s valid=%s' % (node.locked, node.target_valid))
 
@@ -513,8 +536,8 @@ def test_smoothing():
 
     node, rec, _, _ = build_node()
     reset(node)
-    lock_target(node, 0.38)
-    settle(node, 1.15, times=10)
+    lock_target(node, P_NEAR)
+    settle(node, P_FAR, times=10)
 
     # 第 1 个周期的输出应该远小于稳态值（因为从 0 开始加速）
     node.last_ctrl_time -= 0.05
@@ -656,10 +679,10 @@ def test_leg_pair_lock():
     # 变成「漏检」而不是「间距不一致」，测不到这条约束。
     node, rec, _, _ = build_node()
     reset(node)
-    seq = [0.15, 0.45, 0.18, 0.42, 0.15, 0.45, 0.18, 0.42]
+    seq = [0.15, 0.40, 0.18, 0.38, 0.15, 0.40, 0.18, 0.38]
     for g in seq:
         feed(node, FakeScan(legs_objects(0.62, half_gap=g / 2.0)))
-    check('腿距 0.15↔0.45 交替 → 不锁定（间距稳定性约束）',
+    check('腿距 0.15↔0.40 交替 → 不锁定（间距稳定性约束）',
           not node.locked,
           'locked=%s sep 序列 %s' % (node.locked, seq))
 
@@ -746,9 +769,9 @@ def test_lock_settle():
     node, rec, _, _ = build_node(lock_settle_time=1.0)
     reset(node)
     # 先在 0.38m 锁定（必须在 lock_max_range 内），再让它退到 0.85m
-    lock_target(node, 0.38)
-    settle(node, 0.85)
-    check('先锁定 0.38m，再退到 0.85m', node.locked,
+    lock_target(node, P_NEAR)
+    settle(node, P_FAR)
+    check('先锁定 %.2fm，再退到 %.2fm' % (P_NEAR, P_FAR), node.locked,
           'locked=%s d=%.2f' % (node.locked, node.target_dist))
 
     # 刚锁定，立刻下指令 → 必须不动
@@ -772,12 +795,143 @@ def test_lock_settle():
     # 关掉观察期 → 锁完立刻能动（验证这个开关本身有效）
     node, rec, _, _ = build_node(lock_settle_time=0.0)
     reset(node)
-    lock_target(node, 0.38)
-    settle(node, 0.85)
+    lock_target(node, P_NEAR)
+    settle(node, P_FAR)
     m = tick(node, rec, n=25)
     check('lock_settle_time=0 时不等待',
           m is not None and m.linear.x > 0.0,
           'lin=%.3f' % (m.linear.x if m else 0))
+
+
+def test_false_lock_guard():
+    print('\n[10] 防误锁（墙 / 椅脚 / 多腿家具）')
+
+    LOCK_N_F = LOCK_N
+
+    # ---- 1. 正前方一整面墙：宽 + 点多 → 不锁定 ----
+    # FakeScan 的 half 参数就是「半宽索引数」，每索引 0.5°。
+    # half=40 → 81 点、跨度 40°，模拟一堵横在面前的墙。
+    node, rec, _, _ = build_node()
+    reset(node)
+    feed(node, FakeScan([(0.70, 0.0, 40)]), times=LOCK_N_F)
+    check('正前方 40° 宽的墙 → 不锁定（宽度/点数过滤）',
+          not node.locked,
+          'locked=%s（墙 81 点、跨度 40°）' % node.locked)
+
+    # ---- 2. 更宽的墙：横跨整个扇区，顶到边界 → 不锁定 ----
+    node, rec, _, _ = build_node()
+    reset(node)
+    feed(node, FakeScan([(0.70, 0.0, 200)]), times=LOCK_N_F)
+    check('横跨扇区的整面墙 → 不锁定',
+          not node.locked, 'locked=%s' % node.locked)
+
+    # ---- 3. 窄但是「顶到扇区右边界」的墙 → 不锁定 ----
+    # 中心 +75°、半宽 17 索引(8.5°)，覆盖 66.5°~83.5°，
+    # 右端越过 ±75° 扇区边界 → 说明它一直在往外延伸。
+    # 这个簇只有 35 点、跨度 17°，前两道过滤都拦不住，
+    # 只能靠「顶边界」这一条。
+    node, rec, _, _ = build_node()
+    reset(node)
+    feed(node, FakeScan([(0.50, 75.0, 17)]), times=LOCK_N_F)
+    check('顶到扇区边界的窄墙 → 不锁定（顶边过滤）',
+          not node.locked,
+          'locked=%s（35 点、跨度 17°，仅顶边界可拦）' % node.locked)
+
+    # ---- 4. 侧方近距离的墙 → 不锁定（分区距离门槛）----
+    # 60° 方向、0.70m、7 点、跨度 3°。
+    # 形状完全合格，但侧方门槛只有 lock_max_range_side(0.55)。
+    node, rec, _, _ = build_node()
+    reset(node)
+    feed(node, FakeScan([(0.70, 60.0, 3)]), times=LOCK_N_F)
+    check('侧方 60°/0.70m → 不锁定（超出侧方门槛 %.2fm）'
+          % DEFAULTS['lock_max_range_side'],
+          not node.locked, 'locked=%s' % node.locked)
+
+    # ---- 5. 同样的东西挪到正前方 → 应该能锁定 ----
+    node, rec, _, _ = build_node()
+    reset(node)
+    feed(node, FakeScan([(0.70, 0.0, 3)]), times=LOCK_N_F)
+    check('同一个目标在正前方 0.70m → 正常锁定（分区门槛没误伤）',
+          node.locked,
+          'locked=%s dist=%.2f' % (node.locked, node.target_dist))
+
+    # ---- 6. 椅子脚：间距 0.50m 的两根柱子 → 不锁定 ----
+    # 车正对椅子，只能看到前面两条腿。间距 0.50 超过新上限 0.42。
+    node, rec, _, _ = build_node()
+    reset(node)
+    feed(node, FakeScan(legs_objects(0.70, half_gap=0.25)),
+         times=LOCK_N_F)
+    check('间距 0.50m 的两根柱子 → 不锁定（腿距上限 %.2fm）'
+          % DEFAULTS['pair_max_sep'],
+          not node.locked,
+          'locked=%s（椅子前腿间距常在 0.45~0.60m）' % node.locked)
+
+    # ---- 7. 四条腿的正方形家具 → 不锁定（多腿共现）----
+    # 前后两排腿，每排间距 0.40（在腿距上限内），
+    # 但两对的中点只差 0.20m → 判为同一件多腿物体。
+    def furniture(depth=0.70, width=0.40, depth_gap=0.20):
+        hw = width / 2.0
+        out = []
+        for dy in (0.0, depth_gap):
+            d = math.hypot(depth + dy, hw)
+            a = math.degrees(math.atan2(hw, depth + dy))
+            out.append((d, a, 0))
+            out.append((d, -a, 0))
+        return out
+
+    node, rec, _, _ = build_node()
+    reset(node)
+    feed(node, FakeScan(furniture()), times=LOCK_N_F)
+    check('四条腿的家具 → 不锁定（多腿共现拒绝）',
+          not node.locked,
+          'locked=%s（2 对中点仅差 0.20m）' % node.locked)
+
+    # ---- 8. 同样的几何，只有前排两条腿 → 会锁定（已知局限）----
+    # 这条不是 bug，是明确的边界：车正对椅子时只能看到两条前腿，
+    # 和人腿在 2D 雷达下无法区分。记录下来防止误以为已经解决。
+    node, rec, _, _ = build_node()
+    reset(node)
+    front_legs = furniture()[:2]      # 只取前排两条
+    feed(node, FakeScan(front_legs), times=LOCK_N_F)
+    check('【已知局限】只看到前排两条腿时仍会锁定',
+          node.locked,
+          'locked=%s —— 2D 雷达分不清「人腿」和「椅子前腿」，'
+          '靠 pair_max_sep 收紧缓解' % node.locked)
+
+    # ---- 9. 正常大小的实体目标不受影响 ----
+    node, rec, _, _ = build_node()
+    reset(node)
+    feed(node, FakeScan([(0.55, 0.0, 10)]), times=LOCK_N_F)   # 21 点、10°
+    check('正常实体（21 点、跨度 10°）→ 锁定',
+          node.locked and node.lock_kind == 'single',
+          'kind=%s n=21' % node.lock_kind)
+
+    # ---- 10. 太宽的实体（61 点、30°）→ 点数超限不锁定 ----
+    node, rec, _, _ = build_node()
+    reset(node)
+    feed(node, FakeScan([(0.55, 0.0, 30)]), times=LOCK_N_F)
+    check('过宽的实体（61 点、跨度 30°）→ 不锁定（点数 %.0f 上限）'
+          % DEFAULTS['single_max_points'],
+          not node.locked, 'locked=%s' % node.locked)
+
+    # ---- 11. 已锁定后目标走近变宽 → 不能丢（形状过滤只管首次锁定）----
+    node, rec, _, _ = build_node()
+    reset(node)
+    lock_target(node, 0.55, times=LOCK_N_F)
+    ok = node.locked
+    # 走近到 0.40 处、变成 81 点 40° 宽的大块
+    feed(node, FakeScan([(0.40, 0.0, 40)]), times=6)
+    check('已锁定后目标变宽 → 保持跟随（形状过滤只在首次锁定生效）',
+          ok and node.target_valid,
+          'locked=%s valid=%s' % (node.locked, node.target_valid))
+
+    # ---- 12. 关闭形状过滤后，墙又会被锁上（验证开关本身有效）----
+    node, rec, _, _ = build_node(shape_filter_enable=False,
+                                 lock_max_range_side=P_LOCK)
+    reset(node)
+    feed(node, FakeScan([(0.70, 0.0, 40)]), times=LOCK_N_F)
+    check('shape_filter_enable=false → 墙又被锁上（开关有效）',
+          node.locked, 'locked=%s' % node.locked)
 
 
 def main():
@@ -795,6 +949,7 @@ def main():
     test_leg_pair_lock()
     test_single_leg_fallback()
     test_lock_settle()
+    test_false_lock_guard()
 
     # 清理测试锁文件
     try:

@@ -27,17 +27,37 @@ N_SAMPLES = 5           # 采几帧
 TIMEOUT = 8.0
 
 # 与 config/lidar_follow.yaml 的默认值保持一致
-LOCK_MAX_RANGE = 0.50   # 实机标定，见 config 注释
-TRACK_MAX_RANGE = 1.20
+LOCK_MAX_RANGE = 0.80   # 正前方单簇锁定门槛（距离整体 +0.30m）
+TRACK_MAX_RANGE = 1.50
+LOCK_MAX_SIDE = 0.55     # 侧方门槛更紧，防墙面误锁
+SIDE_SECTOR_DEG = 30.0
 SECTOR_DEG = 30.0
+LOCK_SECTOR_DEG = 75.0   # 未锁定时的搜索扇区半角（和节点一致）
 CLUSTER_ANGLE_GAP = math.radians(2.5)
 CLUSTER_RANGE_GAP = 0.15
 REAR_DEG = 40.0
 REAR_RANGE = 0.40
-FRONT_GUARD = 0.32
-# 与节点默认值一致的两个防噪参数（实机验证后新增）
+FRONT_GUARD = 0.62       # 随跟随距离整体 +0.30
+# 与节点默认值一致的防噪参数（实机验证后新增）
 MIN_CLUSTER_POINTS = 5
 MAX_TARGET_JUMP = 0.30
+
+# 防误锁（墙 / 椅脚）
+SHAPE_FILTER = True
+SINGLE_MAX_SPAN = 35.0
+SINGLE_MAX_POINTS = 45
+EDGE_MARGIN = 4.0
+
+# 双腿配对
+PAIR_LOCK_MAX = 1.30
+PAIR_TRACK_MAX = 1.50
+PAIR_MAX_SEP = 0.42
+PAIR_MIN_SEP = 0.05
+PAIR_MAX_DIFF = 0.22
+PAIR_MIN_POINTS = 2
+PAIR_MAX_SPAN = 45.0
+PAIR_MAX_LATERAL = 0.50
+PAIR_MAX_ALONG = 0.25
 
 
 class ScanProbe(Node):
@@ -70,17 +90,43 @@ def analyse(msg):
     all_clusters = GEO.cluster_points(
         all_pts, CLUSTER_ANGLE_GAP, CLUSTER_RANGE_GAP)
 
-    # 前方扇区（目标选择用）
+    # 搜索扇区（目标选择用）。未锁定时用宽扇区，和节点一致。
+    search_rad = math.radians(LOCK_SECTOR_DEG)
+    search_pts = GEO.sector_filter(all_pts, search_rad)
+    search_clusters = GEO.cluster_points(
+        search_pts, CLUSTER_ANGLE_GAP, CLUSTER_RANGE_GAP)
+
+    # 窄前方扇区（刹车守卫用）
     front_pts = GEO.sector_filter(all_pts, sector_rad)
     front_clusters = GEO.cluster_points(
         front_pts, CLUSTER_ANGLE_GAP, CLUSTER_RANGE_GAP)
 
-    # 用与节点完全一致的逻辑（含防噪与跳变保护）
-    pick = GEO.select_target(
-        front_clusters, locked=False, ref_dist=0.0, ref_angle=0.0,
-        lock_max_range=LOCK_MAX_RANGE, track_max_range=TRACK_MAX_RANGE,
+    # 用与节点完全一致的逻辑（含防误锁、防噪、双腿配对）
+    pick = GEO.select_follow_target(
+        search_clusters, False, 0.0, 0.0,
+        LOCK_MAX_RANGE, TRACK_MAX_RANGE,
         min_points=MIN_CLUSTER_POINTS,
-        max_jump=None)   # 未锁定时不需要跳变保护
+        max_jump=None,
+        pair_enable=True,
+        pair_lock_max_range=PAIR_LOCK_MAX,
+        pair_track_max_range=PAIR_TRACK_MAX,
+        pair_max_sep=PAIR_MAX_SEP,
+        pair_min_sep=PAIR_MIN_SEP,
+        pair_max_dist_diff=PAIR_MAX_DIFF,
+        pair_min_points=PAIR_MIN_POINTS,
+        pair_max_span_deg=PAIR_MAX_SPAN,
+        pair_max_lateral_sep=PAIR_MAX_LATERAL,
+        pair_max_along_sep=PAIR_MAX_ALONG,
+        pair_reject_multi=True,
+        pair_multi_radius=0.70,
+        leg_fallback=False,
+        shape_filter_enable=SHAPE_FILTER,
+        single_max_span_deg=SINGLE_MAX_SPAN,
+        single_max_points=SINGLE_MAX_POINTS,
+        edge_margin_deg=EDGE_MARGIN,
+        sector_half_rad=search_rad,
+        lock_max_range_side=LOCK_MAX_SIDE,
+        side_sector_rad=math.radians(SIDE_SECTOR_DEG))
 
     rear_ok = GEO.rear_is_clear(
         all_clusters, math.radians(REAR_DEG), REAR_RANGE)
@@ -88,8 +134,8 @@ def analyse(msg):
 
     return {
         'all_pts': len(all_pts),
-        'front_pts': len(front_pts),
-        'front_clusters': front_clusters,
+        'front_pts': len(search_pts),
+        'front_clusters': search_clusters,
         'all_clusters': all_clusters,
         'pick': pick,
         'rear_clear': rear_ok,
@@ -129,27 +175,42 @@ def main():
     if r['front_clusters']:
         print('\n前方物体（按距离排序）:')
         for c in sorted(r['front_clusters'], key=lambda x: x['dist']):
-            inlock = '★可锁定' if c['dist'] <= LOCK_MAX_RANGE else '  超出门槛'
+            lim = (LOCK_MAX_SIDE if abs(c['angle']) > math.radians(
+                SIDE_SECTOR_DEG) else LOCK_MAX_RANGE)
+            inlock = '★可锁定' if c['dist'] <= lim else '  超出门槛'
             print('   %.2fm  %+6.1f°  %2d点  %s'
                   % (c['dist'], math.degrees(c['angle']), c['n'], inlock))
 
     print('\n' + '-' * 66)
     if r['pick'] is not None:
-        d, a, n = r['pick']
-        print('✅ 能锁定目标：%.2fm / %+.1f°（%d 点）' % (d, math.degrees(a), n))
-        if d <= 0.50:
-            print('   → 距离 %.2f < 0.50，会进入 RETREAT（后退）' % d)
-        elif d <= 0.65:
-            print('   → 距离 %.2f 在死区 0.55~0.65，会 HOLD（不动）' % d)
+        p = r['pick']
+        d, a, n = p['dist'], p['angle'], p['n']
+        kind = {'pair': '双腿对', 'single': '单簇', 'leg': '单腿'}.get(
+            p['kind'], p['kind'])
+        extra = ''
+        if p['kind'] == 'pair':
+            la, lb = p['leg_a'], p['leg_b']
+            extra = ('  [%.2f/%+.0f° + %.2f/%+.0f° 间距%.2f]'
+                     % (la[0], math.degrees(la[1]),
+                        lb[0], math.degrees(lb[1]), p['sep']))
+        print('✅ 能锁定目标【%s】：%.2fm / %+.1f°（%d 点）%s'
+              % (kind, d, math.degrees(a), n, extra))
+        if d < 0.80:
+            print('   → 距离 %.2f < 0.80，会进入 RETREAT（后退）' % d)
+        elif d <= 0.95:
+            print('   → 距离 %.2f 在死区 0.80~0.95，会 HOLD（不动）' % d)
         else:
-            print('   → 距离 %.2f > 0.65，会 APPROACH（前进）' % d)
+            print('   → 距离 %.2f > 0.95，会 APPROACH（前进）' % d)
     else:
-        print('❌ 无法锁定：前方 ±%.0f° 内 %.2fm 以内没有物体' %
-              (SECTOR_DEG, LOCK_MAX_RANGE))
+        print('❌ 无法锁定：搜索扇区 ±%.0f° 内没有合格目标'
+              % LOCK_SECTOR_DEG)
+        print('   门槛：正前方 ±%.0f° 内 %.2fm / 侧方 %.2fm'
+              % (SIDE_SECTOR_DEG, LOCK_MAX_RANGE, LOCK_MAX_SIDE))
+        print('   另外还会拦截：过宽/过多点/顶到扇区边界的簇（防墙）、')
+        print('                 多腿共现（防椅子）、间距 >%.2fm 的假双腿'
+              % PAIR_MAX_SEP)
         if r['front_nearest'] is not None:
-            print('   最近的物体在 %.2fm（超过 %.2fm 锁定门槛）'
-                  % (r['front_nearest'], LOCK_MAX_RANGE))
-            print('   → 把物体往前挪到 %.2fm 以内就能锁定' % LOCK_MAX_RANGE)
+            print('   前方最近的物体在 %.2fm' % r['front_nearest'])
 
     print('\n安全检查状态:')
     print('   后方 %.1fm 内 %s' % (REAR_RANGE,
