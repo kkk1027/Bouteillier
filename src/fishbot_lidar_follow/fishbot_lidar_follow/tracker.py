@@ -154,3 +154,27 @@ class TargetTracker:
             self.last_stamp = stamp
         self.lost_frames += 1
         return self.kf_d.pos, self.kf_a.pos
+
+    def observe_dist_only(self, dist, stamp):
+        """只更新距离，角度完全交给预测。
+
+        用在哪：人走路时两条腿互相遮挡，只看到一条腿。
+        这时距离仍然可靠（两条腿深度基本一致），
+        但单腿的角度会偏离身体中心 ±10° 左右，
+        直接拿来做控制会让车左右抽。
+
+        注意 kf_a 只做 predict 不做 update，
+        所以角度会按最后一次观测到的角速度平滑外推。
+        遮挡是短暂的，这点外推可以接受；而速度通常已经收敛到 0，
+        不会真的越跑越偏。
+        """
+        if self.kf_d.initialized and self.last_stamp > 0.0:
+            dt = max(1e-3, stamp - self.last_stamp)
+            self.kf_d.predict(dt)
+            self.kf_a.predict(dt)
+
+        self.kf_d.update(dist)
+        self.last_stamp = stamp
+        self.lost_frames = 0
+        return (self.kf_d.pos, self.kf_a.pos,
+                self.kf_d.vel, self.kf_a.vel)

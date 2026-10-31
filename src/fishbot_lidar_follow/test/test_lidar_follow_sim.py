@@ -85,8 +85,9 @@ class FakeScan:
 
     def __init__(self, objects=(), n=721, rmin=0.30, rmax=64.0, far=20.0):
         """
-        objects: [(距离, 角度deg), ...]，会把对应索引设成该距离，
-                 并在左右相邻索引各放一个相近的值，模拟一个物体有宽度。
+        objects: [(距离, 角度deg)] 或 [(距离, 角度deg, 半宽点数), ...]
+                 默认半宽 2（即 ±2，共 5 个点，模拟有宽度的实体）。
+                 人腿用半宽 0（每个腿只占 1 个点）—— 实机就是这个工况。
         """
         self.angle_min = math.radians(-180.0)
         self.angle_increment = math.radians(0.5)
@@ -94,14 +95,39 @@ class FakeScan:
         self.range_max = rmax
         self.ranges = [far] * n
 
-        for dist, deg in objects:
+        for obj in objects:
+            dist, deg = obj[0], obj[1]
+            half = obj[2] if len(obj) > 2 else 2
             idx = int(round((math.radians(deg) - self.angle_min)
                             / self.angle_increment))
-            # 物体有宽度：中心 ±2 个点
-            for k in (-2, -1, 0, 1, 2):
+            for k in range(-half, half + 1):
                 j = idx + k
                 if 0 <= j < n:
                     self.ranges[j] = dist + abs(k) * 0.01
+
+
+def legs_objects(depth, half_gap=0.11, yaw_deg=0.0, hide=None):
+    """生成「两条腿」的扫描对象，每条腿只占 1 个点。
+
+    depth     人体中心到车的纵向距离（米）
+    half_gap  每条腿相对中心线的横向偏移（米）
+    yaw_deg   人整体绕车转过的角度
+    hide      None=两条腿都显示；0/1=只显示其中一条（模拟遮挡）
+    """
+    yaw = math.radians(yaw_deg)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    out = []
+    for idx, sign in enumerate((-1.0, 1.0)):
+        if hide is not None and idx != hide:
+            continue
+        xf = depth              # 纵向：+x 为车正前方
+        yl = sign * half_gap    # 横向：+y 为车的左侧
+        xr = xf * cy - yl * sy
+        yr = xf * sy + yl * cy
+        out.append((math.hypot(xr, yr),
+                    math.degrees(math.atan2(yr, xr)),
+                    0))
+    return out
 
 
 # 从节点自己的 DEFAULT_PARAMS 派生，避免两份清单不同步。
@@ -111,6 +137,14 @@ class FakeScan:
 DEFAULTS = dict(LF.DEFAULT_PARAMS)
 DEFAULTS['stop_nav_on_start'] = False
 DEFAULTS['publish_debug'] = False
+# 锁定稳定观察期默认关掉：它按真实时钟计时，而测试是「瞬发」喂帧，
+# 开着会把所有控制用例都拦在 HOLD。它本身由 [9] 单独验证。
+DEFAULTS['lock_settle_time'] = 0.0
+
+# 「喂够帧数让节点锁定」要喂多少帧。
+# 不要硬编码：lock_confirm_frames 一改，硬编码的用例就会悄悄失效。
+# +2 是留余量（第 1 帧只建立候选，不算命中）。
+LOCK_N = int(DEFAULTS['lock_confirm_frames']) + 2
 
 
 def build_node(**overrides):
@@ -173,11 +207,13 @@ def feed(node, scan, times=1):
         time.sleep(0.0)
 
 
-def lock_target(node, dist=0.38, angle=0.0, times=6):
+def lock_target(node, dist=0.38, angle=0.0, times=LOCK_N):
     """先在小距离锁定目标。
 
-    设计上首次锁定必须在 lock_max_range(0.40m) 内，
-    所以想测「目标 0.85m」必须先在 40cm 内锁上，再让它退远。
+    设计上首次锁定必须是：
+      * 单簇目标在 lock_max_range(0.50m) 内
+      * 或者双腿对两点各在 pair_lock_max_range(1.00m) 内
+      * 且连续确认 lock_confirm_frames(3) 帧
     """
     for _ in range(times):
         feed(node, FakeScan([(dist, angle)]))
@@ -225,6 +261,11 @@ def reset(node):
     node.last_ang = 0.0
     node.last_scan_time = 0.0
     node.last_clusters = []
+    node.guard_clusters = []
+    node.lock_hits = 0
+    node.lock_miss = 0
+    node.lock_cand = None
+    node.lock_kind = ''
 
 
 # ============================================================
@@ -240,17 +281,20 @@ def test_lock_rules():
     check('0.90m 目标超过首次锁定范围，不锁定', not node.locked,
           'locked=%s' % node.locked)
 
-    # 目标在 0.35m → 应锁定
+    # 目标在 0.35m → 应锁定（需连续 3 帧确认）
     node, rec, _, _ = build_node()
     reset(node)
     feed(node, FakeScan([(0.35, 0.0)]))
-    check('0.35m 目标在 40cm 内，锁定成功', node.locked,
+    check('单帧不锁定（时间确认生效）', not node.locked,
+          'hits=%d' % node.lock_hits)
+    feed(node, FakeScan([(0.35, 0.0)]), times=LOCK_N)
+    check('0.35m 目标在 50cm 内，连续 %d 帧后锁定' % LOCK_N, node.locked,
           'locked=%s dist=%.2f' % (node.locked, node.target_dist))
 
     # 锁定后目标退到 1.0m，仍应继续跟踪（track_max_range=1.20）
     node, rec, _, _ = build_node()
     reset(node)
-    feed(node, FakeScan([(0.35, 0.0)]))
+    feed(node, FakeScan([(0.35, 0.0)]), times=LOCK_N)
     for _ in range(20):
         feed(node, FakeScan([(1.00, 0.0)]))
     check('锁定后目标退到 1.00m 仍保持跟踪', node.locked and node.target_valid,
@@ -260,18 +304,29 @@ def test_lock_rules():
     # 目标跑到 1.5m（超过 track_max_range）→ 丢失
     node, rec, _, _ = build_node()
     reset(node)
-    feed(node, FakeScan([(0.35, 0.0)]))
+    feed(node, FakeScan([(0.35, 0.0)]), times=LOCK_N)
     for _ in range(10):
         feed(node, FakeScan([(1.50, 0.0)]))
     check('目标超出跟踪范围后判定丢失', not node.target_valid,
           'valid=%s' % node.target_valid)
 
-    # 扇区外的目标不锁定（+45° 超出 ±30°）
+    # 搜索扇区外的目标不锁定。
+    # 未锁定时的搜索扇区是 ±75°（lock_sector_half_angle_deg），
+    # 所以用 +85° 来测「扇区外」。
     node, rec, _, _ = build_node()
     reset(node)
-    feed(node, FakeScan([(0.35, 45.0)]))
-    check('±30° 扇区外的目标不锁定', not node.locked,
+    feed(node, FakeScan([(0.35, 85.0)]), times=LOCK_N)
+    check('±75° 搜索扇区外的目标不锁定', not node.locked,
           'locked=%s' % node.locked)
+
+    # 但 ±75° 扇区内的侧面目标应该能锁定
+    node, rec, _, _ = build_node()
+    reset(node)
+    feed(node, FakeScan([(0.35, 60.0)]), times=LOCK_N)
+    check('+60° 侧面目标能被锁定（宽搜索扇区生效）', node.locked,
+          'locked=%s dist=%.2f ang=%.0f°'
+          % (node.locked, node.target_dist,
+             math.degrees(node.target_angle)))
 
 
 def test_approach_hold_retreat():
@@ -374,7 +429,7 @@ def test_safety():
     # ---- 雷达超时（有过数据但断了很久）→ 停 ----
     node, rec, _, _ = build_node()
     reset(node)
-    feed(node, FakeScan([(0.85, 0.0)]), times=5)
+    feed(node, FakeScan([(0.85, 0.0)]), times=LOCK_N)
     node.last_scan_time -= 2.0        # 假装 2 秒没数据
     m = tick(node, rec, n=3)
     check('雷达超时 → 输出 0', m is not None and abs(m.linear.x) < 1e-6,
@@ -477,6 +532,254 @@ def test_smoothing():
           '首周期=%.3f 上限=%.3f' % (first, 0.80 * 0.05))
 
 
+def test_leg_pair_lock():
+    print('\n[7] 双腿成对锁定（实机工况）')
+
+    # ---- 基本：两条腿各 1 个点，0.62m，间距 22cm ----
+    node, rec, _, _ = build_node()
+    reset(node)
+    legs = legs_objects(0.62)
+    feed(node, FakeScan(legs))
+    check('双腿单帧不锁定（要 %d 帧确认）' % LOCK_N, not node.locked,
+          'hits=%d' % node.lock_hits)
+    feed(node, FakeScan(legs), times=LOCK_N)
+    check('双腿各 1 点也能锁定', node.locked,
+          'locked=%s kind=%s' % (node.locked, node.lock_kind))
+    check('  锁定类型识别为 pair', node.lock_kind == 'pair',
+          node.lock_kind)
+    check('  中点距离 ≈ 0.62m', abs(node.target_dist - 0.62) < 0.05,
+          '%.3f' % node.target_dist)
+    check('  中点角度 ≈ 0°', abs(math.degrees(node.target_angle)) < 3.0,
+          '%+.1f°' % math.degrees(node.target_angle))
+
+    # ---- 中点比单条腿更接近真实身体中心 ----
+    # 单独一条腿在 0.63m/±10°，中点应该在 0.62m/0°
+    check('  中点角度比单腿角度小（修掉了左右跳）',
+          abs(node.target_angle) < math.radians(5.0),
+          '单腿 ±10.1° → 中点 %+.1f°' % math.degrees(node.target_angle))
+
+    # ---- 间距超过 60cm → 不算一双腿 ----
+    node, rec, _, _ = build_node()
+    reset(node)
+    feed(node, FakeScan(legs_objects(0.62, half_gap=0.375)), times=LOCK_N)
+    check('两点间距 0.75m 超过 60cm → 不锁定', not node.locked,
+          'locked=%s' % node.locked)
+
+    # ---- 深度差超过 35cm → 是「腿 + 墙」不是一双腿 ----
+    node, rec, _, _ = build_node()
+    reset(node)
+    feed(node, FakeScan([(0.55, -8.0, 0), (0.95, 8.0, 0)]), times=LOCK_N)
+    check('两点深度差 0.40m → 不锁定', not node.locked,
+          'locked=%s' % node.locked)
+
+    # ---- 锁定后一条腿被挡住 2 帧 → 卡尔曼顶住 ----
+    node, rec, _, _ = build_node()
+    reset(node)
+    feed(node, FakeScan(legs_objects(0.62)), times=LOCK_N)
+    ok = node.locked
+    feed(node, FakeScan(legs_objects(0.62, hide=0)), times=2)
+    check('一条腿被挡住 2 帧 → 仍保持跟随',
+          ok and node.target_valid,
+          'locked=%s valid=%s lost=%d'
+          % (node.locked, node.target_valid, node.tracker.lost_frames))
+
+    # ---- 两条腿整体转 15° → 角度跟着走 ----
+    node, rec, _, _ = build_node()
+    reset(node)
+    feed(node, FakeScan(legs_objects(0.62)), times=LOCK_N)
+    for i in range(1, 11):
+        feed(node, FakeScan(legs_objects(0.62, yaw_deg=15.0 * i / 10.0)))
+    check('双腿整体转 15° → 目标角度跟上',
+          node.target_valid
+          and abs(math.degrees(node.target_angle) - 15.0) < 4.0,
+          '角度 %+.1f°' % math.degrees(node.target_angle))
+
+    # ---- 人侧身站：两条腿合成一个 5 点大簇 → 走单簇路径，不能丢 ----
+    node, rec, _, _ = build_node()
+    reset(node)
+    feed(node, FakeScan(legs_objects(0.62)), times=LOCK_N)
+    kinds = [node.lock_kind]
+    for _ in range(6):
+        feed(node, FakeScan([(0.62, 0.0)]))     # 默认半宽 2 → 5 个点
+        kinds.append('valid' if node.target_valid else 'lost')
+    check('双腿合成单簇后依然跟随（模式切换不打嗝）',
+          node.target_valid and 'lost' not in kinds,
+          ' '.join(kinds))
+
+    # ---- 噪声：每次位置都在跳的孤立点，永远不该锁定 ----
+    node, rec, _, _ = build_node()
+    reset(node)
+    locked_any = False
+    for i in range(12):
+        seed = i * 37
+        d1 = 0.45 + (seed % 9) * 0.05
+        a1 = -20.0 + (seed % 7) * 8.0
+        d2 = 0.45 + ((seed + 3) % 9) * 0.05
+        a2 = -20.0 + ((seed + 5) % 7) * 8.0
+        feed(node, FakeScan([(d1, a1, 0), (d2, a2, 0)]))
+        if node.locked:
+            locked_any = True
+    check('跳动的噪声点不会被锁定', not locked_any,
+          'locked=%s' % locked_any)
+
+    # ---- 实体纸箱（点够多）仍走单簇路径 ----
+    node, rec, _, _ = build_node()
+    reset(node)
+    feed(node, FakeScan([(0.42, 0.0)]), times=LOCK_N)
+    check('实体目标（5 点单簇）仍按单簇锁定',
+          node.locked and node.lock_kind == 'single',
+          'kind=%s' % node.lock_kind)
+
+    # ---- 双腿 + 更近的实体同时存在 → 锁更近的那个 ----
+    node, rec, _, _ = build_node()
+    reset(node)
+    mixed = legs_objects(0.62) + [(0.40, 0.0, 2)]
+    feed(node, FakeScan(mixed), times=LOCK_N)
+    check('双腿与更近实体同时存在 → 锁更近的实体',
+          node.locked and node.lock_kind == 'single'
+          and abs(node.target_dist - 0.40) < 0.05,
+          'kind=%s dist=%.2f' % (node.lock_kind, node.target_dist))
+
+    # ---- 横向张得太开的一对不是双腿 ----
+    # 实机仿真里出现过「间距 0.56m、角度差 49°」的假双腿：
+    # 两点直线距离 0.56 < 60cm 上限，但横向 0.55m 远超人体宽度。
+    node, rec, _, _ = build_node()
+    reset(node)
+    fake = [(0.61, 6.0, 0), (0.73, 55.0, 0)]
+    feed(node, FakeScan(fake), times=LOCK_N)
+    check('横向 0.55m 的「假双腿」不锁定（横向间距约束）',
+          not node.locked, 'locked=%s' % node.locked)
+
+    # ---- 腿距每帧都变 → 间距稳定性拦住 ----
+    # 注意：腿距必须取「两侧都在允许范围内」的值（0.15 / 0.45），
+    # 否则大间距那一帧会被横向约束整帧过滤掉，
+    # 变成「漏检」而不是「间距不一致」，测不到这条约束。
+    node, rec, _, _ = build_node()
+    reset(node)
+    seq = [0.15, 0.45, 0.18, 0.42, 0.15, 0.45, 0.18, 0.42]
+    for g in seq:
+        feed(node, FakeScan(legs_objects(0.62, half_gap=g / 2.0)))
+    check('腿距 0.15↔0.45 交替 → 不锁定（间距稳定性约束）',
+          not node.locked,
+          'locked=%s sep 序列 %s' % (node.locked, seq))
+
+    # ---- 腿距稳定（人正常走）→ 照常锁定 ----
+    node, rec, _, _ = build_node()
+    reset(node)
+    for g in (0.21, 0.23, 0.22, 0.24, 0.22):
+        feed(node, FakeScan(legs_objects(0.62, half_gap=g / 2.0)))
+    check('腿距在 0.21~0.24 微动 → 正常锁定',
+          node.locked, 'locked=%s' % node.locked)
+
+
+def test_single_leg_fallback():
+    print('\n[8] 单腿兜底（只看到一条腿）')
+
+    # ---- 锁定后只剩一条腿 → 不能丢，角度不能跳 ----
+    node, rec, _, _ = build_node()
+    reset(node)
+    feed(node, FakeScan(legs_objects(0.62)), times=LOCK_N)
+    ok = node.locked
+    a0 = math.degrees(node.target_angle)
+    d0 = node.target_dist
+
+    for _ in range(6):
+        feed(node, FakeScan(legs_objects(0.62, hide=0)))
+    check('只剩一条腿 → 仍保持跟随', ok and node.target_valid,
+          'locked=%s valid=%s lost=%d'
+          % (node.locked, node.target_valid, node.tracker.lost_frames))
+    check('  角度不被单腿带偏（不左右抽）',
+          abs(math.degrees(node.target_angle) - a0) < 2.0,
+          '锁定 %.1f° → 现在 %+.1f°' % (a0, math.degrees(node.target_angle)))
+    check('  距离仍然跟得上',
+          abs(node.target_dist - d0) < 0.05,
+          '%.3fm → %.3fm' % (d0, node.target_dist))
+
+    # ---- 单腿距离变化时，距离要跟，角度不跟 ----
+    node, rec, _, _ = build_node()
+    reset(node)
+    feed(node, FakeScan(legs_objects(0.62)), times=LOCK_N)
+    a0 = math.degrees(node.target_angle)
+    for i in range(1, 9):
+        feed(node, FakeScan(legs_objects(0.62 + 0.04 * i, hide=1)))
+    check('单腿距离变大 → 距离跟上',
+          abs(node.target_dist - (0.62 + 0.32)) < 0.08,
+          '实测 %.3fm，期望 ≈%.2fm' % (node.target_dist, 0.94))
+    check('  过程中角度保持不抽',
+          abs(math.degrees(node.target_angle) - a0) < 3.0,
+          '%.1f° → %+.1f°' % (a0, math.degrees(node.target_angle)))
+    check('  目标没有丢', node.target_valid)
+
+    # ---- 单腿兜底不该在未锁定时生效（不能靠一条腿去锁定）----
+    node, rec, _, _ = build_node()
+    reset(node)
+    feed(node, FakeScan(legs_objects(0.62, hide=0)), times=LOCK_N)
+    check('未锁定时单腿不会触发兜底（不会误锁）', not node.locked,
+          'locked=%s' % node.locked)
+
+    # ---- 关掉兜底后，只剩一条腿应该丢 ----
+    node, rec, _, _ = build_node(leg_fallback_enable=False)
+    reset(node)
+    feed(node, FakeScan(legs_objects(0.62)), times=LOCK_N)
+    ok = node.locked
+    for _ in range(6):
+        feed(node, FakeScan(legs_objects(0.62, hide=0)))
+    check('leg_fallback_enable=false → 只剩一条腿就丢',
+          ok and not node.target_valid,
+          'locked=%s valid=%s' % (node.locked, node.target_valid))
+
+    # ---- 单腿距离跑太远（超过容差）→ 不认，宁可丢 ----
+    node, rec, _, _ = build_node()
+    reset(node)
+    feed(node, FakeScan(legs_objects(0.62)), times=LOCK_N)
+    for _ in range(6):
+        feed(node, FakeScan(legs_objects(1.15, hide=0)))
+    check('单腿距离突变 0.53m 超过容差 → 判定丢失',
+          not node.target_valid,
+          'valid=%s dist=%.2f' % (node.target_valid, node.target_dist))
+
+
+def test_lock_settle():
+    print('\n[9] 锁定稳定观察期')
+
+    # 默认关不掉的安全项：这里显式打开
+    node, rec, _, _ = build_node(lock_settle_time=1.0)
+    reset(node)
+    # 先在 0.38m 锁定（必须在 lock_max_range 内），再让它退到 0.85m
+    lock_target(node, 0.38)
+    settle(node, 0.85)
+    check('先锁定 0.38m，再退到 0.85m', node.locked,
+          'locked=%s d=%.2f' % (node.locked, node.target_dist))
+
+    # 刚锁定，立刻下指令 → 必须不动
+    node.last_ctrl_time -= 0.05
+    node.on_ctrl()
+    m = rec.last()
+    check('刚锁定时输出 0（观察期生效）',
+          m is not None and abs(m.linear.x) < 1e-9
+          and abs(m.angular.z) < 1e-9,
+          'lin=%.3f ang=%.3f' % (m.linear.x, m.angular.z))
+
+    # 把锁定时刻往前推 1.5 秒，模拟观察期结束
+    node.lock_time -= 1.5
+    node.last_ctrl_time -= 0.05
+    node.on_ctrl()
+    m = rec.last()
+    check('观察期结束后恢复前进',
+          m is not None and m.linear.x > 0.0,
+          'lin=%.3f 状态=%s' % (m.linear.x, node.state))
+
+    # 关掉观察期 → 锁完立刻能动（验证这个开关本身有效）
+    node, rec, _, _ = build_node(lock_settle_time=0.0)
+    reset(node)
+    lock_target(node, 0.38)
+    settle(node, 0.85)
+    m = tick(node, rec, n=25)
+    check('lock_settle_time=0 时不等待',
+          m is not None and m.linear.x > 0.0,
+          'lin=%.3f' % (m.linear.x if m else 0))
+
+
 def main():
     print('=' * 62)
     print('雷达跟随离线仿真测试')
@@ -489,6 +792,9 @@ def main():
     test_safety()
     test_short_dropout()
     test_smoothing()
+    test_leg_pair_lock()
+    test_single_leg_fallback()
+    test_lock_settle()
 
     # 清理测试锁文件
     try:
