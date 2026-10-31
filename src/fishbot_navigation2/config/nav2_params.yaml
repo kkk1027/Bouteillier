@@ -118,10 +118,25 @@ amcl:
     tf_broadcast: true
 
     # ==========================================================
-    # 🔧【关键】减小 TF 容忍时间
-    # 1.0 秒太大会导致 TF 滞后，影响激光匹配精度
+    # 🔧【关键】TF 容忍时间（2026-10-31 回起点复盘后从 0.2 放宽到 1.0）
+    # ----------------------------------------------------------
+    # 曾经改成 0.2 是出于「减小 TF 滞后」的误解。transform_tolerance
+    # 不是让 TF 更新更快，而是**在查不到当前时刻的变换时，允许拿多旧的
+    # 数据凑合**。设小 = 更容易报错，不是更准。
+    #
+    # 实测故障（2026-10-31 21:45 回起点）：
+    #   Exception in transformPose: Lookup would require extrapolation
+    #   into the future. Requested 1793454305.734 but latest data is at
+    #   1793454304.859785          ← map→odom 只新到 0.87s 前
+    #   Unable to transform robot pose into global plan's frame
+    #   Controller patience exceeded → [follow_path] Aborting handle
+    # 一轮导航里出现 5 次，其中一次直接打断跟出。
+    #
+    # 为什么会滞后 0.87s：AMCL 只在处理激光帧时才重发 map→odom，
+    # 而本项目雷达经 WiFi 传输，有效帧率仅 0.86Hz（还偶有丢帧）。
+    # 用 nav2 默认的 1.0 即可留出足够余量。
     # ==========================================================
-    transform_tolerance: 0.2
+    transform_tolerance: 1.0
 
     # ==========================================================
     # 🔧【关键】静止更新阈值（2026-10-31 塌缩复盘后上调）

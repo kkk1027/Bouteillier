@@ -77,6 +77,72 @@ def _cleanup_process(proc: Optional[subprocess.Popen]):
 
 
 # ============================================================
+# 孤儿导航进程清理
+# ------------------------------------------------------------
+# 问题（2026-10-31 实测）：nav_to_pose 进程存活了 3 小时 10 分，
+# 而当时的导航栈 3 小时前就已经换了新的。
+#
+# 成因：
+#   1. Popen 用了 preexec_fn=os.setsid，子进程独立成会话组，
+#      不受父进程（web_controller）的进程组信号影响；
+#   2. 回收依赖 daemon=True 的 _monitor_process 线程 poll()；
+#   3. web_controller 一重启，_active_nav_process 被重置成 None，
+#      监控线程随旧进程消失 —— 子进程彻底失去管控，永远留着。
+#
+# 后果：孤儿仍占着 /navigate_to_pose 的 action client，可能和新导航
+# 互相打断，或在下一次导航时突然发出自己那个过期的目标。
+#
+# 对策：每次启动新导航前主动扫一遍，把不属于当前活跃进程的全清掉。
+# 全局锁已保证「同一时刻只有一个导航」，所以此刻扫到的都是孤儿。
+# ============================================================
+_NAV_PROC_MARKERS = (
+    'ros2 run fishbot_application nav_to_pose',
+    'ros2 launch autopatrol_robot autopatrol.launch.py',
+)
+
+
+def _reap_orphan_nav_processes() -> int:
+    """杀掉所有遗留的导航子进程，返回清理个数。
+
+    必须在持有 _global_nav_lock 的情况下调用。
+    """
+    keep = set()
+    if _active_nav_process is not None and _active_nav_process.poll() is None:
+        keep.add(_active_nav_process.pid)
+        keep.add(os.getpgid(_active_nav_process.pid))
+
+    me = os.getpid()
+    killed = 0
+    for marker in _NAV_PROC_MARKERS:
+        try:
+            out = subprocess.run(
+                ['pgrep', '-f', marker],
+                capture_output=True, text=True, timeout=3,
+            ).stdout
+        except Exception:
+            continue
+        for line in out.split():
+            if not line.isdigit():
+                continue
+            pid = int(line)
+            # 别杀自己、别杀还活着的当前导航
+            if pid == me or pid in keep:
+                continue
+            try:
+                if os.getpgid(pid) in keep:
+                    continue
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+                killed += 1
+                print('[导航] 已清理遗留导航进程 pid=%d (%s)'
+                      % (pid, marker))
+            except ProcessLookupError:
+                pass
+            except Exception as exc:                   # noqa: BLE001
+                print('[导航] 清理 pid=%d 失败: %s' % (pid, exc))
+    return killed
+
+
+# ============================================================
 # 与雷达跟随互斥
 # ------------------------------------------------------------
 # 本项目没有 twist_mux，导航和雷达跟随都直接往 /cmd_vel 发指令。
@@ -201,6 +267,7 @@ def launch_navigate_by_index(index: int, target_name: str = "") -> str:
             f"target_indices:={index}"
         )
 
+        _reap_orphan_nav_processes()
         _active_nav_process = subprocess.Popen(
             ['bash', '-c', cmd],
             stdout=subprocess.DEVNULL,
@@ -250,6 +317,7 @@ def launch_navigate_sequence(indices: list, target_names: str = "") -> str:
             f"target_indices:={indices_str}"
         )
 
+        _reap_orphan_nav_processes()
         _active_nav_process = subprocess.Popen(
             ['bash', '-c', cmd],
             stdout=subprocess.DEVNULL,
@@ -285,6 +353,7 @@ def launch_return_to_start() -> str:
             f"ros2 run fishbot_application nav_to_pose"
         )
 
+        _reap_orphan_nav_processes()
         _active_nav_process = subprocess.Popen(
             ['bash', '-c', cmd],
             stdout=subprocess.DEVNULL,
@@ -320,6 +389,7 @@ def launch_navigate_xy(x: float, y: float, yaw: float) -> str:
             f"target_coordinates:='{x},{y},{yaw}'"
         )
 
+        _reap_orphan_nav_processes()
         _active_nav_process = subprocess.Popen(
             ['bash', '-c', cmd],
             stdout=subprocess.DEVNULL,

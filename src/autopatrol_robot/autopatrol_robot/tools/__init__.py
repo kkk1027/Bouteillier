@@ -20,11 +20,27 @@ from autopatrol_robot.tools.loc_tools import (
     delete_saved_location,
     clear_all_saved_locations,
 )
-from autopatrol_robot.tools.follow_tools import (
-    start_patrol_mode,
-    stop_patrol_mode,
-    get_patrol_mode_status,
-)
+# ============================================================
+# 视觉跟随（看护模式）已暂时剔除 —— 2026-10-31
+# ------------------------------------------------------------
+# 原因：
+#   1. 它依赖独立的 detection_ws 工作区（esp32_cam_detector），
+#      本机根本没有这个目录，三个工具调了只会报错；
+#   2. 它还占着 3B 小模型的工具名额（每个工具的 schema 都要进
+#      prompt），而实测本地模型 + 雷达跟随已够用；
+#   3. 当前阶段只用雷达跟随，两套并存容易互相干扰。
+#
+# 未删除任何代码：follow_tools.py 完整保留，stop_follow_mode_process
+# 仍被 cleanup_ros() 与 web_controller 的清理路径使用。
+#
+# 恢复方法：把下面这行取消注释，并恢复 ALL_TOOLS / _LOCAL_TOOL_NAMES
+# 里的 start_patrol_mode / stop_patrol_mode / get_patrol_mode_status。
+# ============================================================
+# from autopatrol_robot.tools.follow_tools import (
+#     start_patrol_mode,
+#     stop_patrol_mode,
+#     get_patrol_mode_status,
+# )
 from autopatrol_robot.tools.sys_tools import (
     get_current_position,
     initialize_pose,
@@ -102,10 +118,10 @@ ALL_TOOLS = [
     list_saved_locations,
     delete_saved_location,
     clear_all_saved_locations,
-    # 看护模式工具
-    start_patrol_mode,
-    stop_patrol_mode,
-    get_patrol_mode_status,
+    # 看护模式（视觉跟随）工具已剔除，见上方注释
+    # start_patrol_mode,
+    # stop_patrol_mode,
+    # get_patrol_mode_status,
     # 系统状态工具
     get_current_position,
     initialize_pose,
@@ -154,9 +170,10 @@ _LOCAL_TOOL_NAMES = {
     "list_locations",
     "save_current_location",
     "delete_saved_location",
-    "start_patrol_mode",
-    "stop_patrol_mode",
-    "get_patrol_mode_status",
+    # 当前只用雷达跟随；视觉跟随（看护模式）已剔除
+    # "start_patrol_mode",
+    # "stop_patrol_mode",
+    # "get_patrol_mode_status",
     "get_current_position",
     "get_battery_status",
     # 用户真的会说"初始化一下位姿"，而且 AMCL 定位失效时这是恢复手段，

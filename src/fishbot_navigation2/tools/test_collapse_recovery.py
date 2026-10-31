@@ -44,8 +44,16 @@ with open(SRC, encoding='utf-8') as f:
 
 print('\n=== 静态检查：代码结构 ===')
 
+_conv_seg = re.search(
+    r'self\.state = self\.STATE_CONVERGED.*?(?=\n    def )', CODE, re.S)
+_conv_code = ''
+if _conv_seg:
+    # 只看代码行：注释里为说明历史 bug 会引用 "_timer.cancel()"
+    _conv_code = '\n'.join(ln for ln in _conv_seg.group(0).splitlines()
+                           if not ln.lstrip().startswith('#'))
+
 check('收敛后不再 _timer.cancel() 自杀',
-      '停止周期性 nomotion 更新（AMCL 将不再主动重发 map→odom）' in CODE)
+      _conv_seg is not None and '_timer.cancel()' not in _conv_code)
 
 check('收敛时不再设 _finished=True',
       'self.state = self.STATE_CONVERGED\n        self._converged_at = now'

@@ -110,12 +110,23 @@ class AutoLocalizer(Node):
         self.declare_parameter('converge_hold_sec', 3.0)
         self.declare_parameter('timeout_sec', 120.0)
         self.declare_parameter('timeout_retries', 2)
-        # 收敛后**停止**请求 nomotion。
-        # 之前设成 False（收敛后仍以 2s 周期刷新）是为了让 map→odom
-        # 跟上 odom 漂移。但固件加编码器死区后，静止时 odom 已经不漂
-        # （实测 2252 帧 wz 全为 0），继续刷新只会不断重采样导致粒子塔缩。
-        self.declare_parameter('stop_nomotion_after_converge', True)
-        self.declare_parameter('nomotion_update_period_after_converge_sec', 2.0)
+        # ==========================================================
+        # 收敛后是否还刷新 map→odom（2026-10-31 二次修订）
+        # ----------------------------------------------------------
+        # 曾经默认 True（收敛后完全停发）—— 这是个 bug 源头，已废弃使用。
+        #
+        # 为什么不能停：AMCL 只在**处理激光帧时**才重发 map→odom。
+        # 本项目雷达经 WiFi 传输，实测每分钟约丢一帧，有效帧率 0.86Hz。
+        # 一旦停发，nav2 controller_server（100ms 查一次 TF）就会报
+        #   Lookup would require extrapolation into the future
+        # 实测回起点过程中出现 5 次，其中一次直接把跟出一条控制周期打挂
+        # （Controller patience exceeded → follow_path Aborting）。
+        #
+        # 现在改由 good_enough_cov_xy/yaw 统一控制：
+        #   σ 低于够用线 → 自动暂停（防塔缩）；σ 涨回来 → 自动恢复。
+        # 两个参数仅为向后兼容而保留，不再影响行为。
+        self.declare_parameter('stop_nomotion_after_converge', False)
+        self.declare_parameter('nomotion_update_period_after_converge_sec', 1.0)
         # 粒子塔缩判据：σ 低于物理下限即认为滤波器已退化。
         # 0.05m 栅格 + 最少 500 个粒子不可能达到 5mm 精度。
         self.declare_parameter('collapse_cov_xy', 0.005)
@@ -189,11 +200,9 @@ class AutoLocalizer(Node):
         self.converge_hold_sec = float(
             self.get_parameter('converge_hold_sec').value)
         self.timeout_sec = float(self.get_parameter('timeout_sec').value)
-        self.stop_nomotion_after_converge = bool(
-            self.get_parameter('stop_nomotion_after_converge').value)
-        self.nomotion_period_after_converge = max(
-            0.2, float(self.get_parameter(
-                'nomotion_update_period_after_converge_sec').value))
+        # 注：stop_nomotion_after_converge / nomotion_update_period_after_
+        # converge_sec 两个参数仅为向后兼容而保留声明（旧 launch 可能还在
+        # 传），实际行为已改由 good_enough_cov_xy/yaw 自适应控制。
         self.timeout_retries = int(
             self.get_parameter('timeout_retries').value)
         self.collapse_cov_xy = float(
@@ -515,9 +524,13 @@ class AutoLocalizer(Node):
             return
 
         # ---------- 阶段 3：已收敛，继续盯塔缩 ----------
-        # AMCL 只在处理激光时才重发 map→odom，所以收敛后依然要按需刷新
-        # （由 _maybe_request_nomotion 内部按 stop_nomotion_after_converge
-        #   与“够用即停”两者决策）。
+        # ★ P0（2026-10-31）：收敛**不等于**可以不再刷新 map→odom。
+        #   nav2 controller_server 每 100ms 查一次 TF，而 AMCL 只在处理
+        #   激光帧时才重发。雷达经 WiFi 传输、有效帧率 0.86Hz，停发就会
+        #   让 TF 间隔超过 1s，触发 extrapolation into the future，
+        #   实测导致 Controller patience exceeded / 跟出被打断。
+        #   现在由 _maybe_request_nomotion 内部的「σ 够用即停」自适应：
+        #   静止时 σ 自动降到够用线以下而停发，一动就恢复。
         if self.state == self.STATE_CONVERGED:
             self._maybe_request_nomotion(now)
             # ★ B：收敛不等于没事了。AMCL 仍在消费 /scan，一旦 odom 抖动
@@ -669,44 +682,54 @@ class AutoLocalizer(Node):
 
     def _maybe_request_nomotion(self, now) -> None:
         # ==========================================================
-        # 收敛后是否继续请求 nomotion 更新
+        # 什么时候需要请求 nomotion 更新
         # ----------------------------------------------------------
         # AMCL 只在**处理到激光帧时**才会重发 map→odom 这个 TF。
-        # 小车静止时因为没有运动，AMCL 默认不会更新粒子，也就不重发 TF。
+        # 小车静止时没有运动，AMCL 默认不更新粒子，也就不重发 TF；
+        # 而 nav2 的 controller_server / planner_server 每 100ms 就要查
+        # 一次 map→odom，查不到就报 extrapolation into the future。
         #
-        # 一旦停止请求 nomotion，map→odom 就冻结了。此时 odom→base_link
-        # 只要有一点点漂移，都会原封不动地出现在 map→base_link 上——
-        # 也就是在 RViz 里看到 base_link 相对 map 一直飘。
-        # 本项目实际踩过：收敛后停止请求，静止时定位看起来一直在飘。
-        #
-        # 所以默认改成「收敛后仍以更慢的频率继续请求」，让 AMCL 持续用
-        # 最新激光帧把 map→odom 拉回去。这样即使底层 odom 有小误差，
-        # 也会被周期性吸收掉，而不是持续累积到视觉可见。
         # ==========================================================
-        if self.state == self.STATE_CONVERGED:
-            if self.stop_nomotion_after_converge:
-                return
-            period = self.nomotion_period_after_converge
-        else:
-            # ★ 「够用即停」（A）：σ 已经小于一个栅格就不再刷新了。
-            # 详见参数 good_enough_cov_xy 处的注释：反复对同一帧激光
-            # 重采样只会把方差压到物理下限，进而触发 recovery 瞬移。
-            if self._cov_below_good_enough():
-                if not self._nomotion_suspended:
-                    self._nomotion_suspended = True
-                    self.get_logger().info(
-                        'σ 已小于“够用线”(%.3fm/%.3frad)，暂停请求 '
-                        'nomotion 更新，冻结粒子云以免反复重采样造成塔缩'
-                        % (self.good_enough_cov_xy,
-                           self.good_enough_cov_yaw))
-                return
-            if self._nomotion_suspended:
-                # σ 又变大了（车移动 / 局部重撒后），恢复请求
-                self._nomotion_suspended = False
-                self._last_nomotion_time = now
+        # 统一闸门：σ 够用就停，涨回来就恢复（2026-10-31 二次修订）
+        # ----------------------------------------------------------
+        # 原来这里分两种情况：
+        #   CONVERGED  → 若 stop_nomotion_after_converge 则完全不发
+        #   其它       → 按 good_enough_cov_xy 暂停
+        #
+        # 「收敛后完全停发」是个 bug 源头。本项目雷达经 WiFi 传输、
+        # 实测还有约每分钟一次丢帧，有效帧率仅 0.86Hz —— 一旦停发，
+        # TF 间隔必然超过 1 秒。
+        #
+        # 实测后果（2026-10-31 21:45 回起点过程）：
+        #   Exception in transformPose: Lookup would require extrapolation
+        #   into the future. Requested 1793454305.734 but latest data is
+        #   1793454304.859785            ← 滞后 0.87s
+        #   Unable to transform robot pose into global plan's frame
+        #   Controller patience exceeded → [follow_path] Aborting handle
+        # 共 5 次，其中一次直接把跟出一条控制周期打挂。
+        #
+        # 现在改成：**不看状态，只看 σ**。
+        #   σ < 够用线 → 暂停（粒子云冻结，避免反复重采样造成塔缩）
+        #   σ 涨回来   → 恢复低频刷新（实时补上 TF）
+        # 静止时 σ 自己会往下走、自动停；一动 σ 立刻涨起来、自动续上，
+        # 不需要人判断「收敛了没有」。
+        # ==========================================================
+        if self._cov_below_good_enough():
+            if not self._nomotion_suspended:
+                self._nomotion_suspended = True
                 self.get_logger().info(
-                    'σ 已超过“够用线”，恢复请求 nomotion 更新')
-            period = self.nomotion_period
+                    'σ 已小于“够用线”(%.3fm/%.3frad)，暂停请求 '
+                    'nomotion 更新，冻结粒子云以免反复重采样造成塔缩'
+                    % (self.good_enough_cov_xy,
+                       self.good_enough_cov_yaw))
+            return
+        if self._nomotion_suspended:
+            # σ 又变大了（车移动 / 局部重撒后），恢复请求
+            self._nomotion_suspended = False
+            self._last_nomotion_time = now
+            self.get_logger().info(
+                'σ 已超过“够用线”，恢复请求 nomotion 更新（维持 map→odom 新鲜）')
+        period = self.nomotion_period
 
         if self._latest_cov is None:
             # AMCL 还没输出位姿，此时请求无意义
@@ -945,20 +968,14 @@ class AutoLocalizer(Node):
         # （recovery_alpha_slow 当时是激进的 0.01）注入随机粒子，
         # 位姿静默瞬移 1.46m —— 而没有任何代码在看者。
         #
-        # 现在改成：保留定时器，继续以 tick_period 监控。不发 nomotion
-        # （stop_nomotion_after_converge 已处理），只做两件事：
-        #   1. 盯住塔缩，一出现就原位重撒（B）
-        #   2. 稳定足够久后重置恢复配额（C）
+        # 现在改成：保留定时器，继续以 tick_period 监控。同时不停止
+        # nomotion（否则 map→odom 会陈旧到让 controller 报 TF 外推失败），
+        # 改由「σ 够用即停」自适控制。
         # ==========================================================
-        if self.stop_nomotion_after_converge:
-            self.get_logger().info(
-                '已停止周期性 nomotion 更新（AMCL 将不再主动重发 map→odom）；'
-                '但保留塔缩监控：一旦 σ 被压到物理下限会原位重撒粒子')
-        else:
-            self.get_logger().info(
-                '继续以 %.1fs 周期请求 nomotion 更新，'
-                '保持 map→odom 随激光持续刷新（消耗很低）'
-                % self.nomotion_period_after_converge)
+        self.get_logger().info(
+            '收敛后继续监控：σ 涨过够用线(%.3fm)就恢复 nomotion 刷新 '
+            'map→odom，σ 降下去就自动暂停粒子云'
+            % self.good_enough_cov_xy)
 
     def _check_scan_health(self) -> None:
         """激光消失时立即告警一次 —— 没有激光，全局定位不可能收敛。

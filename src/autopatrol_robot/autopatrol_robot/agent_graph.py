@@ -264,23 +264,17 @@ SYSTEM_PROMPT = PERSONA_TEXT + """
 - get_battery_status: 查询电量
 - list_predefined_points: 列出预定义航点坐标
 
-【看护模式/跟随模式】
-- start_patrol_mode: 开启看护模式（当用户说"开启看护模式"、"启动跟随"时）
-- stop_patrol_mode: 关闭看护模式（当用户说"关闭看护模式"、"停止跟随"时）
-- get_patrol_mode_status: 查询看护模式运行状态
-
 【雷达跟随】
 - start_lidar_follow: 开启雷达跟随，小车跟着前方 40cm 内出现的障碍物走，
   保持约 50cm（超过65cm前进、小于50cm后退）
 - stop_lidar_follow: 停止雷达跟随
 - get_lidar_follow_status: 查询雷达跟随状态
 
-※ 两种跟随的区别（选错会让人很困惑，务必分清）：
-  * 用户说"雷达跟随""用雷达跟着我"→ start_lidar_follow
-  * 用户说"看护模式""摄像头跟着我"→ start_patrol_mode
-  * 用户只笼统说"跟着我"→ 优先用 start_lidar_follow
-    （它不依赖摄像头和检测工作空间，成功率更高）
-  * 两者互斥，开启一个会自动停掉另一个
+※ 关于跟随（当前只支持雷达跟随）：
+  * 用户说"雷达跟随""用雷达跟着我""跟着我""跟上我" → start_lidar_follow
+  * 用户说"看护模式""摄像头跟着我" → 告诉用户视觉跟随暂时不可用，
+    建议改用雷达跟随；**不要**编造工具调用
+  * 雷达跟随会控制底盘，与导航互斥，开启时会自动停掉导航
 
 【管家角色表现】—— 纯视觉效果，不控制任何硬件
 - set_butler_mood: 设置页面上管家机器人的动作，可选在头顶气泡里显示一句短话
@@ -301,8 +295,8 @@ SYSTEM_PROMPT = PERSONA_TEXT + """
 4. 当用户说"去XXX"时，先调用 navigate_to_saved_location（它会自动回退到预定义地点）
 5. 当用户说"先去A再去B"、"依次去A和B"等连续多个地点时，调用 navigate_sequence
 6. 当用户问"有哪些地点"时，调用 list_locations
-7. 当用户说"开启看护模式"时，调用 start_patrol_mode
-8. 当用户说"关闭看护模式"时，调用 stop_patrol_mode
+7. 当用户说"跟着我"、"雷达跟随"时，调用 start_lidar_follow
+8. 当用户说"停止跟随"时，调用 stop_lidar_follow
 9. 当用户问"到了吗"、"导航状态"时，调用 get_navigation_status
 10. 回复要简洁友好
 11. 回复的同时顺手调一次 set_butler_mood，让管家做出符合语气的表情；
@@ -349,10 +343,8 @@ SYSTEM_PROMPT_COMPACT = PERSONA_TEXT + """
 - 电量 → get_battery_status
 - 天气 → get_weather
 - 今天几号/几点 → get_current_datetime
-- 开始/停止巡检 → start_patrol_mode / stop_patrol_mode
-- 巡检开着吗/巡检状态 → get_patrol_mode_status
 - 雷达跟随/跟着我走 → start_lidar_follow
-- 停止跟随 → stop_lidar_follow / stop_patrol_mode
+- 停止跟随 → stop_lidar_follow
 - 说句话吧/让管家说 → butler_say（不是 set_butler_mood）
 - 取消 → cancel_navigation
 
@@ -634,9 +626,9 @@ if __name__ == "__main__":
     print("输入指令，输入 'quit' 退出")
     print("=" * 50)
     print("\n可用命令示例：")
-    print("  • 开启看护模式")
-    print("  • 关闭看护模式")
-    print("  • 看护模式开了吗")
+    print("  • 跟着我")
+    print("  • 停止跟随")
+    print("  • 雷达跟随开着吗")
     print("  • 去厨房")
     print("  • 这里是厕所")
     print("  • 去厕所")
