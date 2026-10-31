@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import (
+    QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy)
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import PoseWithCovarianceStamped
@@ -389,6 +391,34 @@ class MapManager:
         self.current_map_path = ''
         # 取消 /map 轮询线程（load_timer 现在是 Thread，没有 cancel()）
         self._load_cancel = threading.Event()
+
+        # ------------------------------------------------------------
+        # /map 就绪信号 —— 由 CarController.map_callback 回填
+        # ------------------------------------------------------------
+        # 为什么不用 `ros2 topic echo` 子进程判活（旧实现）：
+        #   1) 输出是 "126\n---"，末尾带消息分隔符 `---`，
+        #      旧代码 out.isdigit() 恒为 False → 永远报超时，
+        #      哪怕地图早就加载好了（2026-10-31 实机抳到）。
+        #   2) /map 是 TRANSIENT_LOCAL（latched），
+        #      子进程默认 QoS 若落成 VOLATILE 就会永久挂起。
+        # 节点自己就订阅了 /map，直接在回调里置标志最可靠。
+        self._map_ready = threading.Event()
+        self._map_frames = 0
+        self.ros_node = None      # 创建节点后由 bind_ros_node 回填
+
+    def bind_ros_node(self, node):
+        """绑定 ROS 节点（仅用于日志/诊断，不影响就绪判定）。"""
+        self.ros_node = node
+
+    def mark_map_ready(self):
+        """收到一帧 /map。由 CarController.map_callback 调用。"""
+        self._map_frames += 1
+        self._map_ready.set()
+
+    def reset_map_ready(self):
+        """开始新一轮加载前清空就绪信号，避免被上一张图的残留命中。"""
+        self._map_ready.clear()
+        self._map_frames = 0
         
     def load_map(self, status_callback=None, map_name: str = DEFAULT_MAP_NAME):
         """载入地图。
@@ -464,8 +494,11 @@ class MapManager:
             # 校验地图是否真的加载成功。
             # 原实现是「5 秒后无条件当作成功」，于是 map_server 加载失败、
             # 甚至进程已经死了，前端依旧显示「已加载」，极具误导性。
-            # 现在改为：起一个后台线程轮询 /map，拿到真实结果再定状态。
+            # 现在改为：起一个后台线程等 /map 真到货，拿到真实结果再定状态。
             self._load_cancel.clear()
+            # ★ 先清就绪标志，再起导航。顺序反了就会把上一张图的残留
+            #   当成新地图已加载。
+            self.reset_map_ready()
             self.load_timer = threading.Thread(
                 target=self._wait_map_ready, daemon=True,
                 args=(status_callback,))
@@ -498,17 +531,28 @@ class MapManager:
             return False, f"启动失败: {str(e)}"
 
     def _wait_map_ready(self, status_callback=None, timeout: float = 60.0):
-        """轮询 /map 话题，确认真拿到地图后把状态置为 LOADED。
+        """等 /map 真的到货后把状态置为 LOADED。
 
-        用 `ros2 topic echo /map --once` 子进程判活：只读，不发任何指令。
+        ★ 2026-10-31 重写。旧实现用子进程
+          `ros2 topic echo /map --once --field info.width` 判活，
+          有两个致命问题（实机日志实锤）：
+
+          问题 1：判定条件永远是 False
+            ros2 topic echo 的输出是 "126\\n---"，
+            末尾带着消息分隔符 `---`。
+            旧代码 out.strip().isdigit() → False，
+            **不管地图加载得多好，60 秒后必定报超时**。
+            前端因此永远显示「加载失败」，但 rviz 里地图好好的。
+
+          问题 2：QoS 可能落成 VOLATILE
+            /map 的发布者是 TRANSIENT_LOCAL（latched），
+            只发一次。VOLATILE 订阅能连上但收不到历史消息，
+            于是 `ros2 topic echo` 永久挂起、白等到超时。
+
+        现在直接用节点自己的 /map 订阅（QoS 已修为 TRANSIENT_LOCAL），
+        回调里置 Event，这里等 Event。不 spawn 任何子进程 ——
+        既快又准，也不用依赖 ros2 daemon 的发现缓存。
         """
-        check_cmd = (
-            'export ROS_DOMAIN_ID=0 && '
-            'source /opt/ros/humble/setup.bash && '
-            'source %s/install/setup.bash && '
-            'timeout 47 ros2 topic echo /map --once --field info.width'
-            % self.workspace_dir
-        )
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self._load_cancel.is_set():
@@ -516,22 +560,31 @@ class MapManager:
                 return
             if self.current_state != MapState.LOADING:
                 return          # 进程已退出，交给 monitor_process 报错
-            try:
-                proc = subprocess.run(
-                    ['bash', '-c', check_cmd], capture_output=True,
-                    text=True, timeout=timeout)
-                out = (proc.stdout or '').strip()
-                if out.isdigit() and int(out) > 0:
-                    self.current_state = MapState.LOADED
-                    if status_callback:
-                        status_callback(
-                            "loaded",
-                            "地图已加载（%dx? ）" % int(out))
-                    print('[Map] /map 就绪，地图加载成功')
-                    return
-            except Exception:  # noqa: BLE001
-                pass
-            time.sleep(1.0)
+
+            # 200ms 醒一次：既能快速响应取消，也不空转吃 CPU
+            if self._map_ready.wait(timeout=0.2):
+                self.current_state = MapState.LOADED
+                if status_callback:
+                    status_callback(
+                        "loaded",
+                        "地图已加载（收到 %d 帧 /map）" % self._map_frames)
+                print('[Map] /map 就绪，地图加载成功（共 %d 帧）'
+                      % self._map_frames)
+                return
+
+            # 等不到地图时给一次有用的诊断：是没人发，还是 QoS 不匹配？
+            # 每 10 秒提示一次，避免刷屏。
+            elapsed = timeout - (deadline - time.time())
+            if elapsed >= 10.0 and int(elapsed) % 10 < 1:
+                node = self.ros_node
+                if node is not None:
+                    try:
+                        pubs = node.count_publishers('/map')
+                    except Exception:              # noqa: BLE001
+                        pubs = -1
+                    print('[Map] 已等 %.0fs，当前 /map 发布者 %d 个'
+                          '（0 个说明 map_server 未激活）'
+                          % (elapsed, pubs))
 
         if self.current_state == MapState.LOADING:
             self.current_state = MapState.ERROR
@@ -539,7 +592,7 @@ class MapManager:
                 status_callback(
                     "error",
                     "%.0f 秒内未收到 /map，地图加载失败（检查地图文件、"
-                    "AMCL 日志与 TF）" % timeout)
+                    "map_server 是否 ACTIVE、TF 是否连通）" % timeout)
             print('[Map] /map 超时，判定加载失败')
     
     def close_map(self, status_callback=None):
@@ -1513,11 +1566,32 @@ class CarController(Node):
         self.socketio = socketio
         
         # 订阅地图
+        #
+        # ★ QoS 必须是 TRANSIENT_LOCAL。
+        #   /map 的发布者 map_server 用 TRANSIENT_LOCAL（latched），
+        #   而且**只在激活时发一次**。
+        #
+        #   用默认 QoS（RELIABLE + VOLATILE）会怎样：
+        #     DDS 层面能连上（publisher 的 durability 比 subscriber 强，
+        #     算兼容），但 VOLATILE 订阅者**收不到历史消息**。
+        #     而 map_server 之后再也不发 → map_callback 永不触发
+        #     → 网页永远拿不到地图图片，且不报任何错。
+        #
+        #   实测对比（ros2 topic info /map --verbose）：
+        #     amcl / global_costmap / auto_localizer / rviz2 全是
+        #     TRANSIENT_LOCAL，只有 web_car_controller 是 VOLATILE
+        #     —— 所以 rviz 有图、网页没图。
+        map_qos = QoSProfile(
+            depth=1,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
         self.map_subscription = self.create_subscription(
             OccupancyGrid,
             '/map',
             self.map_callback,
-            10
+            map_qos
         )
         self.battery_subscription = self.create_subscription(
             Float32,
@@ -1542,6 +1616,13 @@ class CarController(Node):
         self.get_logger().debug(f'电池电量: {self.current_battery}%')
     def map_callback(self, msg):
         """地图回调函数 - 保持原始分辨率"""
+        # ★ 先置就绪信号：_wait_map_ready 在等它。
+        #   放在 try 外面，即使后面的图像转换炸了，
+        #   也不能把「地图确实到达」这个事实丢掉。
+        try:
+            self.map_manager.mark_map_ready()
+        except Exception:  # noqa: BLE001
+            pass
         try:
             width = msg.info.width
             height = msg.info.height
@@ -2217,6 +2298,8 @@ def main():
     _setup_nav_callbacks()
 
     car_controller = CarController(map_manager, socketio)
+    # 把节点交给 MapManager，用于 /map 就绪判定和诊断日志
+    map_manager.bind_ros_node(car_controller)
 
     # 启动 Flask 线程
     flask_thread = threading.Thread(target=run_flask)
@@ -2244,6 +2327,7 @@ def main():
                 except:
                     pass
                 car_controller = CarController(map_manager, socketio)
+                map_manager.bind_ros_node(car_controller)
                 print("[ROS2] 节点已重建")
             except Exception as e:
                 print(f"[ROS2] 其他错误: {e}")
