@@ -28,11 +28,23 @@ def generate_launch_description():
     # 避免与 bringup 重复启动辅助节点
     # ----------------------------------------------------------
     # 实际用法是「先 bringup 再 navigation」，而 bringup 已经启动了
-    # urdf2tf / odom2tf / odom_covariance_injector。
+    # urdf2tf / odom2tf / odom_covariance_injector /
+    # imu_bias_remover / ekf_node / imu_link 静态 TF。
     # 两个 launch 都起就会变成两份进程：
     #   - 静态 TF 被两个进程重复发布 → TF_REPEATED_DATA 刷屏
     #   - /odom_ekf 被两个注入节点重复发布 → EKF 吃到重复输入
+    #   - 两个同名 ekf_filter_node → 节点名冲突，或两个滤波器
+    #     交错往 /odometry/filtered 写 → odom→base_link 反复跳变
     # 所以默认 false，认为 bringup 已提供；单独跑导航调试时再置 true。
+    #
+    # ★ 历史坑（2026-10-31）：上面的理由曾经**不成立** ——
+    #   本文件默认 false，而当时的 bringup 里根本没有 ekf_node，
+    #   两边都以为对方起了 EKF，结果谁都没起：
+    #   /odometry/filtered 发布者 0 个 → odom→base_footprint TF 缺失
+    #   → AMCL 生命周期 active 却完全不工作（不发 /amcl_pose、不发
+    #   map→odom），问题极难定位，因为它不报任何错。
+    #   已在 bringup.launch.py 里补齐 IMU 偏置 + EKF + imu_link TF，
+    #   「bringup 已提供」这句话现在才真正成立。
     # ==========================================================
     start_odom_helpers = launch.substitutions.LaunchConfiguration(
         'start_odom_helpers', default='false')
@@ -64,6 +76,10 @@ def generate_launch_description():
     # 写数据。odom2tf 收到的是两个滤波器交错的结果 → odom→base_link
     # 在两者估计之间反复跳变 → AMCL 观测模型被污染，收敛极慢甚至发散。
     # 实测：重复启动时 /odometry/filtered 有 2 个 Publisher。
+    #
+    # 注意 IMU 静态 TF：bringup 里有独立的 publish_imu_tf 开关，
+    # 这里不重复发布。若用 start_odom_helpers:=true 单独调试导航，
+    # 需要自己确保 base_link→imu_link 存在，否则 EKF 会静默丢弃 IMU。
     ekf_node = Node(
         package='robot_localization',
         executable='ekf_node',
