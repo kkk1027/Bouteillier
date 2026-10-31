@@ -29,6 +29,7 @@ ament_python_install_package(${PROJECT_NAME})
 
 install(PROGRAMS
   fishbot_navigation2/auto_localizer.py
+  fishbot_navigation2/amcl_tracer.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

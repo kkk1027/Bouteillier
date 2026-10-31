@@ -152,7 +152,45 @@ def generate_launch_description():
         }],
     )
 
+    # ==========================================================
+    # AMCL 重定位记录器（随导航栈自动拉起）
+    # ----------------------------------------------------------
+    # 实车出现过「位姿突然大幅跳变」的偶发问题，事后无从回溯。
+    # 本节点全程把 AMCL 状态流写盘，出问题直接看文件：
+    #   * AMCL 位姿 / 协方差
+    #   * map→odom（纯 AMCL 修正）与 odom→base（纯 EKF）
+    #     → 用于判定跳变来自 AMCL 还是 EKF
+    #   * /initialpose 条数 = 重定位次数（auto_localizer 撒粒子时会发）
+    #   * 状态判定 COLLAPSE / CONVERGE / DIVERGE
+    #
+    # 完全只读，不发布任何指令。
+    # 输出固定单文件，每次运行覆盖，不占空间。
+    # 默认开；不想要就 trace_amcl:=false。
+    trace_amcl = launch.substitutions.LaunchConfiguration(
+        'trace_amcl', default='true')
+    trace_path = launch.substitutions.LaunchConfiguration(
+        'trace_path', default='/tmp/fishbot_amcl_trace.csv')
+
+    amcl_tracer = Node(
+        package='fishbot_navigation2',
+        executable='amcl_tracer.py',
+        name='amcl_tracer',
+        output='screen',
+        parameters=[{
+            'output_path': trace_path,
+            'use_sim_time': launch_ros.parameter_descriptions
+            .ParameterValue(use_sim_time, value_type=bool),
+        }],
+        condition=launch.conditions.IfCondition(trace_amcl),
+    )
+
     return launch.LaunchDescription([
+        launch.actions.DeclareLaunchArgument(
+            'trace_amcl', default_value='true',
+            description='是否随导航栈启动 AMCL 重定位记录器（只读）'),
+        launch.actions.DeclareLaunchArgument(
+            'trace_path', default_value='/tmp/fishbot_amcl_trace.csv',
+            description='AMCL 记录文件路径（每次运行覆盖）'),
         # 启动横幅：让日志里一眼能确认「这是带自动全局定位的版本」，
         # 而不是靠猜。本项目曾因看不出导航栈版本而白查很久。
         launch.actions.LogInfo(msg=(
@@ -217,6 +255,9 @@ def generate_launch_description():
 
         # AMCL 自动全局定位（全局散布 → 静止周期更新 → 收敛告警）
         auto_localizer,
+
+        # AMCL 重定位记录器（只读，随栈启停，每次运行覆盖上一次）
+        amcl_tracer,
 
         launch_ros.actions.Node(
             package='rviz2',
