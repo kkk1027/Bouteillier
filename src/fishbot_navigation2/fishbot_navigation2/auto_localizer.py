@@ -121,6 +121,46 @@ class AutoLocalizer(Node):
         self.declare_parameter('collapse_cov_xy', 0.005)
         self.declare_parameter('collapse_cov_yaw', 0.01)
         self.declare_parameter('max_collapse_recoveries', 3)
+        # ==========================================================
+        # ★ “够用即停”阈值（2026-10-31 静止塔缩复盘）
+        # ----------------------------------------------------------
+        # 原来的逻辑是“只要没进 CONVERGED 状态就一直发 nomotion”，
+        # 而 CONVERGED 要求 σ_xy ≤ 0.08 且**持续** 3s。实测 σ 会卡在
+        # 0.0446 上下抖动（CONVERGE↔DIVERGE 反复跳，hold 永远凑不满），
+        # 于是 nomotion 一直发下去，对同一帧激光反复重采样，
+        # σ 被单调压到 0.0010m —— 而 0.0446m 早就远优于导航需求了。
+        #
+        # 这里加一个“够用线”：σ 到 3.5cm（< 1 个栅格）后就不再请求
+        # nomotion，让粒子云自然冻结。宁可不更新，也不能反复重采样。
+        # ==========================================================
+        self.declare_parameter('good_enough_cov_xy', 0.035)
+        self.declare_parameter('good_enough_cov_yaw', 0.03)
+        # ==========================================================
+        # ★ 塔缩恢复方式（2026-10-31）
+        # ----------------------------------------------------------
+        # local  ：在当前位姿原位加劫动重撒 —— 恢复粒子多样性但**不瞬移**
+        # global ：调 /reinitialize_global_localization 撒满全图 —— 必然瞬移
+        #
+        # 为什么默认改 local：
+        #   塔缩时当前位姿其实**是对的**（实测车静止 60s 一直钉在
+        #   (0.340,-0.120)，σ 才被压到 0.001）。错的只是“粒子云退化
+        #   成单一副本、失去备选假设”。用全局重撒去救，等于把正确
+        #   答案撕掉重猜 —— 实测直接跳了 1.66m。
+        # 什么时候才用 global：
+        #   真的被绑架（被人抱起换位置）/ 开局收敛阶段。
+        # ==========================================================
+        self.declare_parameter('collapse_recovery_mode', 'local')
+        self.declare_parameter('local_reseed_cov_xy', 0.05)
+        self.declare_parameter('local_reseed_cov_yaw', 0.03)
+        # 稳定收敛多久后重置恢复配额（C）。
+        # 原来 _collapse_recoveries 只增不减，3 次后永久放弃恢复。
+        self.declare_parameter('collapse_rearm_sec', 15.0)
+        # 塔缩恢复冷却期。
+        # ★ 必需：重撒后要等 AMCL 回一帧新 /amcl_pose，_latest_cov 才会
+        #   更新。tick_period 是 0.5s，而 AMCL 响应通常要 1~2s，这期间
+        #   _latest_cov 还是旧的塌缩值，不加冷却就会每 0.5s 重撒一次、
+        #   几秒内把 3 次配额全部烧光。
+        self.declare_parameter('collapse_cooldown_sec', 4.0)
         self.declare_parameter('defer_on_external_initial_pose', True)
         self.declare_parameter('log_period_sec', 10.0)
 
@@ -162,6 +202,20 @@ class AutoLocalizer(Node):
             self.get_parameter('collapse_cov_yaw').value)
         self.max_collapse_recoveries = int(
             self.get_parameter('max_collapse_recoveries').value)
+        self.good_enough_cov_xy = float(
+            self.get_parameter('good_enough_cov_xy').value)
+        self.good_enough_cov_yaw = float(
+            self.get_parameter('good_enough_cov_yaw').value)
+        self.collapse_recovery_mode = str(
+            self.get_parameter('collapse_recovery_mode').value).strip().lower()
+        self.local_reseed_cov_xy = float(
+            self.get_parameter('local_reseed_cov_xy').value)
+        self.local_reseed_cov_yaw = float(
+            self.get_parameter('local_reseed_cov_yaw').value)
+        self.collapse_rearm_sec = float(
+            self.get_parameter('collapse_rearm_sec').value)
+        self.collapse_cooldown_sec = float(
+            self.get_parameter('collapse_cooldown_sec').value)
         self.defer_on_external = bool(
             self.get_parameter('defer_on_external_initial_pose').value)
         self.log_period = float(self.get_parameter('log_period_sec').value)
@@ -195,6 +249,12 @@ class AutoLocalizer(Node):
         self._timeout_retries_used = 0
         self._nomotion_failures = 0
         self._finished = False
+        # 首次进入 CONVERGED 的时刻，用于「稳定多久后重置恢复配额」（C）
+        self._converged_at = None
+        # 是否已进入「够用即停」：σ 足够小后不再发 nomotion（A）
+        self._nomotion_suspended = False
+        # 上次塔缩恢复的时刻（冷却期用，见 collapse_cooldown_sec）
+        self._last_collapse_time = None
         # 激光健康度：用于区分「车没动」与「根本没激光」
         self._scan_count = 0
         self._last_scan_time = None
@@ -452,12 +512,19 @@ class AutoLocalizer(Node):
                    self._fmt_pose(), self._fmt_cov()))
             return
 
-        # ---------- 阶段 3：已收敛，但仍周期性刷新 map→odom ----------
-        # AMCL 只处理激光时才重发 map→odom。完全停掉请求的话，静止时
-        # map→odom 会冻结，odom→base_link 的任何漂移都会直接显示成
-        # 「定位在飘」。这里保持低频请求，把底层误差周期性吸收掉。
+        # ---------- 阶段 3：已收敛，继续盯塔缩 ----------
+        # AMCL 只在处理激光时才重发 map→odom，所以收敛后依然要按需刷新
+        # （由 _maybe_request_nomotion 内部按 stop_nomotion_after_converge
+        #   与“够用即停”两者决策）。
         if self.state == self.STATE_CONVERGED:
             self._maybe_request_nomotion(now)
+            # ★ B：收敛不等于没事了。AMCL 仍在消费 /scan，一旦 odom 抖动
+            #   超标就会更新→重采样→方差塔缩→内置 recovery 注入随机粒子
+            #   →位姿瞬移。必须全程盯住，不能收敛就撒手。
+            if self._check_collapse(now):
+                return
+            # ★ C：稳定足够久就把恢复配额用回来，避免“3 次后永久放弃”
+            self._maybe_rearm_collapse_recoveries(now)
 
     # ============================================================
     # 动作
@@ -523,6 +590,69 @@ class AutoLocalizer(Node):
             % (self.initial_x, self.initial_y, self.initial_yaw,
                self.initial_cov_xy, self.initial_cov_yaw))
 
+    def _publish_local_reseed(self) -> bool:
+        """在**当前位姿附近**局部重撒粒子 —— 恢复多样性但不瞬移。
+
+        ★ 为什么不能用全局重撒：
+          `/reinitialize_global_localization` 会把粒子云均匀撒满整张
+          地图，原来已经收敛好的位姿彻底丢失，必须重新收敛。实测
+          一次重撒就让位姿瞬移 1.66m，而那一刻车根本没动。
+
+        ★ 塔缩时位姿为什么是对的：
+          塌缩的成因是「静止时反复对同一帧激光重采样，副本彼此重合，
+          方差单调压到 0」—— 被压掉的是**不确定性**，不是**估计值**。
+          实测车静止 60s，位姿一直钉在 (0.340, -0.120)，σ 才被压到
+          0.0010m。所以位姿可信，只是滤波器失去了全部备选假设。
+
+        ★ 做法：
+          以当前位姿为中心发一帧 `/initialpose`，协方差给到
+          local_reseed_cov_xy（默认 0.05m，≈1 个栅格）。AMCL 会就地
+          重新散布粒子，既恢复了多样性，又不会跳到别处。
+
+        Returns:
+            True 表示重撒成功，False 表示没有可用位姿。
+        """
+        if self._latest_pose is None:
+            self.get_logger().warn(
+                '未收到过 /amcl_pose，无法原位重撒；降级为全局重撒')
+            return False
+        x, y, yaw = self._latest_pose
+        msg = PoseWithCovarianceStamped()
+        msg.header.frame_id = 'map'
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.pose.pose.position.x = x
+        msg.pose.pose.position.y = y
+        msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
+        cov = [0.0] * 36
+        cov[COV_X] = self.local_reseed_cov_xy
+        cov[COV_Y] = self.local_reseed_cov_xy
+        cov[COV_YAW] = self.local_reseed_cov_yaw
+        msg.pose.covariance = cov
+        # 发两帧，避免 AMCL 刚好在处理激光而丢掉
+        for _ in range(2):
+            self._initial_pose_pub.publish(msg)
+        # 自环过滤：这两帧会被自己的订阅收回去，必须认领
+        self._self_prior_stamp = self.get_clock().now()
+        self._self_prior_xy = (x, y)
+        self.get_logger().warn(
+            '已在**原位**重撒粒子：x=%.2f y=%.2f yaw=%.0f°，'
+            'σ_xy=%.2fm σ_yaw=%.3frad'
+            '（不改变当前位姿估计，仅恢复粒子多样性）'
+            % (x, y, math.degrees(yaw),
+               self.local_reseed_cov_xy, self.local_reseed_cov_yaw))
+        return True
+
+    def _cov_below_good_enough(self) -> bool:
+        """协方差是否已小到「够用」，不必再请求 nomotion 刷新。"""
+        if self._latest_cov is None:
+            return False
+        var_x, var_y, var_yaw = self._latest_cov
+        std_xy = math.sqrt(max(0.0, max(var_x, var_y)))
+        std_yaw = math.sqrt(max(0.0, var_yaw))
+        return (std_xy <= self.good_enough_cov_xy
+                and std_yaw <= self.good_enough_cov_yaw)
+
     def _maybe_request_nomotion(self, now) -> None:
         # ==========================================================
         # 收敛后是否继续请求 nomotion 更新
@@ -544,6 +674,24 @@ class AutoLocalizer(Node):
                 return
             period = self.nomotion_period_after_converge
         else:
+            # ★ 「够用即停」（A）：σ 已经小于一个栅格就不再刷新了。
+            # 详见参数 good_enough_cov_xy 处的注释：反复对同一帧激光
+            # 重采样只会把方差压到物理下限，进而触发 recovery 瞬移。
+            if self._cov_below_good_enough():
+                if not self._nomotion_suspended:
+                    self._nomotion_suspended = True
+                    self.get_logger().info(
+                        'σ 已小于“够用线”(%.3fm/%.3frad)，暂停请求 '
+                        'nomotion 更新，冻结粒子云以免反复重采样造成塔缩'
+                        % (self.good_enough_cov_xy,
+                           self.good_enough_cov_yaw))
+                return
+            if self._nomotion_suspended:
+                # σ 又变大了（车移动 / 局部重撒后），恢复请求
+                self._nomotion_suspended = False
+                self._last_nomotion_time = now
+                self.get_logger().info(
+                    'σ 已超过“够用线”，恢复请求 nomotion 更新')
             period = self.nomotion_period
 
         if self._latest_cov is None:
@@ -609,9 +757,17 @@ class AutoLocalizer(Node):
             return False, '位姿落在障碍物上（物理上不可能）'
         return True, '位姿位于已知空闲区域（栅格值 %d）'
 
-    def _evaluate_convergence(self, now, elapsed: float) -> None:
+    def _check_collapse(self, now) -> bool:
+        """检测并处理粒子塔缩。返回 True 表示当前正处于塔缩状态。
+
+        抽成独立方法是 2026-10-31 的修订：原来它埋在
+        `_evaluate_convergence` 里，而那个函数**只在 CONVERGING 状态
+        被调用**。一旦收敛就会 cancel 定时器，节点彻底停眼 —— 之后
+        AMCL 再怎么塔缩、再怎么被 recovery 注入随机粒子都不再有人管，
+        实测两次 1.4m+ 的瞬移就这样静默发生了。
+        """
         if self._latest_cov is None:
-            return
+            return False
         var_x, var_y, var_yaw = self._latest_cov
         std_xy = math.sqrt(max(0.0, max(var_x, var_y)))
         std_yaw = math.sqrt(max(0.0, var_yaw))
@@ -623,38 +779,91 @@ class AutoLocalizer(Node):
         # 激光反复重采样。没有运动 → 运动模型不加噪声 → 重采样出的
         # 副本彼此完全重合 → 方差单调收缩到 0。
         #
-        # 实测证据：σ_xy 从 0.0156m 塔到 0.0001m（!），随后暴涨到
-        # 0.1428m，位姿瞬移 1.0m。因为塔缩后粒子云退化成单一副本，
-        # recovery_alpha_slow 注入的随机粒子一旦权重更高就会直接接管。
+        # 实测证据（2026-10-31 tracer 抓的 127s 轨迹）：
+        #   σ_xy 稳定在 0.0446m → 0.0234 → 0.0010 → 位姿跳 1.46m
+        # 两次完全一样的循环，周期 68s，可重复。
         #
         # 0.05m 栅格地图上 500~2000 个粒子不可能达到 5mm 精度，
         # 出现这种 σ 只能是塔缩，不是真的定位准。
         # ==========================================================
-        if std_xy < self.collapse_cov_xy and std_yaw < self.collapse_cov_yaw:
-            self._converged_since = None
-            if self._collapse_recoveries < self.max_collapse_recoveries:
-                self._collapse_recoveries += 1
-                self.get_logger().error(
-                    '⚠️ 检测到粒子塔缩：σ_xy=%.4fm σ_yaw=%.4f° 低于物理下限'
-                    '（%.2fm 栅格 + 最少 500 粒子不可能这么准）。\n'
-                    '   成因：静止时反复 nomotion 更新，对同一帧激光重复'
-                    '重采样，粒子副本完全重合、方差被压到 0。\n'
-                    '   后果：滤波器失去全部备选假设，随机恢复粒子一旦'
-                    '胜出，位姿会瞬间跳到几米外。\n'
-                    '   处理：重新撒粒子恢复多样性（第 %d/%d 次）。'
-                    % (std_xy, math.degrees(std_yaw),
-                       (self._map_dims[2] if self._map_dims else 0.05),
-                       self._collapse_recoveries,
-                       self.max_collapse_recoveries))
-                self._start_time = self.get_clock().now()
+        if not (std_xy < self.collapse_cov_xy
+                and std_yaw < self.collapse_cov_yaw):
+            return False
+
+        # ★ 冷却期：重撒后 _latest_cov 要等 AMCL 下一帧 /amcl_pose 才更新，
+        #   这期间它还是旧的塌缩值。不加冷却会每 tick 重撒一次。
+        if self._last_collapse_time is not None:
+            since = (now - self._last_collapse_time).nanoseconds / 1e9
+            if since < self.collapse_cooldown_sec:
+                return True
+
+        self._converged_since = None
+        self._converged_at = None
+        if self._collapse_recoveries < self.max_collapse_recoveries:
+            self._collapse_recoveries += 1
+            self._last_collapse_time = now
+            self.get_logger().error(
+                '⚠️ 检测到粒子塔缩：σ_xy=%.4fm σ_yaw=%.4f° 低于物理下限'
+                '（%.2fm 栅格 + 最少 500 粒子不可能这么准）。\n'
+                '   成因：静止时反复更新，对同一帧激光重复重采样，'
+                '粒子副本完全重合、方差被压到 0。\n'
+                '   后果：滤波器失去全部备选假设，随机恢复粒子一旦'
+                '胜出，位姿会瞬间跳到几米外。\n'
+                '   处理：%s（第 %d/%d 次）。'
+                % (std_xy, math.degrees(std_yaw),
+                   (self._map_dims[2] if self._map_dims else 0.05),
+                   ('原位局部重撒，保持当前位姿'
+                    if self.collapse_recovery_mode == 'local'
+                    else '全局重撒，粒子云撒满全图'),
+                   self._collapse_recoveries,
+                   self.max_collapse_recoveries))
+            self._start_time = self.get_clock().now()
+            self.state = self.STATE_CONVERGING
+            self._nomotion_suspended = False
+            # ★ B：优先原位重撒。塔缩时位姿是对的，只剩多样性丢了，
+            #   局部微扰就够；全局重撒会把正确位姿直接抹掉造成瞬移。
+            if self.collapse_recovery_mode == 'local':
+                if not self._publish_local_reseed():
+                    self._trigger_global_localization()
+            else:
                 self._trigger_global_localization()
-            elif not self._fake_converge_warned:
-                self._fake_converge_warned = True
-                self.get_logger().warn(
-                    '粒子塔缩已重试 %d 次仍复现，不再自动恢复。'
-                    '请检查地图质量或重启导航。'
-                    % self.max_collapse_recoveries)
+        elif not self._fake_converge_warned:
+            self._fake_converge_warned = True
+            self.get_logger().warn(
+                '粒子塔缩已重试 %d 次仍复现，不再自动恢复。'
+                '请检查地图质量或重启导航。'
+                % self.max_collapse_recoveries)
+        return True
+
+    def _maybe_rearm_collapse_recoveries(self, now) -> None:
+        """C：稳定收敛足够久后，把塔缩恢复配额用回来。
+
+        原来 `_collapse_recoveries` 只增不减，3 次之后永久放弃恢复
+        （只 warn 一次），第 4 次塔缩起就只能带着退化粒子云硬跑。
+        但一个正常的长时间导航任务里，小车走走停停，停在原地
+        十几秒就塔缩一次是很常见的，3 次配额根本不够用。
+        """
+        if self._collapse_recoveries <= 0 or self._converged_at is None:
             return
+        stable = (now - self._converged_at).nanoseconds / 1e9
+        if stable < self.collapse_rearm_sec:
+            return
+        self.get_logger().info(
+            '定位稳定 %.0fs 无塔缩，重置塔缩恢复配额（%d → 0）'
+            % (stable, self._collapse_recoveries))
+        self._collapse_recoveries = 0
+        self._fake_converge_warned = False
+
+    def _evaluate_convergence(self, now, elapsed: float) -> None:
+        if self._latest_cov is None:
+            return
+        # 塔缩优先处理：它会让 σ 假性变小，必须先排除再谈收敛
+        if self._check_collapse(now):
+            return
+
+        var_x, var_y, var_yaw = self._latest_cov
+        std_xy = math.sqrt(max(0.0, max(var_x, var_y)))
+        std_yaw = math.sqrt(max(0.0, var_yaw))
 
         if std_xy > self.converge_cov_xy or std_yaw > self.converge_cov_yaw:
             self._converged_since = None
@@ -686,25 +895,32 @@ class AutoLocalizer(Node):
             return
 
         self.state = self.STATE_CONVERGED
-        self._finished = True
+        self._converged_at = now
         self.get_logger().info(
             '✅ 定位已收敛（用时 %.1fs）：位姿=%s σ_xy=%.3fm σ_yaw=%.1f°, '
             'nomotion 请求 %d 次；%s'
             % (elapsed, self._fmt_pose(), std_xy,
                math.degrees(std_yaw), self._nomotion_requests, why))
 
+        # ==========================================================
+        # ★ 收敛后**不再终止节点**（2026-10-31 修订）
+        # ----------------------------------------------------------
+        # 原来这里设 _finished=True 并 _timer.cancel()，节点彻底停眼。
+        # 但 tracer 实测发现：收敛后 AMCL 依然会因 odom 微小抖动更新并
+        # 重采样，σ 被压到 0.0010m，随后 AMCL 内置 recovery
+        # （recovery_alpha_slow 当时是激进的 0.01）注入随机粒子，
+        # 位姿静默瞬移 1.46m —— 而没有任何代码在看者。
+        #
+        # 现在改成：保留定时器，继续以 tick_period 监控。不发 nomotion
+        # （stop_nomotion_after_converge 已处理），只做两件事：
+        #   1. 盯住塔缩，一出现就原位重撒（B）
+        #   2. 稳定足够久后重置恢复配额（C）
+        # ==========================================================
         if self.stop_nomotion_after_converge:
             self.get_logger().info(
-                '已停止周期性 nomotion 更新（注意：AMCL 将不再重发 '
-                'map→odom，静止时若 odom 有漂移会直接体现为定位飘）')
-            self._timer.cancel()
+                '已停止周期性 nomotion 更新（AMCL 将不再主动重发 map→odom）；'
+                '但保留塔缩监控：一旦 σ 被压到物理下限会原位重撒粒子')
         else:
-            # ★ 不能 cancel 定时器。收敛后还要继续按
-            #   nomotion_update_period_after_converge_sec 请求更新，
-            #   让 AMCL 持续用最新激光修正 map→odom。
-            #   _tick 里的 _finished 检查会提前返回，所以这里要把它复位，
-            #   否则 _tick 第一行就 return，请求永远不会发出去。
-            self._finished = False
             self.get_logger().info(
                 '继续以 %.1fs 周期请求 nomotion 更新，'
                 '保持 map→odom 随激光持续刷新（消耗很低）'
