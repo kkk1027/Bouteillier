@@ -1,0 +1,53 @@
+# ============================================================
+# fishbot_voice 参数配置
+#
+# 动作 = 速度 x 时长。0.2 m/s x 5 s = 1 米，室内请按实际场地调整。
+# 改完直接重启节点即可，无需重新编译固件。
+# ============================================================
+voice_control_node:
+  ros__parameters:
+    # ============================================================
+    # ★★★ 安全开关（总闸）★★★
+    # false（默认）= 干跑模式：语音指令正常解析、正常打日志、正常走状态机，
+    #               但绝不向 /cmd_vel 发布任何数据包，车一定不会动。
+    # true         = 实车模式：真正下发速度，语音一喊车就动。
+    #
+    # 为什么默认 false：只要本节点在跑，喊一句话车就会动。调试阶段
+    # 不应该有这种风险。先干跑确认词表、速度、时长都对，再打开。
+    #
+    # 临时打开（不改文件）：
+    #   ros2 launch fishbot_voice voice_control.launch.py enable_motion:=true
+    # ============================================================
+    enable_motion: false
+
+    # -------- 运动参数 --------
+    linear_speed: 0.2          # 直行线速度 (m/s)
+    # 原地转向角速度 (rad/s)。角度 = angular_speed x action_duration
+    #   0.6 rad/s x 5s = 3.0 rad = 172°（旧值，偏慢）
+    #   1.0 rad/s x 5s = 5.0 rad = 286°（当前值，转得利索但接近 3/4 圈）
+    # 觉得转过头了就缩短 action_duration，不要只降速度
+    angular_speed: 1.0
+    action_duration: 5.0       # 单个动作持续时间 (s)
+
+    # -------- 时序参数 --------
+    publish_rate: 20.0         # /cmd_vel 发布频率 (Hz)，必须 > 1/3Hz 否则 ESP32 会超时停车
+    pre_stop_duration: 0.2     # 方向切换前先停车多久 (s)，0 = 不插入过渡
+    stop_burst: 3              # 动作结束后补发几次零速度
+    min_repeat_interval: 0.4   # 同一命令最小重复间隔 (s)，STOP 不受限制
+
+    # -------- 冲突策略 --------
+    # false = 导航运行中忽略语音运动指令（推荐，避免和 Nav2 抢 /cmd_vel）
+    #         但 STOP 永远生效
+    allow_motion_during_nav: false
+
+    # -------- 命令词表 --------
+    # 格式 "ASR-01 输出文本:动作"
+    # 动作取值：NONE / FORWARD / BACKWARD / TURN_LEFT / TURN_RIGHT / STOP
+    # 模块端改词后只改这里，不用动代码，也不用烧录固件
+    command_map:
+      - "WAKE:NONE"              # 唤醒词，只记日志
+      - "MOVE_FWD:FORWARD"       # 前进
+      - "MOVE_BACK:BACKWARD"     # 后退
+      - "MOVE_LEFT:TURN_LEFT"    # 原地左转
+      - "MOVE_RIGHT:TURN_RIGHT"  # 原地右转
+      - "FOLLOW_OFF:STOP"        # 取消跟随 = 停止运动（最高优先级）

@@ -1,0 +1,15 @@
+# 手动建图存图请求
+# name:       地图名（不含扩展名）。空字符串时由节点生成 manual_<YYYYmmdd_HHMMSS>
+# directory:  保存目录。空字符串时使用工作空间 src/fishbot_navigation2/maps
+# overwrite:  同名 pgm/yaml/pbstream 是否允许覆盖
+# save_pbstream: 是否同时通过 Cartographer /write_state 保存 .pbstream
+string name
+string directory
+bool overwrite
+bool save_pbstream
+---
+bool success
+string message
+string map_yaml
+string map_pgm
+string pbstream

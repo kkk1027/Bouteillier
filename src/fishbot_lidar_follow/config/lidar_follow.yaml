@@ -1,0 +1,132 @@
+# ============================================================
+# 雷达跟随参数
+# ------------------------------------------------------------
+# 用法：
+#   ros2 launch autopatrol_robot lidar_follow.launch.py
+#   ros2 launch autopatrol_robot lidar_follow.launch.py \
+#       lidar_follow_params:=/path/to/your.yaml
+#
+# 所有距离单位均为米，速度单位 m/s、rad/s。
+# ============================================================
+lidar_follow_node:
+  ros__parameters:
+
+    # ---------- 输入 ----------
+    scan_topic: /scan
+    # 雷达安装高度很低（laser_link 在 base_link 上方 0.075m），
+    # 地面/地毯可能被扫到。低于这个高度的就算噪声也照样进数据，
+    # 所以这里只能靠距离和角度过滤，不能靠高度。
+    cmd_vel_topic: /cmd_vel
+    control_rate: 20.0          # 控制循环频率（Hz）。雷达只有 5Hz，
+                                # 但控制要跑得更勤，才能用卡尔曼预测补上延迟
+
+    # ---------- 目标识别 ----------
+    # 首次锁定的距离门槛。
+    # ★ 实机标定（2026-10-31）：雷达装在车体**正中心**，
+    #   用户量的"前方40cm"如果从车头算，雷达读数会多出车体半径。
+    #   实测物体在 0.44m 时点云 24~28 点、单簇、读数极稳，
+    #   但旧值 0.40 差 4cm 锁不上。
+    #   调到 0.50 后：覆盖 0.44m，且不超过 retreat_enter(0.50)，
+    #   锁定后不会立刻触发后退。
+    #   注意：再往上调就会和 retreat_enter 冲突（锁定即后退）。
+    lock_max_range: 0.50
+    # 锁定之后放宽的范围。目标往后退也能继续跟，否则没法"前进追赶"。
+    track_max_range: 1.20
+    # 雷达 range_min=0.30，所以实际下限是 0.30。
+    sector_half_angle_deg: 30.0
+
+    # 聚类：相邻点如果角度差和距离差都小于阈值，算同一个物体
+    cluster_angle_gap_deg: 2.5
+    cluster_range_gap: 0.15
+
+    # 点数少于这个值的簇直接忽略。
+    # ★ 实测必须开：真实雷达里 1~3 个点的簇几乎都是噪声
+    #   （柜子边缘、家具反光），但它们的距离可能只有 0.8m，
+    #   不滤掉就会被当成目标「追过去」。
+    min_cluster_points: 5
+
+    # 已锁定时，新目标距离与当前目标相差超过此值 → 判为换了物体，
+    # 当作本帧没有目标（交给丢帧逻辑），而不是立刻切过去。
+    # ★ 实测必须开：目标被推到 30cm 内（雷达 range_min 下限）时
+    #   近处点全部消失，剩下的远簇只差 0.54m，
+    #   不拦住就会切换目标并开始前进。
+    max_target_jump: 0.30
+
+    # ---------- 距离死区（三态滞回）----------
+    #        <0.50        0.55        0.65        >
+    #   RETREAT ─┤   HOLD   ├─ APPROACH
+    #            ↑          ↑
+    #      后退到这里停   前进到这里停
+    #
+    # 进入和退出用不同阈值，形成 10cm 滞回带，
+    # 避免目标在 50cm 附近微动时状态反复翻转。
+    approach_enter: 0.65        # d > 此值 → 开始前进
+    approach_exit: 0.55         # 前进到 d < 此值 → 停止前进（进入 HOLD）
+    retreat_enter: 0.50         # d < 此值 → 开始后退
+    retreat_exit: 0.55          # 后退到 d > 此值 → 停止后退（进入 HOLD）
+
+    # 距离误差死区：目标距离与期望距离之差小于此值就当 0
+    # 期望距离取 0.575（0.55 和 0.60 的中点），只在 APPROACH 内用于速度调节
+    desired_distance: 0.575
+    distance_deadband: 0.02
+
+    # ---------- 角度控制 ----------
+    angle_deadband_deg: 2.0     # 方位角误差 < 2° 视为对准，不转向
+    # 目标偏离超过这个角度时先原地转向、不前进
+    # （否则会一边前进一边大角度转弯，描出弧线冲过去）
+    align_before_move_deg: 15.0
+
+    # ---------- 速度 ----------
+    max_linear: 0.22            # 前进最大速度
+    max_reverse: 0.12           # 后退最大速度（比前进慢，安全）
+    max_angular: 0.80           # 最大角速度
+
+    # PD 增益。距离环和角度环分开。
+    kp_linear: 1.10             # 距离误差 → 线速度
+    kd_linear: 0.18             # 距离误差变化率 → 线速度
+    kp_angular: 1.60            # 角度误差 → 角速度
+    kd_angular: 0.12            # 角度误差变化率 → 角速度
+
+    # 输出死区：算出来的速度小于此值直接归零，避免电机嗡嗡响
+    cmd_linear_deadband: 0.015
+    cmd_angular_deadband: 0.020
+
+    # 速度变化限幅（m/s²、rad/s²），让动作平滑不抖动
+    linear_accel_limit: 0.80
+    angular_accel_limit: 2.50
+
+    # ---------- 卡尔曼滤波 ----------
+    # 对 (距离 d, 方位角 θ) 各用一个匀速模型卡尔曼。
+    # 状态 [位置, 速度]，测量只有位置。
+    # 雷达 5Hz 有 200ms 延迟，靠这里的速度估计做预测补偿。
+    kf_process_noise_pos: 0.0015
+    kf_process_noise_vel: 0.060
+    kf_measure_noise_dist: 0.010    # 测距噪声（m）
+    kf_measure_noise_angle: 0.012   # 测角噪声（rad）
+
+    # ---------- 安全 ----------
+    # 后退前检查后方，有障碍就不退（防止撞到从背后靠近的人或墙）
+    rear_check_range: 0.40
+    rear_sector_half_angle_deg: 40.0
+
+    # 前方防撞：正常前进时也看一眼，比目标更近的东西要刹车
+    front_guard_range: 0.32
+
+    # 超过这么久没收到有效 scan → 判定雷达故障，停车
+    scan_timeout: 0.60
+    # 丢失目标后立即停车（用户选定的策略）
+    # 但允许「短暂丢帧」——连续丢帧超过这个次数才真正判丢失，
+    # 因为单线雷达偶尔会漏一两个点
+    lost_frame_threshold: 3
+
+    # ---------- 与导航互斥 ----------
+    # 跟随运行时占一个锁文件，导航工具看到锁就拒绝执行
+    lock_file: /tmp/fishbot_lidar_follow.lock
+
+    # 启动时自动停掉正在运行的导航
+    stop_nav_on_start: true
+
+    # ---------- 调试 ----------
+    # true 时把目标点、聚类结果发到 ~/debug 话题，方便 rviz 看
+    publish_debug: true
+    debug_topic: /lidar_follow/debug

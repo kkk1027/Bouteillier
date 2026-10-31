@@ -1,0 +1,294 @@
+﻿/*
+ *  YDLIDAR SYSTEM
+ *  YDLIDAR ROS 2 Node
+ *
+ *  Copyright 2017 - 2020 EAI TEAM
+ *  http://www.eaibot.com
+ *
+ */
+
+#ifdef _MSC_VER
+#ifndef _USE_MATH_DEFINES
+#define _USE_MATH_DEFINES
+#endif
+#endif
+
+#include "src/CYdLidar.h"
+#include <math.h>
+#include <chrono>
+#include <iostream>
+#include <memory>
+#include "sensor_msgs/msg/point_cloud.hpp"
+#include "rclcpp/clock.hpp"
+#include "rclcpp/rclcpp.hpp"
+#include "rclcpp/time_source.hpp"
+#include "sensor_msgs/msg/laser_scan.hpp"
+#include "std_srvs/srv/empty.hpp"
+#include <vector>
+#include <iostream>
+#include <string>
+#include <signal.h>
+
+#define ROS2Verision "1.0.1"
+
+
+int main(int argc, char *argv[]) {
+  rclcpp::init(argc, argv);
+
+  auto node = rclcpp::Node::make_shared("ydlidar_ros2_driver_node");
+
+  RCLCPP_INFO(node->get_logger(), "[YDLIDAR INFO] Current ROS Driver Version: %s\n", ((std::string)ROS2Verision).c_str());
+
+  CYdLidar laser;
+  std::string str_optvalue = "/dev/ydlidar";
+  node->declare_parameter("port", str_optvalue);
+  node->get_parameter("port", str_optvalue);
+  ///lidar port
+  laser.setlidaropt(LidarPropSerialPort, str_optvalue.c_str(), str_optvalue.size());
+  ///ignore array
+  str_optvalue = "";
+  node->declare_parameter("ignore_array", str_optvalue);
+  node->get_parameter("ignore_array", str_optvalue);
+  laser.setlidaropt(LidarPropIgnoreArray, str_optvalue.c_str(), str_optvalue.size());
+
+  std::string frame_id = "laser_frame";
+  node->declare_parameter("frame_id", frame_id);
+  node->get_parameter("frame_id", frame_id);
+
+  //////////////////////int property/////////////////
+  /// lidar baudrate
+  int optval = 230400;
+  node->declare_parameter("baudrate", optval);
+  node->get_parameter("baudrate", optval);
+  laser.setlidaropt(LidarPropSerialBaudrate, &optval, sizeof(int));
+  /// tof lidar
+  optval = TYPE_TRIANGLE;
+  node->declare_parameter("lidar_type", optval);
+  node->get_parameter("lidar_type", optval);
+  laser.setlidaropt(LidarPropLidarType, &optval, sizeof(int));
+  /// device type
+  optval = YDLIDAR_TYPE_SERIAL;
+  node->declare_parameter("device_type", optval);
+  node->get_parameter("device_type", optval);
+  laser.setlidaropt(LidarPropDeviceType, &optval, sizeof(int));
+  /// sample rate
+  optval = 9;
+  node->declare_parameter("sample_rate", optval);
+  node->get_parameter("sample_rate", optval);
+  laser.setlidaropt(LidarPropSampleRate, &optval, sizeof(int));
+  /// abnormal count
+  optval = 4;
+  node->declare_parameter("abnormal_check_count", optval);
+  node->get_parameter("abnormal_check_count", optval);
+  laser.setlidaropt(LidarPropAbnormalCheckCount, &optval, sizeof(int));
+
+  /// Intenstiy bit count
+  optval = 8;
+  node->declare_parameter("intensity_bit", optval);
+  node->get_parameter("intensity_bit", optval);
+  laser.setlidaropt(LidarPropIntenstiyBit, &optval, sizeof(int));
+     
+  //////////////////////bool property/////////////////
+  /// fixed angle resolution
+  bool b_optvalue = false;
+  node->declare_parameter("fixed_resolution", b_optvalue);
+  node->get_parameter("fixed_resolution", b_optvalue);
+  laser.setlidaropt(LidarPropFixedResolution, &b_optvalue, sizeof(bool));
+  /// rotate 180
+  b_optvalue = true;
+  node->declare_parameter("reversion", b_optvalue);
+  node->get_parameter("reversion", b_optvalue);
+  laser.setlidaropt(LidarPropReversion, &b_optvalue, sizeof(bool));
+  /// Counterclockwise
+  b_optvalue = true;
+  node->declare_parameter("inverted", b_optvalue);
+  node->get_parameter("inverted", b_optvalue);
+  laser.setlidaropt(LidarPropInverted, &b_optvalue, sizeof(bool));
+  b_optvalue = true;
+  node->declare_parameter("auto_reconnect", b_optvalue);
+  node->get_parameter("auto_reconnect", b_optvalue);
+  laser.setlidaropt(LidarPropAutoReconnect, &b_optvalue, sizeof(bool));
+  /// one-way communication
+  b_optvalue = false;
+  node->declare_parameter("isSingleChannel", b_optvalue);
+  node->get_parameter("isSingleChannel", b_optvalue);
+  laser.setlidaropt(LidarPropSingleChannel, &b_optvalue, sizeof(bool));
+  /// intensity
+  // b_optvalue = false;
+  // node->declare_parameter("intensity", b_optvalue);
+  // node->get_parameter("intensity", b_optvalue);
+  // laser.setlidaropt(LidarPropIntenstiy, &b_optvalue, sizeof(bool));
+  laser.setAutoIntensity(true);
+  /// Motor DTR
+  b_optvalue = false;
+  node->declare_parameter("support_motor_dtr", b_optvalue);
+  node->get_parameter("support_motor_dtr", b_optvalue);
+  laser.setlidaropt(LidarPropSupportMotorDtrCtrl, &b_optvalue, sizeof(bool));
+
+  //////////////////////float property/////////////////
+  /// unit: °
+  float f_optvalue = 180.0f;
+  node->declare_parameter("angle_max", f_optvalue);
+  node->get_parameter("angle_max", f_optvalue);
+  laser.setlidaropt(LidarPropMaxAngle, &f_optvalue, sizeof(float));
+  f_optvalue = -180.0f;
+  node->declare_parameter("angle_min", f_optvalue);
+  node->get_parameter("angle_min", f_optvalue);
+  laser.setlidaropt(LidarPropMinAngle, &f_optvalue, sizeof(float));
+  /// unit: m
+  f_optvalue = 64.f;
+  node->declare_parameter("range_max", f_optvalue);
+  node->get_parameter("range_max", f_optvalue);
+  laser.setlidaropt(LidarPropMaxRange, &f_optvalue, sizeof(float));
+  f_optvalue = 0.1f;
+  node->declare_parameter("range_min", f_optvalue);
+  node->get_parameter("range_min", f_optvalue);
+  laser.setlidaropt(LidarPropMinRange, &f_optvalue, sizeof(float));
+  /// unit: Hz
+  f_optvalue = 10.f;
+  node->declare_parameter("frequency", f_optvalue);
+  node->get_parameter("frequency", f_optvalue);
+  laser.setlidaropt(LidarPropScanFrequency, &f_optvalue, sizeof(float));
+
+  bool invalid_range_is_inf = false;
+  node->declare_parameter("invalid_range_is_inf", invalid_range_is_inf);
+  node->get_parameter("invalid_range_is_inf", invalid_range_is_inf);
+
+
+  bool ret = laser.initialize();
+  if (ret) {
+    ret = laser.turnOn();
+  } else {
+    RCLCPP_ERROR(node->get_logger(), "%s\n", laser.DescribeError());
+  }
+
+  // 初始化/启动失败必须以非零退出码结束。
+  // 2026-10-30 实测：原来失败后仍走到末尾 return 0，launch 只打印
+  // "process has finished cleanly"，既不报错也不会重启，表现为 /scan
+  // 静默消失、建图端只看到「地图不动」。改为 return 1 后，
+  // launch 会记录 "process has died [exit code 1]"，配合 respawn 可自愈。
+  if (!ret) {
+    RCLCPP_ERROR(
+      node->get_logger(),
+      "[YDLIDAR ERROR] 雷达初始化失败（串口桥接未就绪或无数据）。"
+      "进程以退出码 1 结束，交由 launch 重启。");
+    laser.disconnecting();
+    rclcpp::shutdown();
+    return 1;
+  }
+
+  // 使用 RELIABLE QoS 发布激光数据，确保 Cartographer / Nav2 能正常订阅
+  // （SensorDataQoS=BEST_EFFORT 与 Cartographer 的默认 RELIABLE 不兼容）
+  auto laser_pub = node->create_publisher<sensor_msgs::msg::LaserScan>("scan", rclcpp::QoS(rclcpp::KeepLast(5)).reliable());
+  auto pc_pub = node->create_publisher<sensor_msgs::msg::PointCloud>("point_cloud", rclcpp::QoS(rclcpp::KeepLast(5)).reliable());
+  
+  auto stop_scan_service =
+    [&laser](const std::shared_ptr<rmw_request_id_t> request_header,
+  const std::shared_ptr<std_srvs::srv::Empty::Request> req,
+  std::shared_ptr<std_srvs::srv::Empty::Response> response) -> bool
+  {
+    return laser.turnOff();
+  };
+
+  auto stop_service = node->create_service<std_srvs::srv::Empty>("stop_scan",stop_scan_service);
+
+  auto start_scan_service =
+    [&laser](const std::shared_ptr<rmw_request_id_t> request_header,
+  const std::shared_ptr<std_srvs::srv::Empty::Request> req,
+  std::shared_ptr<std_srvs::srv::Empty::Response> response) -> bool
+  {
+    return laser.turnOn();
+  };
+
+  auto start_service = node->create_service<std_srvs::srv::Empty>("start_scan",start_scan_service);
+
+  rclcpp::WallRate loop_rate(20);
+
+  while (ret && rclcpp::ok()) {
+
+    LaserScan scan;//
+
+    if (laser.doProcessSimple(scan)) {
+
+      auto scan_msg = std::make_shared<sensor_msgs::msg::LaserScan>();
+      auto pc_msg = std::make_shared<sensor_msgs::msg::PointCloud>();
+
+      // 使用ROS时钟时间替代YDLIDAR硬件时间戳。
+      // YDLIDAR SDK返回的硬件时间戳(scan.stamp)不是单调递增的，
+      // 跨帧会来回跳动，导致Cartographer的sensor_bridge.cpp忽略所有后续扫描。
+      // node->now()保证帧间时间戳严格单调递增。
+      // 额外保护：强制每个新时间戳 > 上一个，防止系统时钟回跳。
+      // 注意：必须使用 RCL_ROS_TIME 与 node->now() 的时钟类型匹配。
+      static bool first_scan = true;
+      static rclcpp::Time last_stamp(0, 0, RCL_ROS_TIME);
+      rclcpp::Time now_stamp = node->now();
+      if (!first_scan && now_stamp <= last_stamp) {
+        // 时钟回跳或暂停，递增一个纳秒以维持单调性
+        now_stamp = last_stamp + rclcpp::Duration::from_nanoseconds(1);
+      }
+      last_stamp = now_stamp;
+      first_scan = false;
+      scan_msg->header.stamp = now_stamp;
+      scan_msg->header.frame_id = frame_id;
+      pc_msg->header = scan_msg->header;
+      scan_msg->angle_min = scan.config.min_angle;
+      scan_msg->angle_max = scan.config.max_angle;
+      scan_msg->angle_increment = scan.config.angle_increment;
+      scan_msg->scan_time = scan.config.scan_time;
+      scan_msg->time_increment = 0.0;  // 设为0，避免Cartographer按递增时间戳细分时出现时间倒流警告
+      scan_msg->range_min = scan.config.min_range;
+      scan_msg->range_max = scan.config.max_range;
+      
+      int size = (scan.config.max_angle - scan.config.min_angle)/ scan.config.angle_increment + 1;
+      scan_msg->ranges.resize(size);
+      scan_msg->intensities.resize(size);
+
+      pc_msg->channels.resize(2);
+      int idx_intensity = 0;
+      pc_msg->channels[idx_intensity].name = "intensities";
+      int idx_timestamp = 1;
+      pc_msg->channels[idx_timestamp].name = "stamps";
+
+      for(size_t i=0; i < scan.points.size(); i++) {
+        int index = std::ceil((scan.points[i].angle - scan.config.min_angle)/scan.config.angle_increment);
+        if(index >=0 && index < size) {
+	  if (scan.points[i].range >= scan.config.min_range) {
+            scan_msg->ranges[index] = scan.points[i].range;
+            scan_msg->intensities[index] = scan.points[i].intensity;
+	  }
+        }
+
+	if (scan.points[i].range >= scan.config.min_range &&
+             scan.points[i].range <= scan.config.max_range) {
+          geometry_msgs::msg::Point32 point;
+          point.x = scan.points[i].range * cos(scan.points[i].angle);
+          point.y = scan.points[i].range * sin(scan.points[i].angle);
+          point.z = 0.0;
+          pc_msg->points.push_back(point);
+          pc_msg->channels[idx_intensity].values.push_back(scan.points[i].intensity);
+          pc_msg->channels[idx_timestamp].values.push_back(i * scan.config.time_increment);
+        }
+
+      }
+
+      laser_pub->publish(*scan_msg);
+      pc_pub->publish(*pc_msg);
+
+    } else {
+      RCLCPP_ERROR(node->get_logger(), "Failed to get scan");
+    }
+    if(!rclcpp::ok()) {
+      break;
+    }
+    rclcpp::spin_some(node);
+    loop_rate.sleep();
+  }
+
+
+  RCLCPP_INFO(node->get_logger(), "[YDLIDAR INFO] Now YDLIDAR is stopping .......");
+  laser.turnOff();
+  laser.disconnecting();
+  rclcpp::shutdown();
+
+  return 0;
+}

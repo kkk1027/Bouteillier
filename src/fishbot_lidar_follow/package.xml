@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>fishbot_lidar_follow</name>
+  <version>0.1.0</version>
+  <description>
+    基于单线激光雷达的目标跟随节点。让小车跟随前方最近的障碍物，
+    并保持约 50cm 距离。含三态滞回防抖、匀速模型卡尔曼预测、
+    前后方安全检查、与导航互斥。
+  </description>
+  <maintainer email="kbf@example.com">kbf</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_msgs</depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
