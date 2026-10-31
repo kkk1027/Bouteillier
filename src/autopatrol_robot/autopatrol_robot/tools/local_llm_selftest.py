@@ -24,6 +24,7 @@ try:
     from autopatrol_robot.agent_graph import (
         llm_with_tools, ACTIVE_SYSTEM_PROMPT, ACTIVE_TOOLS,
         LLM_MODEL, LOCAL_BASE_URL, _nonce_prompt,
+        _strip_past_tool_turns,
     )
     from langchain_core.messages import HumanMessage, SystemMessage
 except ImportError as e:
@@ -71,6 +72,73 @@ CASES = [
 ]
 
 
+def _multi_turn_cases():
+    """多轮对话回归用例 —— 专防「历史范例污染」。
+
+    2026-10-31 实机 bug：
+      第 1 轮说「帮我回到原点」→ 正确调用 return_to_start
+      第 2 轮只说「回起点」   → 直接回一句文字，坚决不调工具
+
+    原因：历史里留着上一轮完整的
+      AI(tool_calls) + Tool(...) + AI(最终文本)
+    3B 模型把最后那条 AI 文本当成回答范例逐字照抄。
+    修复见 agent_graph._strip_past_tool_turns()。
+
+    这里用真实历史结构复现，只检查模型想调什么工具，不执行任何工具。
+    """
+    return [
+        # (标题, 历史消息, 当前用户输入, 期望工具)
+        ('回起点（上一轮已调过 return_to_start）',
+         ['帮我回到原点', 'return_to_start', '📍 正在返回起点...',
+          '📍 我会尽快回到起点，主人。'],
+         '回起点', 'return_to_start'),
+        ('开始巡检（上一轮已调过 start_patrol_mode）',
+         ['开始巡检', 'start_patrol_mode', '✅ 巡检已启动',
+          '好的主人，已开始巡检。'],
+         '开始巡检', 'start_patrol_mode'),
+        ('导航到厨房（上一轮调过另一个导航工具）',
+         ['去客厅', 'navigate_to_saved_location', '📍 正在前往客厅',
+          '马上就到客厅了。'],
+         '去厨房', 'navigate_to_saved_location'),
+    ]
+
+
+def _run_multi_turn():
+    """跑多轮回归用例，返回 (通过数, 总数)。"""
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    print("\n" + "-" * 58)
+    print("多轮对话回归（历史范例污染）")
+    print("-" * 58)
+
+    ok = 0
+    cases = _multi_turn_cases()
+    for title, hist, now, want in cases:
+        # 还原历史结构：Human / AI(tool_calls) / Tool / AI(最终文本)
+        msgs = [
+            HumanMessage(content=hist[0]),
+            AIMessage(content='', tool_calls=[
+                {'name': hist[1], 'args': {}, 'id': 'call_x'}]),
+            ToolMessage(content=hist[2], tool_call_id='call_x'),
+            AIMessage(content=hist[3]),
+            HumanMessage(content=now),
+        ]
+        stripped = _strip_past_tool_turns(msgs)
+        full = [SystemMessage(content=_nonce_prompt(ACTIVE_SYSTEM_PROMPT))]
+        full += stripped
+        try:
+            r = llm_with_tools.invoke(full)
+        except Exception as e:                      # noqa: BLE001
+            print("❌ %-30s 异常: %s" % (title, str(e)[:40]))
+            continue
+        names = [c["name"] for c in (r.tool_calls or [])]
+        hit = want in names
+        ok += hit
+        print("%s %-30s 期望 %-26s 实得 %s"
+              % ("✅" if hit else "❌", title, want, names or "无"))
+    return ok, len(cases)
+
+
 def main():
     print("=" * 58)
     print("本地模型工具调用自检")
@@ -113,8 +181,12 @@ def main():
           (ok, n, pct, total_time / n))
     if fails:
         print("失败用例 %d 条（见上）" % len(fails))
+
+    # ---- 多轮回归 ----
+    mt_ok, mt_n = _run_multi_turn()
+    print("多轮准确率: %d/%d" % (mt_ok, mt_n))
     print("=" * 58)
-    return 0 if pct >= 85 else 1
+    return 0 if (pct >= 85 and mt_ok == mt_n) else 1
 
 
 if __name__ == "__main__":

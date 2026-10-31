@@ -9,7 +9,7 @@ from typing import Literal
 
 import httpx
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.checkpoint.memory import InMemorySaver
@@ -383,6 +383,92 @@ ACTIVE_SYSTEM_PROMPT = (SYSTEM_PROMPT_COMPACT if LLM_PROVIDER == "local"
 MAX_HISTORY_MESSAGES = int(os.environ.get("FISHBOT_MAX_HISTORY", "12"))
 
 
+def _strip_past_tool_turns(messages):
+    """丢弃「以前轮次」留下的工具往返，只保留当前轮的。
+
+    ============================================================
+    为什么要剥离（2026-10-31 实机日志实锤）
+    ============================================================
+    用户先说「帮我回到原点」，模型正确调用 return_to_start，
+    历史里于是留下完整的三段：
+
+        Human: 帮我回到原点
+        AI   : tool_calls=[return_to_start]
+        Tool : 📍 正在返回起点...
+        AI   : 📍 我会尽快回到起点，主人。
+        Human: 回起点                    ← 新的一轮
+
+    3B 模型把最后那条 AI 文本当成了「回答范例」，第二轮直接照抄：
+
+        AI   : 📍 我会尽快回到起点位置，请稍等片刻。   ← 没调工具
+
+    这就是少数样本污染（in-context imitation）。
+    系统提示里已经写了「必须调工具」「禁止用文字描述代替调用工具」，
+    对 3B 模型依然压不住 —— 结构性问题只能靠结构解决。
+
+    ============================================================
+    为什么只剥离「最后一轮之前」的部分
+    ============================================================
+    图里是 tools → agent，工具执行完还会回到本节点。
+    那条路径下模型**必须**看到 AI(tool_calls) + Tool(result)
+    才能总结工具结果。所以：
+
+      * 最后一条 HumanMessage **之后**（当前轮）→ 原样保留
+      * 最后一条 HumanMessage **之前**（历史轮）→ 剥掉工具往返
+
+    保留 HumanMessage 序列，多轮上下文（比如「我叫小明」）不丢。
+
+    可用环境变量 FISHBOT_KEEP_TOOL_HISTORY=1 关闭本行为。
+    """
+    if not messages:
+        return list(messages)
+    if os.environ.get("FISHBOT_KEEP_TOOL_HISTORY", "") == "1":
+        return list(messages)
+
+    last_human = -1
+    for i in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[i], HumanMessage):
+            last_human = i
+            break
+
+    if last_human <= 0:
+        return list(messages)          # 没有更早的历史，无需处理
+
+    head = messages[:last_human]
+    tail = messages[last_human:]       # 当前轮：连工具往返一起保留
+
+    cleaned = []
+    i = 0
+    while i < len(head):
+        m = head[i]
+
+        # 孤立的工具结果（对应的调用已不在）—— 留着会让接口报 400
+        if type(m).__name__ == "ToolMessage":
+            i += 1
+            continue
+
+        # 一整轮工具调用：AI(tool_calls) + Tool(...) + AI(最终文本)
+        if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+            i += 1
+            while i < len(head) and type(head[i]).__name__ == "ToolMessage":
+                i += 1
+            # 该轮的最终纯文本回答也要丢 —— 它才是被模仿的那个范例
+            if i < len(head):
+                nxt = head[i]
+                if (isinstance(nxt, AIMessage)
+                        and not getattr(nxt, "tool_calls", None)):
+                    i += 1
+            continue
+
+        cleaned.append(m)
+        i += 1
+
+    if len(cleaned) < len(head):
+        print("[AgentNode] 剥离历史工具回合 %d → %d 条（当前轮保留）"
+              % (len(head), len(cleaned)))
+    return cleaned + tail
+
+
 def _trim_history(messages, limit=None):
     """保留最近 limit 条消息，并保证工具调用链完整。"""
     limit = limit or MAX_HISTORY_MESSAGES
@@ -458,6 +544,11 @@ def agent_node(state: MessagesState):
     # 表现为 content 为空且没有 tool_calls（实测踩过）。
     # 这里只保留最近若干条，并且必须保证 tool_call / tool_result 成对，
     # 否则 OpenAI 兼容接口会直接 400。
+
+    # ★ 先剥离「上一轮」的工具往返，再裁剪长度。
+    #   顺序不能反：_trim_history 只按条数粗切，切完可能恰好
+    #   留下一段「AI 最终文本」，那段才是被模仿的范例。
+    messages = _strip_past_tool_turns(messages)
     messages = _trim_history(messages)
 
     # 添加系统提示（只加一次）
