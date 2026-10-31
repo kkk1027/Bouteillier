@@ -82,16 +82,27 @@ class FakeWorld(Node):
             x, y, yaw, sxy, syaw = 1.0, 0.5, 0.1, 0.05, 0.08
         elif s < 5.0:                     # 粒子塌缩：σ 被压到极低
             x, y, yaw, sxy, syaw = 1.0, 0.5, 0.1, 0.0008, 0.0005
-        elif s < 6.0:                     # 塌缩后即将重定位
+        elif s < 6.0:                     # 局部重撒后（σ 回到 0.3）
             x, y, yaw, sxy, syaw = 1.0, 0.5, 0.1, 0.30, 0.40
-        else:                             # 瞬移 1.2m（重定位结果错位）
+        elif s < 7.0:                     # 瞬移 1.2m 后重新收敛
             x, y, yaw, sxy, syaw = 2.2, 0.5, 0.1, 0.05, 0.08
+        elif s < 8.5:                     # ★ 全局重撒：σ 暴增到 1.4m
+            x, y, yaw, sxy, syaw = 2.4, 0.3, 0.1, 1.40, 0.90
+        else:                             # 再次收敛
+            x, y, yaw, sxy, syaw = 2.4, 0.3, 0.1, 0.05, 0.08
 
-        # 第 5 秒发一次 /initialpose（模拟 auto_localizer 重新撒粒子）
+        # 第 5 秒发一次 /initialpose（模拟 auto_localizer **局部**重撒）
         if not hasattr(self, '_reseeded') and s >= 5.0:
             self._reseeded = True
             self.init_pub.publish(self._pose(1.0, 0.5, 0.1, 0.25, 0.0685))
-            self.get_logger().info('>>> 发送 /initialpose（模拟重新撒粒子）')
+            self.get_logger().info('>>> 发送 /initialpose（模拟局部重撒）')
+
+        # 第 7 秒模拟**全局**重撒：只有 σ 突增，没有任何 /initialpose，
+        # 验证 tracer 不依赖话题也能识别服务调用
+        if not hasattr(self, '_reseeded_global') and s >= 7.0:
+            self._reseeded_global = True
+            self.get_logger().info(
+                '>>> 全局重撒：σ 突增到 1.40m（无 /initialpose）')
 
         if abs(s - 6.0) < 0.06 and not hasattr(self, '_jumped'):
             self._jumped = True
@@ -197,6 +208,8 @@ def main():
     checks = [
         ('记录了 COLLAPSE 状态', 'COLLAPSE' in text),
         ('记录了 RESEED 事件', 'RESEED' in text),
+        ('识别出局部重撒（/initialpose）', 'RESEED[LOCAL]' in text),
+        ('识别出全局重撒（σ 突增，无话题）', 'RESEED[GLOBAL]' in text),
         ('记录了 JUMP 事件', 'JUMP' in text),
         ('跳变来源归属为 AMCL', 'JUMP[AMCL]' in text),
         ('记录了 CONVERGE 状态', 'CONVERGE' in text),

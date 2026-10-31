@@ -44,9 +44,20 @@ AMCL 重定位过程记录器 —— 随导航栈自动拉起，**只读，不�
 ================================================================
 重定位事件怎么捕获
 ================================================================
-auto_localizer 每次「重新撒粒子」都会往 /initialpose 发一条消息
-（auto_localizer.py:516）。所以订阅 /initialpose 就能精确计数
-重定位次数和时刻，不需要读它的内部状态。
+★ 这里踩过一次坑，两个来源都要看：
+
+auto_localizer 有两套恢复手段：
+  1. 局部重撒 —— 发一帧 /initialpose（带小协方差）
+  2. 全局重撒 —— 调服务 /reinitialize_global_localization
+
+曾经只订阅 /initialpose 就以为能数清重定位次数，结果日志显示
+「重定位=0」但位姿明明瞬移了 1.66m —— 因为全局重撒走的是**服务**，
+不是话题，订阅根本看不到。差点把排查方向带偏。
+
+服务调用无法订阅，所以这里改用**协方差突增**做指纹：
+  * 全局重撒会把粒子云撒满整张地图 → σ 从 0.01 级跳到 0.5m 以上
+  * 局部重撒只在原位扰动 0.05m → σ 最多到 0.22m
+  * 两者量级差一个数量级，可以可靠区分
 
 同时本节点会镜像 auto_localizer 的塌缩判据
 （std_xy < 0.005 且 std_yaw < 0.01）提前标记 COLLAPSE，
@@ -92,6 +103,11 @@ COLLAPSE_STD_YAW = 0.01        # 弧度
 CONVERGE_STD_XY = 0.08         # 高于此值判为未收敛
 CONVERGE_STD_YAW = 0.15        # 弧度（约 8.6°）
 
+# 全局重撒识别阈值（服务调用不可订阅，只能靠 σ 突增当指纹）
+#   撒满全图 → σ 通常 0.5~2.0m；局部重撒 σ 最多 0.22m
+GLOBAL_RESEED_MIN_STD = 0.40
+GLOBAL_RESEED_RATIO = 5.0      # 新 σ 至少是旧 σ 的 5 倍才算突变
+
 CSV_HEADER = (
     't,wall,x,y,yaw,std_xy,std_yaw,'
     'mo_x,mo_y,mo_yaw,ob_x,ob_y,ob_yaw,'
@@ -136,7 +152,9 @@ class AmclTracer(Node):
         # ---- 输入缓存 ----
         self.pose = None              # (x, y, yaw, std_xy, std_yaw, stamp)
         self.n_amcl = 0
-        self.n_reseed = 0             # /initialpose 条数 = 重定位次数
+        self.n_reseed = 0             # 重定位总次数（局部 + 全局）
+        self.n_reseed_local = 0       # 来自 /initialpose
+        self.n_reseed_global = 0      # 由 σ 突增识别（服务无法订阅）
         self.last_reseed = 0.0
         self.scan_hz = 0.0
         self.ekf_hz = 0.0
@@ -209,17 +227,42 @@ class AmclTracer(Node):
         vx = max(c[0], 0.0)
         vy = max(c[7], 0.0)
         vyaw = max(c[35], 0.0)
+        new_std = math.sqrt(max(vx, vy))
+        new_std_yaw = math.sqrt(vyaw)
+
+        # ★ 全局重撒指纹：服务调用无法订阅，只能从协方差突增识别。
+        #   把粒子云撒满整张地图 → σ 必然从 0.01 级跳到 0.5m 以上；
+        #   而局部重撒（/initialpose）最多到 0.22m，相差一个数量级。
+        old = self.pose
+        if old is not None and old[3] < GLOBAL_RESEED_MIN_STD:
+            if (new_std >= GLOBAL_RESEED_MIN_STD
+                    and new_std >= old[3] * GLOBAL_RESEED_RATIO):
+                self.n_reseed_global += 1
+                self.n_reseed += 1
+                self.last_reseed = time.time()
+                self._event(
+                    'RESEED[GLOBAL] 第 %d 次 —— 全局重撒（服务调用），'
+                    'σ 从 %.3fm 突增到 %.3fm（位姿即将瞬移）'
+                    % (self.n_reseed, old[3], new_std))
+
         self.pose = (
             p.position.x, p.position.y, _yaw(p.orientation),
-            math.sqrt(max(vx, vy)), math.sqrt(vyaw),
+            new_std, new_std_yaw,
             msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9)
         self.n_amcl += 1
 
     def on_reseed(self, msg):
-        """auto_localizer 重新撒粒子 = 一次重定位。"""
+        """收到 /initialpose = 一次局部重撒（或人工在 RViz 点选）。"""
+        self.n_reseed_local += 1
         self.n_reseed += 1
         self.last_reseed = time.time()
-        self._event('RESEED 第 %d 次重定位（重新撒粒子）' % self.n_reseed)
+        c = msg.pose.covariance
+        std = math.sqrt(max(max(c[0], 0.0), max(c[7], 0.0)))
+        p = msg.pose.pose.position
+        self._event(
+            'RESEED[LOCAL] 第 %d 次 —— /initialpose '
+            '(x=%.2f y=%.2f σ=%.3fm)'
+            % (self.n_reseed, p.x, p.y, std))
 
     def on_scan(self, msg):
         now = time.time()
@@ -394,10 +437,12 @@ class AmclTracer(Node):
         """退出时写总结并打印。"""
         elapsed = time.time() - self.started
         summary = (
-            '采样行=%d  事件=%d  跳变=%d  重定位=%d  AMCL消息=%d  '
+            '采样行=%d  事件=%d  跳变=%d  重定位=%d（局部%d/全局%d）  '
+            'AMCL消息=%d  '
             '最后scan=%.1fHz 最后EKF=%.1fHz'
             % (self.n_rows, self.n_events, self.jump_count,
-               self.n_reseed, self.n_amcl, self.scan_hz, self.ekf_hz))
+               self.n_reseed, self.n_reseed_local, self.n_reseed_global,
+               self.n_amcl, self.scan_hz, self.ekf_hz))
         if self.fp is not None:
             try:
                 self.fp.write('# ---- 结束：运行 %.0fs  %s ----\n'
