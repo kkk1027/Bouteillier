@@ -259,7 +259,9 @@ SYSTEM_PROMPT = PERSONA_TEXT + """
 - get_navigation_status: 查询导航状态
 
 【系统状态】
-- initialize_pose: 初始化AMCL定位（地图加载后、首次导航前调用，告诉机器人"你现在在起点"）
+- initialize_pose: **重置** AMCL 定位，强制认为车此刻在原点（破坏性操作，
+  只在用户明确说"初始化位姿/初始化定位/重置定位"时才用；
+  ⚠️ 用户说"回起点/回家"时**绝对不要**用它，那是 return_to_start 的事）
 - get_current_position: 获取当前位置
 - get_battery_status: 查询电量
 - list_predefined_points: 列出预定义航点坐标
@@ -615,6 +617,16 @@ def agent_node(state: MessagesState):
     #   - 非控制类工具（set_butler_mood / get_weather 等）原样保留
     # ============================================================
     if getattr(response, "tool_calls", None):
+        # 1) 先做语义防护：拦掉被"起点"二字误触发的 initialize_pose
+        #    （它会把 AMCL 位姿重置到 (0,0)，破坏性最强，必须最先处理）
+        last_user_text = ""
+        for m in reversed(messages):
+            if isinstance(m, HumanMessage):
+                last_user_text = str(getattr(m, "content", "") or "")
+                break
+        response = _guard_initialize_pose(response, last_user_text)
+
+        # 2) 再收敛多个互斥工具
         response = _dedupe_exclusive_tool_calls(response)
 
     return {"messages": [response]}
@@ -635,20 +647,116 @@ def agent_node(state: MessagesState):
 # 它们本身就会「到达后自动回起点」。所以只要模型给出了**明确的
 # 目的地**，就该优先执行它；return_to_start 视为被顺手多带的低价值项。
 _EXCLUSIVE_NAV_TOOLS = {
+    # ---- 0：明确的导航目的地（最高优先级）----
     "navigate_to_saved_location": 0,
     "navigate_to_location": 0,
     "navigate_to_predefined_point": 0,
     "navigate_to_xy": 0,
     "navigate_sequence": 0,
+    # ---- 1：进入跟随模式 ----
     "start_patrol_mode": 1,
     "start_lidar_follow": 1,
-    "return_to_start": 2,          # 优先级最低：多半是附带误调
+    # ---- 2：停止 / 取消类 ----
+    "stop_patrol_mode": 2,
+    "stop_lidar_follow": 2,
+    "cancel_navigation": 2,
+    # ---- 3：导航回起点（navigate_* 已自带回程，多半是附带误调）----
+    "return_to_start": 3,
+    # ---- 4：最低 —— 重置定位是破坏性操作，最容易被"起点"二字误触发 ----
+    "initialize_pose": 4,
 }
 
 # 与导航同时出现时应当丢弃的工具：会写坏地点数据
 _DROP_WITH_NAV_TOOLS = {
     "save_current_location",
 }
+
+# ============================================================
+# initialize_pose 的语义防护（2026-11-01）
+# ------------------------------------------------------------
+# 实测故障：用户说「回起点」，模型调了 initialize_pose。
+# 原因：工具描述里有"起点"二字，3B 模型看到"回**起点**"就选了它。
+# 后果：initialize_amcl_pose() 直接把 AMCL 位姿重置成 (0,0,3.14)，
+#       表现为「车瞬间重定位到起点」而不是「开过去」——
+#       而且如果车实际不在原点，之后所有导航都是错的。
+#
+# 上面 _EXCLUSIVE_NAV_TOOLS 的优先级只能处理"多个工具同时出现"的情况；
+# 如果模型**只**吐了 initialize_pose 一个，去重逻辑不会触发。
+# 所以这里再加一层基于**用户原话**的判断。
+#
+# 规则：
+#   用户明确说要初始化  → 放行（这是个正当操作）
+#   用户没说初始化      → 丢弃 initialize_pose
+#                        若同时能看出导航语义，补一个 return_to_start
+# ============================================================
+
+# 用户明确要求重置定位的说法
+_INIT_POSE_INTENT_WORDS = (
+    "初始化位姿", "初始化定位", "初始化amcl", "初始化 amcl",
+    "重置定位", "重设定位", "设置初始位置", "位姿初始化",
+)
+
+# 用户想要「回起点」的说法（导航语义，绝不能用 initialize_pose）
+_GO_HOME_INTENT_WORDS = (
+    "回起点", "返回起点", "回到起点", "回家", "回原点", "返回原点",
+    "回去", "回出发",
+)
+
+
+def _guard_initialize_pose(response, user_text: str):
+    """防止"回起点"被误解成"把定位重置到起点"。"""
+    if not getattr(response, "tool_calls", None):
+        return response
+
+    has_init = any(tc.get("name") == "initialize_pose"
+                   for tc in response.tool_calls)
+    if not has_init:
+        return response
+
+    text = (user_text or "").lower()
+
+    # 用户确实说要初始化 -> 正常放行
+    if any(w in text for w in _INIT_POSE_INTENT_WORDS):
+        return response
+
+    wants_home = any(w in text for w in _GO_HOME_INTENT_WORDS)
+
+    if wants_home:
+        # 用户说"回起点" -> 换成 return_to_start
+        new_calls = [tc for tc in response.tool_calls
+                     if tc.get("name") != "initialize_pose"]
+        # 模型可能已经给了 return_to_start，别再加一遍（会触发去重日志）
+        if not any(tc.get("name") == "return_to_start" for tc in new_calls):
+            new_calls.append({
+                "name": "return_to_start",
+                "args": {},
+                "id": "guard_ret_home",
+            })
+        print("[AgentNode] 🛡️ 用户说的是回起点（不是重置定位），"
+              "已把 initialize_pose 换成 return_to_start")
+    else:
+        # 既没说要初始化、也没看出导航语义 -> 直接丢掉这个破坏性操作
+        new_calls = [tc for tc in response.tool_calls
+                     if tc.get("name") != "initialize_pose"]
+        print("[AgentNode] 🛡️ 用户未要求初始化定位，"
+              "已丢弃 initialize_pose（破坏性操作）")
+
+    if not new_calls:
+        # 全被丢掉了：给一句提示，避免空回复
+        try:
+            from langchain_core.messages import AIMessage
+            return AIMessage(content="需要我初始化定位吗？这会重置当前位置。")
+        except Exception:                              # noqa: BLE001
+            return response
+
+    try:
+        return response.model_copy(update={"tool_calls": new_calls})
+    except Exception:                                  # noqa: BLE001
+        try:
+            response.tool_calls = new_calls
+        except Exception:                              # noqa: BLE001
+            pass
+        return response
 
 
 def _dedupe_exclusive_tool_calls(response):
