@@ -110,7 +110,8 @@ class ServoClient:
         self._logger.info('已发送舵机播报指令（异步，等待 ESP32 执行）')
         return True
 
-    def call_servo_and_wait(self, timeout: float = 60.0) -> str:
+    def call_servo_and_wait(self, timeout: float = 60.0,
+                            heartbeat=None) -> str:
         """同步调用舵机服务，阻塞等待 ESP32 完成「播报→等按钮→返回」全流程。
 
         关键：使用临时独立 Node 做 service call，而不是复用 self.node（PatrolNode）。
@@ -121,7 +122,12 @@ class ServoClient:
         触发闲时降噪关电机。
 
         Args:
-            timeout: 等待按钮按下的超时秒数（默认 60s，与 ESP32 一致）
+            timeout: 等待按钮按下的超时秒数
+            heartbeat: 可选的零参回调，在等待期间周期性调用。
+                ★ 2026-11-01 新增：这 60 秒里 ESP32 处于阻塞态、停发
+                  /odom，EKF 会用最后一帧速度盲推，位姿沿固定方向匀速
+                  漂移（实测 55 秒漂了 20.6m）。回调用来维持
+                  /nav_node_status 心跳，至少不让 ESP32 进闲时降噪。
 
         Returns:
             'success' — 按钮已按下，播报完成
@@ -154,8 +160,17 @@ class ServoClient:
             self._logger.info('📢 发送舵机播报指令，等待 ESP32 按钮确认...')
             future = client.call_async(req)
 
-            # 只 spin 临时空节点，不干扰 PatrolNode
-            rclpy.spin_until_future_complete(call_node, future, timeout_sec=timeout)
+            # 自己控制等待节奏，而不是一次性 spin 到底：
+            # 这样每 0.5s 能调一次 heartbeat，让上层有机会维持心跳。
+            deadline = time.time() + timeout
+            while not future.done() and time.time() < deadline:
+                rclpy.spin_until_future_complete(
+                    call_node, future, timeout_sec=0.5)
+                if heartbeat is not None and not future.done():
+                    try:
+                        heartbeat()
+                    except Exception:      # noqa: BLE001
+                        pass
 
             if not future.done():
                 self._logger.warning('⏰ 等待 ESP32 按钮按下超时')
@@ -180,6 +195,26 @@ class PatrolNode(BasicNavigator):
         # 导航相关定义
         self.declare_parameter('initial_point', [0.0, 0.0, 0.0])
         self.declare_parameter('target_points', [0.0, 0.0, 0.0, -1.0, 4.7, 3.14,-1.0, -2.5, 0.0,-4.5, -0.55, -1.57])
+        # ============================================================
+        # 舵机播报开关（2026-11-01 实机事故后改为默认关闭）
+        # ------------------------------------------------------------
+        # 原因：这个播报会**阻塞 60 秒**等 ESP32 的按钮确认。期间
+        # patrol_node 不再发布 /nav_node_status，ESP32 也停发 /odom 和
+        # /imu_raw，EKF 只能按上一帧速度盲推 —— 实测 55 秒漂了 20.6m，
+        # AMCL 匹配率从 92% 掉到 16~37%，用户看到的就是「位姿缓慢漂移」。
+        #
+        # 而且它完美解释了「只在去厕所后出现、回起点不出现」：
+        #   去厕所 → patrol_node（有播报）
+        #   回起点 → nav_to_pose（没有播报）
+        #
+        # 需要原来的巡逻播报功能时，把参数设成 true 即可（届时会带心跳）。
+        # ============================================================
+        self.declare_parameter('enable_servo_announce', False)
+        self.declare_parameter('servo_timeout_sec', 15.0)
+        self.enable_servo_announce_ = bool(
+            self.get_parameter('enable_servo_announce').value)
+        self.servo_timeout_sec_ = float(
+            self.get_parameter('servo_timeout_sec').value)
         self.initial_point_ = self.get_parameter('initial_point').value
         self.target_points_ = self.get_parameter('target_points').value
         # 实时位置获取 TF 相关定义
@@ -383,15 +418,72 @@ class PatrolNode(BasicNavigator):
             self.get_logger().warn(f'导航结果异常: {result}')
             return
 
-        servo_client = ServoClient(node=self)
-        servo_client.stop_robot()
-        self.get_logger().info('执行舵机动作')
+        self._run_servo_announce('目标点')
+
+    def _run_servo_announce(self, label: str = '') -> str:
+        """到达目的地后的舵机播报（**默认关闭**）。
+
+        ============================================================
+        ★ 2026-11-01 实机事故：这个播报是「去厕所后位姿乱飘」的元凶
+        ============================================================
+        实测日志（patrol_node）：
+            12:08:47  导航结果：成功
+            12:08:48  已发送停止指令 + 零角速度IMU
+            12:08:48  执行舵机动作
+            12:08:48  📢 发送舵机播报指令，等待 ESP32 按钮确认...
+            12:09:48  ⏰ 等待 ESP32 按钮按下超时      ← 阻塞了整整 60 秒！
+            12:09:48  舵机动作失败: timeout
+
+        在这 60 秒里：
+          1. `patrol_node` 主线程**完全阻塞**在 spin_until_future_complete
+             上，不再发布 /nav_node_status、不再处理任何导航回调；
+          2. ESP32 同时也在阻塞态等按钮，**/odom 和 /imu_raw 都停发**；
+          3. EKF（robot_localization）拿不到观测，就按**上一帧的速度**
+             继续推算 —— 位姿沿固定方向匀速漂移。
+        实测 trace：odom→base_footprint 在 55 秒里从 0.15m 均匀长到
+        20.6m（≈0.37 m/s），方向固定在 53°，同时 AMCL 匹配率
+        从 92% 跌到 16~37%，可见就是“匀速盲推”。
+
+        ★ 为什么“只有去厕所会飘、回起点不飘”：
+            去厕所  → patrol_node（本函数）→ 有舵机播报
+            回起点  → nav_to_pose         → **没有舵机播报**
+          完全对应用户的现场观察。
+
+        所以：默认**不播报**。需要时把参数 enable_servo_announce 设 true，
+        但即使打开，也会在等待期间**持续发心跳**，不让 ESP32 停发 odom。
+        """
+        if not self.enable_servo_announce_:
+            self.get_logger().info(
+                '已到达%s（舵机播报已关闭，直接结束；'
+                '打开参数 enable_servo_announce:=true 可恢复）'
+                % (label or ''))
+            return 'skipped'
+
+        self.get_logger().info('执行舵机动作（%s）' % (label or '到达'))
+        servo = ServoClient(node=self)
+        servo.stop_robot()
         time.sleep(0.3)
-        result = servo_client.call_servo_and_wait()
-        if result == 'success':
-            self.get_logger().info('舵机动作完成')
+        servo_result = servo.call_servo_and_wait(
+            timeout=self.servo_timeout_sec_,
+            heartbeat=lambda: self._heartbeat_during_servo())
+        if servo_result == 'success':
+            self.get_logger().info('✅ 舵机播报完成')
         else:
-            self.get_logger().error(f'舵机动作失败: {result}')
+            self.get_logger().warn(f'导航到达但播报未完成: {servo_result}')
+        return servo_result
+
+    def _heartbeat_during_servo(self) -> None:
+        """舵机播报阻塞期间的心跳。
+
+        不做任何运动控制，只维持两件事：
+          1. /nav_node_status = True —— 告诉 ESP32“导航节点还在”，
+             避免它 3 秒后进闲时降噪；
+          2. /cmd_vel 零速 —— 确保底盘真的静止（此时本应已经停了）。
+        """
+        try:
+            self.publish_nav_status(True)
+        except Exception:          # noqa: BLE001 - 心跳失败不影响主流程
+            pass
 
     def navigate_and_complete(self, x: float, y: float, yaw: float = 0.0) -> str:
         """导航到目标点并完成舵机播报（原子操作）。
@@ -457,17 +549,15 @@ class PatrolNode(BasicNavigator):
             self.get_logger().warn(f'导航异常: {result}')
             return 'servo_failed'
 
-        self.get_logger().info('导航到达，执行舵机播报...')
-        servo = ServoClient(node=self)
-        servo.stop_robot()
-        time.sleep(0.3)
-        servo_result = servo.call_servo_and_wait()
-        if servo_result == 'success':
-            self.get_logger().info('✅ 导航+播报 全部完成')
-        else:
-            self.get_logger().warn(f'导航到达但播报未完成: {servo_result}')
-            return 'servo_failed'
-        return 'success'
+        self.get_logger().info('导航到达目标点')
+        # 舵机播报默认关闭（详见 _run_servo_announce 的注释：
+        # 它会阻塞 60 秒，期间 ESP32 停发 /odom，EKF 盲推导致位姿漂移）
+        servo_result = self._run_servo_announce('目标点')
+        if servo_result in ('success', 'skipped'):
+            self.get_logger().info('✅ 导航完成')
+            return 'success'
+        self.get_logger().warn(f'导航到达但播报未完成: {servo_result}')
+        return 'servo_failed'
 
     
     def get_current_pose(self, timeout_sec=3.0):

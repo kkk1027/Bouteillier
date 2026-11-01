@@ -295,7 +295,9 @@ SYSTEM_PROMPT = PERSONA_TEXT + """
 2. 当用户说"删除XXX"时，调用 delete_saved_location
 3. 当用户说"清空所有地点"时，调用 clear_all_saved_locations
 4. 当用户说"去XXX"时，**只调用** navigate_to_saved_location 这一个工具
-   （它会自动回退到预定义地点，且内部已包含"到达后自动回起点"）
+   （它会自动回退到预定义地点）
+   ★ 它默认**只去、不回来**。只有用户明说“去了再回来”、
+     “去X然后回起点”时，才把 return_home 参数设为 true。
 5. 当用户说"先去A再去B"、"依次去A和B"等连续多个地点时，调用 navigate_sequence
 6. 当用户问"有哪些地点"时，调用 list_locations
 7. 当用户说"跟着我"、"雷达跟随"时，调用 start_lidar_follow
@@ -316,8 +318,8 @@ SYSTEM_PROMPT = PERSONA_TEXT + """
 - 除了 set_butler_mood / butler_say 这类纯表情工具，
   其它工具**每轮最多只调用一个**
 - 绝对不要同时调用多个导航工具（会互相抢占，导致任务失败）
-- 特别注意：navigate_to_saved_location 内部**已经包含**"到达后自动
-  返回起点"，所以**不要**再额外调用 return_to_start
+- 特别注意：navigate_to_saved_location 默认**不会**自动返回起点；
+  用户只说“去XXX”时，不要额外调用 return_to_start
 - 用户说"去XXX"时，只需 navigate_to_saved_location 一个工具；
   **不要**先调用 save_current_location
 
@@ -772,9 +774,12 @@ def agent_node(state: MessagesState):
 # 如果按顺序保留第一个导航工具，留下的是 return_to_start —— 但用户说的
 # 是「去厕所」，正确意图是「先去厕所、再自动回起点」。
 #
-# 关键事实：所有 navigate_* 内部都传了 return_to_start=True，
-# 它们本身就会「到达后自动回起点」。所以只要模型给出了**明确的
-# 目的地**，就该优先执行它；return_to_start 视为被顺手多带的低价值项。
+# 关键事实：只要模型给出了**明确的**目的地，就该优先执行它；
+# return_to_start 视为被顺手多带的低价值项。
+#
+# ★ 2026-11-01 修订：navigate_* 已**不再**默认自动回起点
+#   （见 tools/nav_tools.py 的 return_home 参数，默认 False）。
+#   这条优先级规则依然成立 —— 用户嘴里的目的地永远比"回起点"更重要。
 _EXCLUSIVE_NAV_TOOLS = {
     # ---- 0：明确的导航目的地（最高优先级）----
     "navigate_to_saved_location": 0,

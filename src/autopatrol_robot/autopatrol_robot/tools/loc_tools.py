@@ -92,12 +92,17 @@ def save_current_location(name: str) -> str:
 
 
 @tool(args_schema=NavigateToSavedInput)
-def navigate_to_saved_location(name: str) -> str:
+def navigate_to_saved_location(name: str, return_home: bool = False) -> str:
     """
     导航到之前保存的自定义地点。
 
     当用户说"去厕所"、"去书房"时使用此工具。
     如果名称不是自定义地点，会回退尝试预定义地点。
+
+    return_home 默认为 False —— **只去，不自动回起点**。
+    ★ 2026-11-01 实机反馈：原来硬编码 return_to_start=True，用户只说
+      “去厕所”，到了之后车又自己跑回起点，完全不是他要的。
+      现在改成默认不回，只有用户明说“去了再回来”才设 True。
     """
     from autopatrol_robot.nav_manager import launch_navigate_with_return_async
 
@@ -106,11 +111,13 @@ def navigate_to_saved_location(name: str) -> str:
     # 先查自定义地点
     index = store.find_index(name)
     if index is not None:
-        return launch_navigate_with_return_async(index, name, return_to_start=True)
+        return launch_navigate_with_return_async(
+            index, name, return_to_start=bool(return_home))
 
     # 回退：查预定义地点
     if name in LOCATION_MAP:
-        return launch_navigate_with_return_async(LOCATION_MAP[name], name, return_to_start=True)
+        return launch_navigate_with_return_async(
+            LOCATION_MAP[name], name, return_to_start=bool(return_home))
 
     # 都找不到
     custom = store.list_all()

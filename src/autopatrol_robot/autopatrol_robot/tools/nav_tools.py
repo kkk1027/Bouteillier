@@ -47,6 +47,11 @@ class NavToPredefinedPointInput(BaseModel):
 class NavigateToLocationInput(BaseModel):
     """导航到命名地点"""
     location: str = Field(..., description="地点名称，例如：厨房、客厅、影音房、起点等")
+    return_home: bool = Field(
+        default=False,
+        description=("到达后是否自动返回起点。"
+                     "★ 只有当用户明确说『去X然后回来』或『去X再回起点』"
+                     "时才设 true；用户只说『去X』时必须留空（默认 false）。"))
 
 
 class NavigateSequenceInput(BaseModel):
@@ -58,23 +63,26 @@ class NavigateSequenceInput(BaseModel):
 
 
 # ============================================================
-# 公共 helper：导航到预定义点 + 自动回起点
+# 公共 helper：导航到预定义点（默认**不**自动回起点）
 # ============================================================
 
-def _navigate_to_and_return(index: int, name: str) -> str:
-    """导航到预定义点，到达后自动返回起点（异步非阻塞版）。
+def _navigate_to(index: int, name: str, return_home: bool = False) -> str:
+    """导航到预定义点（异步非阻塞版）。
 
-    不再阻塞等待导航完成，立即返回启动确认。
-    后台线程监控导航进度，通过回调推送阶段通知。
+    ★ 2026-11-01 改动：默认**不再自动返回起点**。
+      原来这里硬编码 return_to_start=True，用户只说“去厕所”
+      → 到了之后车又自己跑回去，完全不是他要的。
+      现在只有用户明说“去了再回来”才传 True。
 
     回调阶段（由 web_controller 注册）：
       'started'   → "📍 正在前往 XXX..."
       'arrived'   → "✅ 已到达 XXX！"
-      'returning' → "📍 正在返回起点..."
+      'returning' → "📍 正在返回起点..."（仅 return_home=True）
       'completed' → "✅ 已回到起点！"
       'failed'    → "❌ 导航失败：..."
     """
-    return launch_navigate_with_return_async(index, name, return_to_start=True)
+    return launch_navigate_with_return_async(
+        index, name, return_to_start=bool(return_home))
 
 
 # ============================================================
@@ -82,15 +90,17 @@ def _navigate_to_and_return(index: int, name: str) -> str:
 # ============================================================
 
 @tool(args_schema=NavigateToLocationInput)
-def navigate_to_location(location: str) -> str:
-    """导航到命名地点（预定义：起点/厨房/客厅/影音房），到达后自动返回起点。
+def navigate_to_location(location: str, return_home: bool = False) -> str:
+    """导航到命名地点（预定义：起点/厨房/客厅/影音房）。
 
     当用户说"去厨房"、"去客厅"时使用此工具。
+    默认**只去，不自动回起点**；只有用户明说“去了再回来”才把
+    return_home 设为 true。
     """
     index = LOCATION_MAP.get(location)
     if index is None:
         return f"❌ 未找到预定义地点: {location}。可用地点：{', '.join(LOCATION_MAP.keys())}"
-    return _navigate_to_and_return(index, location)
+    return _navigate_to(index, location, return_home)
 
 
 @tool(args_schema=NavToPredefinedPointInput)
@@ -102,7 +112,7 @@ def navigate_to_predefined_point(index: int) -> str:
     """
     if index < 1 or index > 4:
         return f"❌ 索引 {index} 无效，有效范围是 1-4"
-    return _navigate_to_and_return(index, f"点{index}")
+    return _navigate_to(index, f"点{index}")
 
 
 @tool(args_schema=NavToPoseInput)
@@ -145,7 +155,9 @@ def navigate_sequence(locations: list[str]) -> str:
         indices.append(index)
 
     names = " → ".join(locations)
-    return launch_navigate_sequence_async(indices, names, return_to_start=True)
+    # 序列导航默认也不自动返航（同 navigate_to_location 的改动）
+    return launch_navigate_sequence_async(indices, names,
+                                          return_to_start=False)
 
 
 @tool
