@@ -6,7 +6,7 @@ from rclpy.qos import (
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import PoseWithCovarianceStamped
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, send_from_directory
 from flask_socketio import SocketIO, emit
 import threading
 import subprocess
@@ -1705,7 +1705,14 @@ class CarController(Node):
         self.publish_velocity(0.0, 0.0)
 
 # ==================== Flask 应用 ====================
-app = Flask(__name__)
+# ★ 显式指定 static_folder。
+#   本文件既可能被 `python3 web_controller.py` 直接运行（此时 __name__
+#   是 '__main__'），也可能被别的模块 import，两种情况下 Flask 猜测的
+#   root_path 不保证一致。写死绝对路径最稳，否则 /static/icons/*.png
+#   可能 404 —— 表现为「图标怎么都不显示、添加到主屏是空白方块」。
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+app = Flask(__name__, static_folder=os.path.join(_BASE_DIR, 'static'))
 app.config['SECRET_KEY'] = 'secret!'
 # 模板自动重载：Flask 默认在非 debug 模式下会缓存已编译的模板，
 # 于是改完 control.html 刷新浏览器看到的还是旧页面（本次实际踩到，
@@ -1763,6 +1770,14 @@ def _setup_nav_callbacks():
 
 def _generate_and_emit_announcement(phase: str, message: str):
     """调用 LLM 生成拟人化主动播报并通过 SocketIO 推送。"""
+    # ★ 必须在这个函数里 import。
+    # 原来这两行写在 _setup_nav_callbacks() 内部，但本函数是**另一个**
+    # 独立函数，Python 作用域不共享 → 运行时 NameError:
+    #   name 'SystemMessage' is not defined
+    # 表现为每次导航完成都打印「[NavAnnounce] 生成播报失败」，
+    # 用户永远听不到"我到家了"这类主动播报。
+    from langchain_core.messages import HumanMessage, SystemMessage
+
     try:
         from autopatrol_robot.agent_graph import llm
 
@@ -2078,6 +2093,42 @@ def connection_status():
 def index():
     """主页面"""
     return render_template('control.html')
+
+
+# ==================== PWA 资源 ====================
+# 为什么不用 /static/xxx 而要在根路径暴露这两个文件：
+#   * Service Worker 的作用域默认是它自己的 URL 所在目录。
+#     如果从 /static/sw.js 加载，scope 就只有 /static/，无法控制 / 页面。
+#     放根路径 + Service-Worker-Allowed 头最省事。
+#   * manifest.json 放根路径可以让 scope/start_url 都是 '/'，语义更清楚。
+@app.route('/manifest.json')
+def pwa_manifest():
+    """PWA 应用清单。"""
+    resp = send_from_directory(
+        app.static_folder, 'manifest.json',
+        mimetype='application/manifest+json')
+    # 改了 manifest 之后要能立刻生效，不做强缓存
+    resp.headers['Cache-Control'] = 'no-cache'
+    return resp
+
+
+@app.route('/sw.js')
+def pwa_service_worker():
+    """Service Worker 脚本。
+
+    注意：Service Worker 只在 **HTTPS 或 localhost** 这样的 secure
+    context 下才会被浏览器注册。当前是 http://<局域网IP>:5000，
+    所以 iPhone 上这个 SW 不会生效（浏览器会直接拒绝注册）。
+    这不是 bug：iOS 的「添加到主屏幕」并不需要 HTTPS，也不需要 SW，
+    靠的是 control.html 里的 apple-mobile-web-app-capable。
+    这里照样把文件提供出去，将来若上了 HTTPS 就自动生效。
+    """
+    resp = send_from_directory(
+        app.static_folder, 'sw.js',
+        mimetype='application/javascript')
+    resp.headers['Service-Worker-Allowed'] = '/'
+    resp.headers['Cache-Control'] = 'no-cache'
+    return resp
 
 @app.route('/control', methods=['POST'])
 def control():

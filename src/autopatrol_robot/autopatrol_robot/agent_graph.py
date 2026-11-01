@@ -292,7 +292,8 @@ SYSTEM_PROMPT = PERSONA_TEXT + """
 1. 当用户说"这里是XXX"时，调用 save_current_location
 2. 当用户说"删除XXX"时，调用 delete_saved_location
 3. 当用户说"清空所有地点"时，调用 clear_all_saved_locations
-4. 当用户说"去XXX"时，先调用 navigate_to_saved_location（它会自动回退到预定义地点）
+4. 当用户说"去XXX"时，**只调用** navigate_to_saved_location 这一个工具
+   （它会自动回退到预定义地点，且内部已包含"到达后自动回起点"）
 5. 当用户说"先去A再去B"、"依次去A和B"等连续多个地点时，调用 navigate_sequence
 6. 当用户问"有哪些地点"时，调用 list_locations
 7. 当用户说"跟着我"、"雷达跟随"时，调用 start_lidar_follow
@@ -308,6 +309,15 @@ SYSTEM_PROMPT = PERSONA_TEXT + """
     不要凭记忆猜今天几号
 14. 工具查不到的事（如实时新闻、股价）就诚实说查不到，
     不要编造，也不要声称自己"无法联网"
+
+【最重要】一轮只调一个工具：
+- 除了 set_butler_mood / butler_say 这类纯表情工具，
+  其它工具**每轮最多只调用一个**
+- 绝对不要同时调用多个导航工具（会互相抢占，导致任务失败）
+- 特别注意：navigate_to_saved_location 内部**已经包含**"到达后自动
+  返回起点"，所以**不要**再额外调用 return_to_start
+- 用户说"去XXX"时，只需 navigate_to_saved_location 一个工具；
+  **不要**先调用 save_current_location
 
 【重要】导航工具已改为非阻塞：
 - 当你调用导航工具后，工具会立即返回 "📍 正在前往..." 类消息
@@ -581,7 +591,110 @@ def agent_node(state: MessagesState):
             except Exception as e:  # noqa: BLE001
                 print(f"[AgentNode] 重试失败: {e}")
 
+    # ============================================================
+    # 单轮 tool_calls 互斥收敛（2026-11-01）
+    # ------------------------------------------------------------
+    # 实测故障：用户说「去厕所」，3B 模型一次吐出 3 个工具：
+    #   ['save_current_location', 'return_to_start',
+    #    'navigate_to_saved_location']
+    # 后果是三重灾难：
+    #   1. save_current_location 把**当前位置**存成了「厕所」→ 数据污染
+    #   2. return_to_start 起了一个导航进程
+    #   3. navigate_to_saved_location 再起一个 →
+    #      「已有导航任务进行中（目标：回起点）」，真正的任务失败
+    #
+    # 为什么必须在代码层拦：3B 模型的工具选择是**确定性错误**，
+    # 同一句话每次都错，调 prompt 只能降低概率，不能消除。
+    # 而且 navigate_to_saved_location 内部已自带 return_to_start=True，
+    # 本就会导航后自动回起点，额外调 return_to_start 纯属重复。
+    #
+    # 规则：
+    #   - 导航类工具之间互斥，只保留模型输出的**第一个**
+    #   - 同轮出现导航类时，丢弃 save_current_location
+    #     （"去X"里不存在"顺便把当前位置记成X"的合理意图）
+    #   - 非控制类工具（set_butler_mood / get_weather 等）原样保留
+    # ============================================================
+    if getattr(response, "tool_calls", None):
+        response = _dedupe_exclusive_tool_calls(response)
+
     return {"messages": [response]}
+
+
+# 会「抢占底盘 / 导航进程」的工具：同一轮只能执行一个。
+#
+# 值 = 优先级，数字越小越优先。
+#
+# 【为什么需要优先级，而不是简单取第一个】
+# 实测模型输出顺序是
+#   ['save_current_location', 'return_to_start',
+#    'navigate_to_saved_location']
+# 如果按顺序保留第一个导航工具，留下的是 return_to_start —— 但用户说的
+# 是「去厕所」，正确意图是「先去厕所、再自动回起点」。
+#
+# 关键事实：所有 navigate_* 内部都传了 return_to_start=True，
+# 它们本身就会「到达后自动回起点」。所以只要模型给出了**明确的
+# 目的地**，就该优先执行它；return_to_start 视为被顺手多带的低价值项。
+_EXCLUSIVE_NAV_TOOLS = {
+    "navigate_to_saved_location": 0,
+    "navigate_to_location": 0,
+    "navigate_to_predefined_point": 0,
+    "navigate_to_xy": 0,
+    "navigate_sequence": 0,
+    "start_patrol_mode": 1,
+    "start_lidar_follow": 1,
+    "return_to_start": 2,          # 优先级最低：多半是附带误调
+}
+
+# 与导航同时出现时应当丢弃的工具：会写坏地点数据
+_DROP_WITH_NAV_TOOLS = {
+    "save_current_location",
+}
+
+
+def _dedupe_exclusive_tool_calls(response):
+    """收敛单轮 tool_calls：导航类互斥，避免抢进程 + 数据污染。"""
+    calls = list(response.tool_calls)
+    names = [c.get("name") for c in calls]
+
+    nav_calls = [c for c in calls if c.get("name") in _EXCLUSIVE_NAV_TOOLS]
+    if not nav_calls:
+        return response
+
+    # 按优先级挑一个（同级则保留模型先给出的那个）
+    kept_nav = min(nav_calls,
+                   key=lambda c: _EXCLUSIVE_NAV_TOOLS[c.get("name")])
+    dropped = []
+
+    new_calls = []
+    for c in calls:
+        name = c.get("name")
+        if name in _EXCLUSIVE_NAV_TOOLS:
+            if c is kept_nav:
+                new_calls.append(c)
+            else:
+                dropped.append(name)
+            continue
+        if name in _DROP_WITH_NAV_TOOLS:
+            dropped.append(name)
+            continue
+        new_calls.append(c)
+
+    if not dropped:
+        return response
+
+    print("[AgentNode] ⚠️ 同一轮多个冲突工具 %s → 只保留 %s（丢弃 %s）"
+          % (names, kept_nav.get("name"), dropped))
+
+    # AIMessage 的 tool_calls 是只读属性，用 model_copy 造一个新对象
+    try:
+        return response.model_copy(update={"tool_calls": new_calls})
+    except Exception:                                  # noqa: BLE001
+        # 极老版本的 langchain 没有 model_copy，退回直接赋值
+        try:
+            response.tool_calls = new_calls
+        except Exception:                              # noqa: BLE001
+            pass
+        return response
 
 
 # ============================================================
