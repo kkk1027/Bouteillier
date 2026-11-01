@@ -1509,6 +1509,30 @@
         }
 
         /* 暗角：让中间的对话区更突出 */
+        /* ============================================================
+           连接页背景虚化（2026-11-01）
+           ------------------------------------------------------------
+           连接页中央是"BOUTEILLIER + 连接以开始"，背后是整间房。
+           背景不虚化时，家具的细节会和按钮、标题抢注意力，
+           第一眼看上去很乱。虚化之后视觉重心自然落到中央的按钮上。
+
+           几个实现要点：
+             · transition 加在 .room-scene 上，进入工作台时是"慢慢变清楚"
+               而不是"啪"地一下切换，仪式感更好；
+             · blur 会让元素边缘变半透明，露出底下的 body 背景色，
+               所以同时 scale(1.08) 把画面放大一圈盖住边缘；
+             · transform-origin 用中心，放大才是均匀的。
+           ============================================================ */
+        .room-scene {
+            transition: filter .55s ease, transform .55s ease;
+            transform-origin: 50% 50%;
+        }
+
+        .room-scene.is-blur {
+            filter: blur(14px) saturate(.92) brightness(1.05);
+            transform: scale(1.08);
+        }
+
         .room-vignette {
             position: absolute;
             inset: 0;
@@ -3753,7 +3777,7 @@
        1) 画出来的家具程序不知道它在哪，没法做碰撞 —— 机器人会从沙发上碾过去；
        2) 只有横向有意义，前后纵深（y 轴）根本用不上。
      ============================================================ -->
-<div class="room-scene" id="roomScene" aria-hidden="true">
+<div class="room-scene is-blur" id="roomScene" aria-hidden="true">
     <svg class="room-svg" id="roomSvg" xmlns="http://www.w3.org/2000/svg"></svg>
     <div class="room-vignette"></div>
 </div>
@@ -4376,6 +4400,9 @@
         const home = document.getElementById('viewHome');
         const app = document.getElementById('viewApp');
         if (!home || !app) return;
+        // 背景虚化：连接页虚化，进工作台后取消（详见 .room-scene.is-blur）
+        const scene = document.getElementById('roomScene');
+        if (scene) scene.classList.toggle('is-blur', which !== 'app');
         if (which === 'app') {
             home.classList.add('is-gone');
             app.classList.remove('is-gone');
@@ -6128,25 +6155,39 @@
         //   表现为「完全不动的假死」。
         //   现在把地毯挪到沙发脚下（和沙发共用同一块区域，不额外占地方），
         //   茶几往右后方挪，正面留出一条贯穿左右的空地当"跑道"。
+        // ★ 为什么把进深从 4.4 压到 3.0（2026-11-01）
+        // ------------------------------------------------------------
+        // 用户反馈："家具、背后的墙体、地板要均匀分布，现在地板占了
+        //          屏幕的一半"。
+        //
+        // 斜二轴测里，地板在屏幕上的高度 = d·cos45°·k；
+        // 而家具高度 = 实物高 × k。两者相除，k 被约掉：
+        //     地板高 / 沙发高 = d·cos45° / 0.8
+        // 也就是说「地板有多大、家具就显得多小」**只由进深 d 决定**，
+        // 无论怎么调缩放都改变不了这个比例。
+        // 想同时做到「地板变小」和「家具变大」，唯一的路就是减小 d。
+        // d 从 4.4 降到 3.0 后，这个比值从 3.9 降到 2.65。
         const WIDE_ITEMS = [
             { id: 'rug', kind: 'rug', layer: 0, soft: true,
-              x0: -3.30, y0: 2.70, w: 2.45, d: 1.50, h: 0.02,
+              x0: -3.30, y0: 1.15, w: 2.50, d: 1.30, h: 0.02,
               c: '#ffd6a6', name: '地毯' },
             { id: 'window', kind: 'window', layer: 1, soft: true,
-              x0: -0.60, y0: 4.10, w: 2.45, d: 0.14, h: 1.45, z0: 0.62,
+              x0: -0.70, y0: 2.90, w: 2.45, d: 0.10, h: 1.45, z0: 0.62,
               c: '#fff5dc', name: '窗户' },
+            // 沙发：后沿 1.75+0.93 = 2.68，墙 3.00，距 0.32
             { id: 'sofa', kind: 'sofa', layer: 1,
-              x0: -3.35, y0: 3.05, w: 2.35, d: 1.05, h: 0.80,
+              x0: -3.35, y0: 1.75, w: 2.35, d: 0.93, h: 0.80,
               c: '#ffcf9f', name: '沙发' },
-            { id: 'plant', kind: 'plant', layer: 1,
-              x0: 2.88, y0: 3.18, w: 0.58, d: 0.58, h: 0.98,
-              c: '#d99566', name: '盆栽' },
             { id: 'table', kind: 'table', layer: 1,
-              x0: 0.15, y0: 2.35, w: 1.30, d: 0.78, h: 0.46,
+              x0: 0.20, y0: 1.30, w: 1.30, d: 0.72, h: 0.46,
               c: '#f0d3a8', name: '茶几' },
+            // 盆栽：右后角
+            { id: 'plant', kind: 'plant', layer: 1,
+              x0: 2.90, y0: 2.02, w: 0.58, d: 0.58, h: 0.98,
+              c: '#d99566', name: '盆栽' },
             // 落地灯：细高物件，把中景的竖向空间填起来
             { id: 'lamp', kind: 'floorlamp', layer: 1,
-              x0: 2.96, y0: 1.30, w: 0.42, d: 0.42, h: 1.86,
+              x0: 2.96, y0: 1.05, w: 0.40, d: 0.40, h: 1.86,
               c: '#ffd9a0', name: '落地灯' },
         ];
 
@@ -6165,55 +6206,86 @@
         //   这就是"太空"的数学原因。
         //   把进深拉到 5.6 之后，地板占到约六成，墙退到三成多，
         //   再叠上窗户 / 挂画 / 搁板 / 吊灯，画面才真正被填满。
-        // ★ 摆放约束（竖屏专用，比横屏苛刻）
-        //   手机放得很大，真正能走的只有中间一条约 1.4m 宽的通道
-        //   （见 layout() 里的 MIN_WALK）。所以家具必须让开这条通道，
-        //   否则机器人会在出生点被卡住 —— 这个坑已经踩过一次。
-        //   茶几和沙发都放在通道左侧，右边留给机器人走；
-        //   盆栽和落地灯放到通道右侧，纯粹是画面里的景。
+        // ★ 竖屏布局（2026-11-01 第二次调整）
+        // ------------------------------------------------------------
+        // 上一版为了给机器人留通道，把沙发挪到了房间中段（y=2.55），
+        // 结果沙发孤零零悬在屋子中间 —— 用户反馈"违和感强，
+        // 没有像电脑端一样靠墙"。
+        //
+        // 这一版按真实客厅来摆：
+        //   · 沙发靠后墙（后沿距墙 0.32，和电脑端完全一致）
+        //   · 沙发左端几乎贴着左墙
+        //   · 地毯压在沙发前缘下面
+        //   · 茶几落在地毯上、沙发正前方
+        //   · 盆栽塞右后角，落地灯靠右侧
+        // 机器人活动区收缩到"茶几之前"那段起居空地上 —— 真实家庭里
+        // 人也不会走到沙发后面去，这样既合理又天然避开了家具。
         const TALL_ITEMS = [
             { id: 'rug', kind: 'rug', layer: 0, soft: true,
-              x0: -2.35, y0: 2.35, w: 2.15, d: 1.35, h: 0.02,
+              x0: -2.00, y0: 1.00, w: 1.95, d: 1.35, h: 0.02,
               c: '#ffd6a6', name: '地毯' },
+            // 窗户：挂在沙发正上方（房间里唯一的自然光源，必须留在画面里）
             { id: 'window', kind: 'window', layer: 1, soft: true,
-              x0: -0.95, y0: 5.46, w: 1.90, d: 0.14, h: 1.55, z0: 1.05,
+              x0: -1.55, y0: 2.90, w: 1.45, d: 0.10, h: 1.55, z0: 1.05,
               c: '#fff5dc', name: '窗户' },
+            // 沙发：后沿 1.75+0.93 = 2.68，墙 3.00，距 0.32（与横屏一致）
             { id: 'sofa', kind: 'sofa', layer: 1,
-              x0: -2.35, y0: 2.55, w: 1.90, d: 0.95, h: 0.80,
+              x0: -1.95, y0: 1.75, w: 1.80, d: 0.93, h: 0.80,
               c: '#ffcf9f', name: '沙发' },
+            // 茶几：沙发正前方，落在地毯上
             { id: 'table', kind: 'table', layer: 1,
-              x0: -1.60, y0: 1.10, w: 1.05, d: 0.65, h: 0.44,
+              x0: -1.75, y0: 1.05, w: 0.90, d: 0.60, h: 0.44,
               c: '#f0d3a8', name: '茶几' },
+            // 盆栽：沙发右侧
             { id: 'plant', kind: 'plant', layer: 1,
-              x0: 1.15, y0: 2.30, w: 0.60, d: 0.60, h: 0.98,
+              x0: 0.55, y0: 2.05, w: 0.55, d: 0.55, h: 0.98,
               c: '#d99566', name: '盆栽' },
+            // 落地灯：右侧
             { id: 'lamp', kind: 'floorlamp', layer: 1,
-              x0: 1.30, y0: 0.95, w: 0.40, d: 0.40, h: 1.85,
+              x0: 1.10, y0: 1.10, w: 0.38, d: 0.38, h: 1.85,
               c: '#ffd9a0', name: '落地灯' },
         ];
 
+        // ============================================================
         // 墙面装饰（不可碰撞，只贴在 y = d 的后墙上）
-        //   x = 中心世界横坐标   z = 中心离地高度   w/h = 尺寸
+        // ------------------------------------------------------------
+        // ★ 位置和尺寸全部用「比例」而不是绝对世界坐标（2026-11-01）。
+        //   原因：墙高 wallH 是 layout() 算出来的，会随视口变化 ——
+        //   手机上为了盖住屏幕顶部，墙可以长到 10 个单位以上。
+        //   如果画框写死 z=1.95，它就只到墙的 1/5 高度，
+        //   上面 4/5 是一大片空墙，正是用户说的"太空"。
+        //   改成比例后，无论墙多高，装饰都均匀铺满整个墙面。
+        //
+        //   xf = 横向位置（占半间房宽的比例，-1 = 左墙）
+        //   zf = 高度（占墙高的比例，0 = 地面，1 = 墙顶）
+        //   wf / hf = 尺寸（占墙高的比例，保证与 zf 同尺度）
+        // ============================================================
         const WIDE_DECOR = [
-            { kind: 'frame', x: 2.55, z: 1.62, w: 1.05, h: 0.78,
+            { kind: 'frame', xf: 0.70, zf: 0.30, wf: 0.26, hf: 0.20,
               c: '#ffeacd', art: '#f0c79a' },
-            { kind: 'frame', x: -0.72, z: 1.78, w: 0.66, h: 0.52,
+            { kind: 'frame', xf: -0.20, zf: 0.26, wf: 0.17, hf: 0.13,
               c: '#fff0d8', art: '#e8b98c' },
-            { kind: 'sconce', x: 1.30, z: 1.62 },
-            { kind: 'pendant', x: 1.85, z: 2.38 },
+            { kind: 'sconce', xf: 0.36, zf: 0.34 },
+            { kind: 'shelf', xf: 0.10, zf: 0.56, wf: 0.30 },
+            { kind: 'frame', xf: -0.62, zf: 0.62, wf: 0.21, hf: 0.16,
+              c: '#ffeacd', art: '#e8b98c' },
+            { kind: 'pendant', xf: 0.50, zf: 0.52 },
         ];
 
-        // 竖屏的墙很高（房间只占下半屏），所以装饰要分层往高处摆，
-        // 否则顶上会留一大片空墙。
+        // 竖屏的墙特别高（房间只占下半屏），所以装饰铺得更密，
+        // 从上到下五层，让整面墙都有内容。
         const TALL_DECOR = [
-            { kind: 'frame', x: -1.62, z: 1.95, w: 0.85, h: 0.66,
+            { kind: 'frame', xf: -0.58, zf: 0.13, wf: 0.15, hf: 0.11,
               c: '#ffeacd', art: '#f0c79a' },
-            { kind: 'sconce', x: 1.42, z: 2.10 },
-            { kind: 'shelf', x: 0.05, z: 3.55 },
-            { kind: 'frame', x: -0.95, z: 4.55, w: 1.05, h: 0.78,
+            { kind: 'sconce', xf: 0.62, zf: 0.22 },
+            { kind: 'frame', xf: 0.14, zf: 0.31, wf: 0.12, hf: 0.09,
               c: '#fff0d8', art: '#e8b98c' },
-            { kind: 'sconce', x: 1.62, z: 5.10 },
-            { kind: 'pendant', x: 0.55, z: 3.05 },
+            { kind: 'shelf', xf: -0.34, zf: 0.43, wf: 0.24 },
+            { kind: 'frame', xf: -0.60, zf: 0.58, wf: 0.16, hf: 0.12,
+              c: '#ffeacd', art: '#f0c79a' },
+            { kind: 'sconce', xf: 0.66, zf: 0.68 },
+            { kind: 'shelf', xf: 0.24, zf: 0.78, wf: 0.20 },
+            { kind: 'pendant', xf: 0.52, zf: 0.46 },
         ];
 
         // 当前生效的预设（由 layout() 覆盖）
@@ -6223,8 +6295,10 @@
         // 机器人可达范围（世界坐标）。留出边距，
         // 免得它跑到墙里或者一半身子伸出地板外。
         const BOUNDS = { x0: -3.10, x1: 3.10, y0: 0.45, y1: 3.95 };
-        const WIDE_BOUNDS = { x0: -3.10, x1: 3.10, y0: 0.45, y1: 3.95 };
-        const TALL_BOUNDS = { x0: -1.55, x1: 1.55, y0: 0.50, y1: 3.85 };
+        const WIDE_BOUNDS = { x0: -3.10, x1: 3.10, y0: 0.42, y1: 2.40 };
+        // 活动区 = 茶几之前那段起居空地（y 上限 3.05，
+        // 再往上就会被茶几挡住 —— 这正是想要的效果）
+        const TALL_BOUNDS = { x0: -1.30, x1: 1.10, y0: 0.42, y1: 2.40 };
 
         let k = 100;          // 每个世界单位多少像素
         let viewW = 390, viewH = 844;   // 最近一次取景的视口尺寸
@@ -6267,6 +6341,10 @@
             camDY = Math.max(-1, Math.min(1, dy)) * (viewH * 0.022);
             applyCam();
         }
+
+        // 当前视角偏移。管家的 DOM 元素不在 SVG 里，得自己把这个
+        // 偏移加上去，否则拖动视角时房间动、机器人不动 —— 一眼就假。
+        function camOffset() { return { x: camDX, y: camDY }; }
 
         // 按比例调亮/调暗一个 #rrggbb 颜色
         function shade(hex, f) {
@@ -6706,9 +6784,39 @@
         // ============================================================
         function drawDecor() {
             const D = ROOM.d;
+            // ★ 把「比例」换算成世界坐标（2026-11-01）
+            //   装饰定义里用的是 xf / zf / wf / hf（占半房宽 / 占墙高的比例），
+            //   而墙高 wallH 每次 layout() 都会重算，所以必须在绘制时
+            //   才换算 —— 提前算好存进 ITEMS 的话，换视口就过期了。
+            const HW = ROOM.w / 2;
+
+            // ★★ 关键：装饰要按「看得见的那段墙」定位，不是按 wallH。
+            // ------------------------------------------------------------
+            // wallH 是故意算大的（让墙顶跑到屏幕上方之外，避免露边），
+            // 所以 z ∈ [0, wallH] 里只有下面一小段在屏幕上。
+            // 装饰若按 wallH 的比例摆，2/3 都会在屏幕外面 —— 实测
+            // zf=0.78 的画框落在了 y = -187px，完全看不见。
+            //
+            // 后墙上「看得见的高度」是：
+            //   墙顶屏幕 y = oy − (d·cos45° + z)·k  ≥ 0
+            //   ⇒  z ≤ oy/k − d·cos45°
+            // 就拿这个值当 1.0 来摆装饰，无论视口多大都铺满可见墙。
+            const wallVisible = Math.max(
+                1.2,
+                oy / k - ROOM.d * C45 - 0.15     // 再留 0.15 给踢脚线
+            );
+
             let o = '';
             for (let i = 0; i < DECOR.length; i++) {
-                const d = DECOR[i];
+                const raw = DECOR[i];
+                const d = {
+                    kind: raw.kind,
+                    x: (raw.xf === undefined ? 0 : raw.xf) * HW,
+                    z: (raw.zf === undefined ? 0.3 : raw.zf) * wallVisible,
+                    w: (raw.wf === undefined ? 0.16 : raw.wf) * wallVisible * 1.35,
+                    h: (raw.hf === undefined ? 0.12 : raw.hf) * wallVisible * 1.35,
+                    c: raw.c, art: raw.art
+                };
                 if (d.kind === 'frame') {
                     const tl = proj(d.x - d.w / 2, D, d.z + d.h / 2);
                     const br = proj(d.x + d.w / 2, D, d.z - d.h / 2);
@@ -6739,7 +6847,7 @@
                 } else if (d.kind === 'pendant') {
                     // 吊灯：从很高的地方垂下来，填屏幕上半部的大片空墙，
                     // 同时给房间一个明确的"光源"，光感立刻合理。
-                    const py = (d.y === undefined) ? D * 0.42 : d.y;
+                    const py = D * 0.46;
                     const top = proj(d.x, py, ROOM.wallH);
                     const bot = proj(d.x, py, d.z);
                     // 吊线
@@ -6753,7 +6861,8 @@
                          '" ry="' + (k * 0.62 * C45).toFixed(1) +
                          '" fill="url(#winGlow)" opacity=".8"/>';
                     // 灯罩：上窄下宽的梯形
-                    const wTop = 0.14, wBot = 0.46, hh = 0.34;
+                    const wTop = d.w * 0.28, wBot = d.w * 1.0,
+                          hh = Math.max(0.18, d.h * 2.2);
                     const p1 = proj(d.x - wBot / 2, py, d.z);
                     const p2 = proj(d.x + wBot / 2, py, d.z);
                     const p3 = proj(d.x + wTop / 2, py, d.z + hh);
@@ -6763,8 +6872,9 @@
                     o += '<path d="' + roundedPath([p1, p2, p3, p4], k * 0.03) +
                          '" fill="url(#ogTop)"/>';
                 } else if (d.kind === 'shelf') {
-                    // 墙上的搁板 + 两本小书，用来填中段以上的空墙
-                    const bw = 1.15, bh = 0.10;
+                    // 墙上的搁板 + 几件小物，用来填中段以上的空墙
+                    // ★ 尺寸跟随 d.w / d.h，不再写死 —— 换视口时比例才对
+                    const bw = d.w, bh = Math.max(0.06, d.h * 0.5);
                     const tl = proj(d.x - bw / 2, D, d.z + bh / 2);
                     const br = proj(d.x + bw / 2, D, d.z - bh / 2);
                     const w = br.x - tl.x, hh = br.y - tl.y;
@@ -6941,8 +7051,8 @@
             // 竖屏（含方屏）用紧凑户型，横屏用宽厅。
             const portrait = vh > vw * 1.04;
             const preset = portrait
-                ? { w: 4.6, d: 5.6, items: TALL_ITEMS, decor: TALL_DECOR, b: TALL_BOUNDS }
-                : { w: 7.2, d: 4.4, items: WIDE_ITEMS, decor: WIDE_DECOR, b: WIDE_BOUNDS };
+                ? { w: 4.4, d: 3.0, items: TALL_ITEMS, decor: TALL_DECOR, b: TALL_BOUNDS }
+                : { w: 7.2, d: 3.0, items: WIDE_ITEMS, decor: WIDE_DECOR, b: WIDE_BOUNDS };
 
             ROOM.w = preset.w;
             ROOM.d = preset.d;
@@ -6954,39 +7064,75 @@
             const spanW = ROOM.w + ROOM.d * C45;
             const spanH = ROOM.d * C45;
 
-            // ---- 2. 想放多大：地板宽度占屏宽的倍数 ----
-            // 竖屏必须放得更大，否则房间缩成屏幕下方一条，上面全空。
-            const kWant = (vw * (portrait ? 2.15 : 1.18)) / spanW;
+            // ============================================================
+            // 2. 由「目标构图比例」反推缩放 k（2026-11-01 重写）
+            // ------------------------------------------------------------
+            // 用户要求："家具、背后的墙体、地板要均匀分布"。
+            //
+            // 旧做法是用一堆试出来的倍数（1.45 / 1.62 / 2.35…），
+            // 每换一个视口比例就崩一次，只能反复手调。现在直接解方程：
+            //
+            //   屏幕上，从「后墙脚那条线」到屏幕底部，全是地板：
+            //       地板高 = d·cos45°·k + (H − oy)
+            //   令它恰好等于 F_FLOOR·H，反解出 k：
+            //       k = (F_FLOOR − (1 − oyFrac)) · H / (d·cos45°)
+            //
+            //   k 一旦定死，家具大小也就定了（家具高 = 实物高 × k）。
+            //   所以这个式子同时钉住了「地板占比」和「家具大小」，
+            //   换任何视口都自动保持同一套构图。
+            //
+            //   ★ 但要注意：地板大小 与 家具大小 的**比例**只由进深 d 决定
+            //     （地板高/家具高 = d·cos45°/实物高，k 会被约掉）。
+            //     想两者都满意，只能连 d 一起改 —— 这就是为什么
+            //     家具清单里的进深从 4.4 压到了 3.0。
+            // ============================================================
+            const F_FLOOR = 0.42;      // 地板目标占屏高
+            const oyFrac  = 0.965;     // 地板前沿落在屏幕 96.5% 处
+            const kFloor = (F_FLOOR - (1 - oyFrac)) * vh / (ROOM.d * C45);
 
-            // ---- 3. 放大到什么程度还可以走 ----
-            // 关键推导（不依赖取景原点，很好用）：
-            //   屏幕上能装下的行走宽度
-            //     = vw/k − Δy·cos45°
-            //   于是"至少留 MIN_WALK 宽的可行走区域"给出 k 的上限：
+            // ---- 3. 上限：放大到还能走得动为止 ----
+            //   屏幕上能装下的行走宽度 = vw/k − Δy·cos45°
+            //   于是"至少留 MIN_WALK"给出 k 的上限：
             //     k ≤ vw / (MIN_WALK + Δy·cos45°)
-            // 手机放大后必然有一部分房间被裁掉 —— 用户已明确允许，
-            // 下面第 4b 步会把可行走范围收进可见区域，保证机器人不出画。
-            const MIN_WALK = 1.6;
+            const MIN_WALK = 1.20;
             const dy = BOUNDS.y1 - BOUNDS.y0;
             const kMaxWalk = vw / (MIN_WALK + dy * C45);
 
-            k = Math.max(26, Math.min(Math.min(kWant, kMaxWalk), 210));
+            k = Math.max(26, Math.min(kFloor, kMaxWalk, 340));
+            // 兜底：房间总宽至少要铺满屏幕（墙会延伸，不会露边，
+            // 但太窄会让整个房间缩在中间）
             if (spanW * k < vw * 1.02) k = Math.max(k, (vw * 1.02) / spanW);
 
-            // ---- 4. 取景原点 ----
-            // ox：让**可行走区域的中段**落在屏幕中间，
-            // 而不是让"地板中心"居中。原因：进深会把画面往右推，
-            // 若按地板中心对齐，机器人实际能走的那一小块会偏到右半边，
-            // 左边空出一大片用不上的地板。
-            const yMid = (BOUNDS.y0 + BOUNDS.y1) * 0.5;
-            ox = vw * 0.5 - yMid * C45 * k;
+            // ---- 4. 取景原点：按「家具内容」居中 ----
+            // ★ 为什么不再用"地板中心"或"行走区中点"（都被实测打回过）：
+            //   · 按地板中心 → 进深把画面往右推，机器人能走的那块偏到右边；
+            //   · 按行走区中点 → 放得大时后墙那排家具整体被推出屏幕右侧，
+            //     连墙都看不见，沙发看着像悬空。
+            //   现在直接算所有家具在屏幕上的横向范围，把它居中。
+            //   这样无论怎么缩放，看得见的一定是"有东西的那部分"。
+            let uMin = Infinity, uMax = -Infinity;
+            for (let i = 0; i < ITEMS.length; i++) {
+                const it = ITEMS[i];
+                const u0 = it.x0 + it.y0 * C45;
+                const u1 = (it.x0 + it.w) + (it.y0 + it.d) * C45;
+                if (u0 < uMin) uMin = u0;
+                if (u1 > uMax) uMax = u1;
+            }
+            // ★ 只按家具居中，不把行走区算进来。
+            //   行走区的 u 跨度比家具还宽（前左角到后右角），
+            //   把它算进去会把整幅画面推偏，结果两边各裁掉一大块。
+            //   行走区由下面第 4b 步钳进可见范围即可。
+            ox = vw * 0.5 - ((uMin + uMax) * 0.5) * k;
+
             // 兜一道：左墙 x=-HW 必须落在屏幕左边界之外，
             // 否则会露出"房间外面"的一条空白。
             const leftWallX = ox - (ROOM.w / 2) * k;
             if (leftWallX > 0) ox -= leftWallX + 2;
 
-            // oy：地板前沿（y=0）落在屏幕下方约 90% 处
-            oy = vh * 0.90;
+            // oy：地板前沿（y=0）落在屏幕 96.5% 处。
+            // 留 3.5% 是因为地板往后（屏幕上往下）还继续延伸，
+            // 前沿贴着底边即可，不用留大片空白。
+            oy = vh * oyFrac;
 
             // ---- 4b. 把可行走范围收进真正看得到的区域 ----
             // 屏幕可视的世界 x 区间随 y 变化（进深越大越偏右），
@@ -7023,6 +7169,7 @@
             layout: layout,
             botScale: botScale,
             setCam: setCam,
+            camOffset: camOffset,
             needsLayout: needsLayout,
             obstacles: obstacles,
             bounds: BOUNDS,
@@ -7174,10 +7321,17 @@
             }
             const sc = World.botScale();
             const feet = World.proj(bx, by, 0);
+            // ★ 必须叠加视角偏移（2026-11-01）
+            //   场景是 SVG 里的 <g id="camRoot">，随视角平移；
+            //   而机器人的 .butler-stage 是 SVG 之外的 DOM 元素，
+            //   坐标是屏幕绝对坐标 —— 不补上这个偏移，拖动视角时
+            //   就会出现"房间在动、机器人钉在原地"的穿帮。
+            //   两者用的是同一份 camDX/camDY，所以永远严格同步。
+            const cam = World.camOffset();
             // 缩放原点在 50% 100%（脚底中心），所以缩放不会移动这个点
             stage.style.transform =
-                'translate3d(' + (feet.x - BOT_W / 2).toFixed(1) + 'px,' +
-                                 (feet.y - BOT_H).toFixed(1) + 'px,0)';
+                'translate3d(' + (feet.x - BOT_W / 2 + cam.x).toFixed(1) + 'px,' +
+                                 (feet.y - BOT_H + cam.y).toFixed(1) + 'px,0)';
             if (scaleEl) {
                 scaleEl.style.transform = 'scale(' + sc.toFixed(3) + ')';
             }
