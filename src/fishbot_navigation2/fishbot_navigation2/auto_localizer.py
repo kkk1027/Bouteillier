@@ -39,6 +39,7 @@
 不发布任何 /cmd_vel，不会让小车移动。
 """
 
+import json
 import math
 
 import rclpy
@@ -48,7 +49,13 @@ from rclpy.node import Node
 from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
                        ReliabilityPolicy)
 from sensor_msgs.msg import LaserScan
+from std_msgs.msg import String
 from std_srvs.srv import Empty
+
+from fishbot_navigation2.loc_quality import (
+    LaserMapMatcher, MapGrid, PoseStabilityTracker, QualityAssessor,
+    StatusSnapshot,
+)
 
 # PoseWithCovarianceStamped 6x6 协方差矩阵按行优先展开
 COV_X = 0
@@ -178,6 +185,41 @@ class AutoLocalizer(Node):
         self.declare_parameter('defer_on_external_initial_pose', True)
         self.declare_parameter('log_period_sec', 10.0)
 
+        # ==========================================================
+        # ★ 定位质量评估（2026-11-01）
+        # ----------------------------------------------------------
+        # 仅靠 σ 判收敛必然两头出错：
+        #   真收敛时 σ 可能因为粒子略散而超线 → 永远不收敛 → 120s 重撒
+        #   假收敛时 σ 很小但位置错，反而被当成功
+        # 现在加入「激光-地图匹配率」这个物理证据，σ 降为参考项。
+        # 详见 loc_quality.py 顶部的完整复盘。
+        # ==========================================================
+        # 地图障碍物膨胀半径（格）。2 格 = 10cm，容忍地图离散化与
+        # 定位小偏差。
+        self.declare_parameter('match_inflate_cells', 2)
+        # 匹配率门限：
+        #   good —— 达到此值 + 位姿稳定，即便 σ 超线也判收敛
+        #   min  —— σ 达标时，匹配率至少要有这么高
+        #   bad  —— 低于此值一票否决（无论 σ 多小）
+        self.declare_parameter('match_good_rate', 0.75)
+        self.declare_parameter('match_min_rate', 0.55)
+        self.declare_parameter('match_bad_rate', 0.40)
+        # 匹配率需要的最少有效束数 / 最少有效占比，不足则认为统计不可信
+        self.declare_parameter('match_min_samples', 40)
+        self.declare_parameter('match_min_coverage', 0.20)
+        # 位姿稳定性：连续 N 秒内位移 < move_tol 且转角 < rot_tol_deg
+        # 这就是用户说的「地图上的车头图标不动了」的代码化。
+        self.declare_parameter('stable_window_sec', 3.0)
+        self.declare_parameter('stable_move_tol_m', 0.05)
+        self.declare_parameter('stable_rot_tol_deg', 2.0)
+        # 激光相对 base_footprint 的平面偏移。
+        # 本项目 URDF: laser_joint xyz="0 0 0.075" → x/y 都是 0。
+        self.declare_parameter('laser_offset_x', 0.0)
+        self.declare_parameter('laser_offset_y', 0.0)
+        # 定位状态话题（JSON，供网页状态条与导航闸门使用）
+        self.declare_parameter('status_topic', '/localization_status')
+        self.declare_parameter('status_period_sec', 0.5)
+
         self.auto_global = bool(
             self.get_parameter('auto_global_localization').value)
         self.use_prior = bool(
@@ -235,6 +277,40 @@ class AutoLocalizer(Node):
         self.log_period = float(self.get_parameter('log_period_sec').value)
         self.scan_stale_sec = float(
             self.get_parameter('scan_stale_sec').value)
+
+        # ---------------- 定位质量评估（2026-11-01） ----------------
+        self._assessor = QualityAssessor(
+            cov_xy=self.converge_cov_xy,
+            cov_yaw=self.converge_cov_yaw,
+            good_rate=float(self.get_parameter('match_good_rate').value),
+            min_rate=float(self.get_parameter('match_min_rate').value),
+            bad_rate=float(self.get_parameter('match_bad_rate').value),
+        )
+        self._matcher = LaserMapMatcher(
+            min_samples=int(self.get_parameter('match_min_samples').value),
+            min_coverage=float(self.get_parameter('match_min_coverage').value),
+        )
+        self._stability = PoseStabilityTracker(
+            window_sec=float(self.get_parameter('stable_window_sec').value),
+            move_tol=float(self.get_parameter('stable_move_tol_m').value),
+            rot_tol_deg=float(self.get_parameter('stable_rot_tol_deg').value),
+        )
+        self._inflate_cells = int(
+            self.get_parameter('match_inflate_cells').value)
+        self._laser_offset_x = float(
+            self.get_parameter('laser_offset_x').value)
+        self._laser_offset_y = float(
+            self.get_parameter('laser_offset_y').value)
+        self._status_topic = str(
+            self.get_parameter('status_topic').value)
+        self._status_period = max(
+            0.1, float(self.get_parameter('status_period_sec').value))
+        self._grid = None            # MapGrid，收到地图后构建
+        self._latest_scan = None     # 最新一帧 LaserScan（匹配用）
+        self._match = None           # MatchResult
+        self._decision = None        # Decision
+        self._last_status_time = None
+        self._post_converge_low = 0  # 收敛后匹配率连续偏低计数
 
         # ---------------- 状态 ----------------
         self.state = self.STATE_WAITING_MAP
@@ -308,6 +384,10 @@ class AutoLocalizer(Node):
         self._initial_pose_pub = self.create_publisher(
             PoseWithCovarianceStamped,
             str(self.get_parameter('initial_pose_topic').value), 10)
+        # 定位状态（JSON 文本）。网页状态条和导航闸门都读它，
+        # 这样用户永远不需要问「好了没」。
+        self._status_pub = self.create_publisher(
+            String, self._status_topic, 10)
         self._global_loc_client = self.create_client(
             Empty, str(self.get_parameter('global_localization_service').value))
         self._nomotion_client = self.create_client(
@@ -356,6 +436,20 @@ class AutoLocalizer(Node):
         self._map_data = msg.data
         self._map_dims = (width, height, res, origin.x, origin.y)
 
+        # 构建匹配率用的栅格（带障碍物膨胀），只做一次
+        try:
+            self._grid = MapGrid(
+                msg.data, width, height, res, origin.x, origin.y,
+                inflate_cells=self._inflate_cells)
+            self.get_logger().info(
+                '激光-地图匹配器就绪：%dx%d 栅格，障碍物膨胀 %d 格（%.0fcm）'
+                % (width, height, self._inflate_cells,
+                   self._inflate_cells * res * 100))
+        except Exception as exc:                   # noqa: BLE001
+            self._grid = None
+            self.get_logger().warn(
+                '构建匹配栅格失败，将退化为仅用 σ 判断收敛: %s' % exc)
+
         free = sum(1 for v in msg.data if 0 <= v < 65)
         occ = sum(1 for v in msg.data if v >= 65)
         unknown = sum(1 for v in msg.data if v < 0)
@@ -402,6 +496,8 @@ class AutoLocalizer(Node):
     def _scan_callback(self, msg: LaserScan) -> None:
         self._scan_count += 1
         self._last_scan_time = self.get_clock().now()
+        # 缓存最新一帧供匹配率计算。471 束 ≈ 4KB，留一帧足够。
+        self._latest_scan = msg
         if self._scan_count == 1:
             self.get_logger().info(
                 '收到激光 %s：%d 束，量程 %.2f~%.2fm'
@@ -484,6 +580,11 @@ class AutoLocalizer(Node):
         now = self.get_clock().now()
         elapsed = self._elapsed()
 
+        # ★ 定位状态每 tick 都尝试发布（内部按 status_period 限流）。
+        #   放在最前面是为了让网页状态条在等待地图/服务阶段也有内容，
+        #   而不是一片空白。
+        self._publish_status()
+
         # ---------- 阶段 0：等启动延时 ----------
         if elapsed < self.startup_delay_sec:
             return
@@ -521,13 +622,15 @@ class AutoLocalizer(Node):
                 return
 
             self._maybe_request_nomotion(now)
+            # 先算匹配率，再判收敛（匹配率是主判据）
+            self._compute_match()
             self._evaluate_convergence(now, elapsed)
             if self._finished:      # 本轮已收敛，不再打"进行中"
                 return
             self._log_periodically(
-                '全局定位进行中（已 %.0fs，%s）：位姿=%s 协方差=%s'
+                '全局定位进行中（已 %.0fs，%s）：位姿=%s 协方差=%s %s'
                 % (elapsed, self._scan_status_text(),
-                   self._fmt_pose(), self._fmt_cov()))
+                   self._fmt_pose(), self._fmt_cov(), self._fmt_match()))
             return
 
         # ---------- 阶段 3：已收敛，继续盯塔缩 ----------
@@ -547,6 +650,34 @@ class AutoLocalizer(Node):
                 return
             # ★ C：稳定足够久就把恢复配额用回来，避免“3 次后永久放弃”
             self._maybe_rearm_collapse_recoveries(now)
+            # 收敛后仍然刷新匹配率，让网页状态条始终显示真实质量，
+            # 也便于发现「被抱走」这类突发情况。
+            self._compute_match()
+            self._check_post_converge_health()
+
+    # ============================================================
+    # 收敛后的健康监控
+    # ============================================================
+    def _check_post_converge_health(self) -> None:
+        """收敛后匹配率突然崩掉 → 大概率被抱走 / 地图被改。
+
+        只告警不自动改状态：导航可能正在进行中，贸然把 state 改回
+        CONVERGING 会让导航闸门在任务中途拒绝后续下单，反而更糟。
+        """
+        match = self._match
+        if match is None or match.rate is None:
+            return
+        if match.rate >= self._assessor.bad_rate:
+            self._post_converge_low = 0
+            return
+        self._post_converge_low = getattr(self, '_post_converge_low', 0) + 1
+        # 连续 3 次（约 1.5s）都很低才报，避免单帧噪声
+        if self._post_converge_low == 3:
+            self.get_logger().warn(
+                '⚠️ 收敛后激光匹配率降到 %.0f%%（低于否决线 %.0f%%）。'
+                '小车可能被移动过，或地图已被修改。\n'
+                '   如果小车确实被挪动，请重新「载入地图」触发全局定位。'
+                % (match.rate * 100, self._assessor.bad_rate * 100))
 
     # ============================================================
     # 动作
@@ -768,28 +899,37 @@ class AutoLocalizer(Node):
     # 收敛判定
     # ============================================================
     def _check_pose_on_map(self):
-        """校验当前位姿是否落在合理位置，识别「假收敛」。
+        """校验当前位姿是否落在合理位置。
 
-        ★ 为什么需要这一步：
-          协方差 σ 只反映**粒子云的一致性（precision）**，不反映
-          **准确性（accuracy）**。如果所有粒子都收敛到同一个错误位置，
-          σ 同样会很小——这就是 AMCL 经典的「假收敛」。
+        ==========================================================
+        ★ 2026-11-01 重写：从「单像素硬否决」改为「邻域 + 软硬区分」
+        ==========================================================
+        旧实现只看**一个 5cm 栅格**：
+            val = self._map_data[row * width + col]
+            if val < 0:  return False, '位姿落在未知区域'
+        两个致命问题：
 
-          静止时特别容易发生：缺少新观测去证伪那个错误的共识。
-          实测就踩到过：σ_xy 已经 0.049，但位置是错的，必须移动
-          一段时间才纠正过来。
+        1. 这张图 **67.9% 是未知区**，位姿那一个格子很容易落在灰色
+           区域。于是正确位姿被反复判「假收敛」→ 永远不收敛 →
+           120s 超时重撒 → 位姿全图乱飘。本次事故的主线就是这个。
+        2. 单像素没有冗余，边界噪声一来判定就翻转。
 
-          这里用两个廉价但有效的判据：
-            1. 位姿是否落在**已知区域**（未知区 = 地图没覆盖，不可信）
-            2. 位姿是否落在**障碍物上**（物理上不可能）
+        新实现：
+          * 查 (2*radius+1)² 邻域，只要有**任意一格**是已知空闲就算通过
+            —— 容忍地图离散化与定位小偏差。
+          * 区分「软失败」与「硬失败」：
+              硬失败（物理不可能）：落在墙上 / 地图外 → 仍然否决
+              软失败（只是图不全）  ：邻域全是未知区   → 只提示不否决
+            因为现在有激光匹配率这个更强的物理证据，地图覆盖不全
+            不该再一票否决正确位姿。
 
         Returns:
-            (是否可信, 说明字符串)
+            (是否可信, 说明字符串, 是否硬失败)
         """
         if self._map_data is None or self._map_dims is None:
-            return True, '（无地图数据，跳过校验）'
+            return True, '（无地图数据，跳过校验）', False
         if self._latest_pose is None:
-            return True, '（无位姿）'
+            return True, '（无位姿）', False
 
         width, height, res, ox, oy = self._map_dims
         x, y, _ = self._latest_pose
@@ -806,26 +946,40 @@ class AutoLocalizer(Node):
         # 旧代码照搬了「直接读 PGM 文件」的写法，又翻了一次：
         #     row = height - 1 - int((y - oy) / res)
         # 结果读到的是**上下镜像**的像素。
-        #
-        # 实测后果（room1 地图，67.9% 是未知灰）：
-        #   真实位姿 (0.34, -0.07) 正确地落在一片全 254(空闲) 的区域，
-        #   镜像后读到的却是上方 205(未知) 的像素，于是判「假收敛」，
-        #   永远不收敛 → 120s 超时 → 全局重撒 → 位姿瞬移 1.8m，
-        #   然后每 120 秒循环一次。本次 trace 里的 1.83m 跳变就是这个。
         # ==========================================================
         col = int((x - ox) / res)
         row = int((y - oy) / res)
 
         if not (0 <= col < width and 0 <= row < height):
-            return False, '位姿在地图范围之外 (%.2f, %.2f)' % (x, y)
+            return False, '位姿在地图范围之外 (%.2f, %.2f)' % (x, y), True
 
-        val = self._map_data[row * width + col]
-        if val < 0:
-            return False, '位姿落在未知区域（地图没覆盖这里）'
-        if val >= 65:
-            return False, '位姿落在障碍物上（物理上不可能）'
-        return True, '位姿位于已知空闲区域（栅格值 %d / 栅格 %d,%d）' % (
-            val, col, row)
+        radius = 2
+        saw_free = False
+        saw_occupied = False
+        saw_unknown = False
+        for dy in range(-radius, radius + 1):
+            r = row + dy
+            if not (0 <= r < height):
+                continue
+            base = r * width
+            for dx in range(-radius, radius + 1):
+                c = col + dx
+                if not (0 <= c < width):
+                    continue
+                val = self._map_data[base + c]
+                if val < 0:
+                    saw_unknown = True
+                elif val >= 65:
+                    saw_occupied = True
+                else:
+                    saw_free = True
+
+        if saw_free:
+            return (True,
+                    '位姿位于已知空闲区域（栅格 %d,%d）' % (col, row), False)
+        if saw_occupied:
+            return (False, '位姿落在障碍物上（物理上不可能）', True)
+        return (False, '位姿邻域全是未知区域（地图没覆盖这里）', False)
 
     def _check_collapse(self, now) -> bool:
         """检测并处理粒子塔缩。返回 True 表示当前正处于塔缩状态。
@@ -935,8 +1089,31 @@ class AutoLocalizer(Node):
         std_xy = math.sqrt(max(0.0, max(var_x, var_y)))
         std_yaw = math.sqrt(max(0.0, var_yaw))
 
-        if std_xy > self.converge_cov_xy or std_yaw > self.converge_cov_yaw:
+        # ---- 位姿稳定性（B）：把"地图上的车头图标不动了"写成代码 ----
+        stable, stable_sec = self._stability.update(
+            self._elapsed(), self._latest_pose)
+
+        # ---- 激光-地图匹配率（A）：471 束激光共同投票 ----
+        match = self._match
+        if match is None:
+            match = self._compute_match()
+
+        # ---- 综合判定（C：σ 从硬门槛降为参考项） ----
+        decision = self._assessor.assess(
+            std_xy, std_yaw, match, stable, stable_sec)
+        self._decision = decision
+
+        if not decision.converged:
             self._converged_since = None
+            # ★ 物理否决时给出一次性告警：这种情况是"位姿真的错了"，
+            #   和"再等等"完全不同，必须让用户看见。
+            if decision.veto and not self._fake_converge_warned:
+                self._fake_converge_warned = True
+                self.get_logger().warn(
+                    '⚠️ %s\n   这与「收敛慢」是两回事：粒子云可能已经'
+                    '收敛到一个错误位置。\n   建议缓慢原地转动小车'
+                    '（转动比走直线更能消除角度歧义）。'
+                    % decision.reason)
             return
 
         if self._converged_since is None:
@@ -947,30 +1124,44 @@ class AutoLocalizer(Node):
         if held < self.converge_hold_sec:
             return
 
-        # 收敛前先做「假收敛」校验：σ 小不等于位置对
-        ok, why = self._check_pose_on_map()
+        # 收敛前再确认一次「位姿没有落在障碍物上」。
+        #
+        # ★ 2026-11-01 修订：这一步从「硬否决」降级为「只否决物理上
+        #   不可能的情况」。
+        #   原来它只查一个 5cm 栅格，位姿落在那一个格子是未知区就否掉，
+        #   而这张图 67.9% 是未知区 —— 于是正确位姿被反复否掉，
+        #   永远不收敛 → 120s 重撒 → 位姿全图乱飘（本次事故主线）。
+        #   现在「落在未知区」只记一次提示，不再否决；
+        #   真正否决的只剩「落在墙上/地图外」这种物理不可能。
+        ok, why, hard = self._check_pose_on_map()
         if not ok:
-            if not self._fake_converge_warned:
-                self._fake_converge_warned = True
-                self.get_logger().warn(
-                    '⚠️ 疑似「假收敛」：粒子云已经很集中（σ_xy=%.3fm），'
-                    '但%s。\n'
-                    '   σ 只代表粒子一致性，不代表位置正确。静止时缺少新'
-                    '观测证伪错误共识，很容易出现这种情况。\n'
-                    '   建议：缓慢原地转动小车（转动比走直线更能消除角度'
-                    '歧义），或考虑重建一张覆盖完整的图。'
-                    % (std_xy, why))
-            # 不判定收敛，继续等待更可靠的共识
-            self._converged_since = None
-            return
+            if hard:
+                if not self._fake_converge_warned:
+                    self._fake_converge_warned = True
+                    self.get_logger().warn(
+                        '⚠️ 位姿物理上不成立：%s。不判定收敛。' % why)
+                self._converged_since = None
+                return
+            if not self._blocked_by_map_warned:
+                self._blocked_by_map_warned = True
+                self.get_logger().info(
+                    '位姿落在未知区域（%s），但激光匹配率%s，'
+                    '判定可信 —— 这只是地图覆盖不全，不影响导航'
+                    % (why,
+                       '不可用' if match is None or match.rate is None
+                       else '%.0f%%' % (match.rate * 100)))
 
         self.state = self.STATE_CONVERGED
         self._converged_at = now
         self.get_logger().info(
             '✅ 定位已收敛（用时 %.1fs）：位姿=%s σ_xy=%.3fm σ_yaw=%.1f°, '
-            'nomotion 请求 %d 次；%s'
+            '匹配率=%s，%s；nomotion 请求 %d 次'
             % (elapsed, self._fmt_pose(), std_xy,
-               math.degrees(std_yaw), self._nomotion_requests, why))
+               math.degrees(std_yaw),
+               '不可用' if match is None or match.rate is None
+               else '%.0f%%（%d/%d）'
+               % (match.rate * 100, match.hit, match.hit + match.miss),
+               decision.reason, self._nomotion_requests))
 
         # ==========================================================
         # ★ 收敛后**不再终止节点**（2026-10-31 修订）
@@ -989,6 +1180,111 @@ class AutoLocalizer(Node):
             '收敛后继续监控：σ 涨过够用线(%.3fm)就恢复 nomotion 刷新 '
             'map→odom，σ 降下去就自动暂停粒子云'
             % self.good_enough_cov_xy)
+
+    # ============================================================
+    # 定位质量评估（2026-11-01）
+    # ============================================================
+    def _compute_match(self):
+        """用当前位姿 + 最新激光算一次「激光-地图匹配率」。
+
+        为什么值得每 0.5s 算一遍：
+          这是唯一能区分「σ 小但位置错」的物理证据。471 束激光一起
+          投票，比 σ 那种"粒子自己跟自己一致"的指标可靠得多。
+          代价：一次遍历 471 束（大多数只做 1 次栅格查找），
+          实测在 2Hz 下可忽略。
+        """
+        self._match = None
+        if self._grid is None or self._latest_pose is None:
+            return None
+        scan = self._latest_scan
+        if scan is None or not self._scan_ok():
+            return None
+        try:
+            self._match = self._matcher.evaluate(
+                self._grid, self._latest_pose, scan.ranges,
+                angle_min=float(scan.angle_min),
+                angle_increment=float(scan.angle_increment),
+                range_min=float(scan.range_min),
+                range_max=float(scan.range_max),
+                laser_offset_x=self._laser_offset_x,
+                laser_offset_y=self._laser_offset_y,
+            )
+        except Exception as exc:                   # noqa: BLE001
+            self.get_logger().warn('匹配率计算失败（忽略本轮）: %s' % exc)
+            self._match = None
+        return self._match
+
+    # --------------------------------------------------------
+    def _build_status(self) -> StatusSnapshot:
+        """汇总成一份可发布的定位状态。"""
+        var_x = var_y = var_yaw = None
+        if self._latest_cov is not None:
+            var_x, var_y, var_yaw = self._latest_cov
+
+        std_xy = None
+        std_yaw_deg = None
+        if var_x is not None:
+            std_xy = math.sqrt(max(0.0, max(var_x, var_y)))
+            std_yaw_deg = math.degrees(math.sqrt(max(0.0, var_yaw)))
+
+        match = self._match
+        decision = self._decision
+        # ★ 不在这里调 update()：_evaluate_convergence 已经用同一时刻
+        #   的位姿喂过一次了，再喂一次会让窗口里出现重复样本。
+        stable, stable_sec = self._stability.last
+
+        snap = StatusSnapshot(
+            state=self.state,
+            ready=(self.state == self.STATE_CONVERGED),
+            progress=(decision.progress if decision is not None else 0.0),
+            reason=(decision.reason if decision is not None else ''),
+            hint=(decision.hint if decision is not None else ''),
+            std_xy=std_xy,
+            std_yaw_deg=std_yaw_deg,
+            sigma_ok=bool(decision.sigma_ok) if decision else
+            (std_xy is not None and std_xy <= self.converge_cov_xy),
+            stable=stable,
+            stable_sec=stable_sec,
+            scan_ok=self._scan_ok(),
+        )
+        if match is not None:
+            snap.match_rate = match.rate
+            snap.match_ok = bool(decision.match_ok) if decision else False
+            snap.hit = match.hit
+            snap.miss = match.miss
+            snap.unknown = match.unknown
+            snap.coverage = match.coverage
+        if self._latest_pose is not None:
+            px, py, pyaw = self._latest_pose
+            snap.pose = {'x': round(px, 3), 'y': round(py, 3),
+                         'yaw_deg': round(math.degrees(pyaw), 1)}
+        snap.extra = {
+            'elapsed': round(self._elapsed(), 1),
+            'timeout_sec': self.timeout_sec,
+            'inflate_cells': self._inflate_cells,
+        }
+        return snap
+
+    def _publish_status(self) -> None:
+        """发布 /localization_status（JSON）。
+
+        网页状态条和 nav_manager 的导航闸门都靠它，这样
+        用户永远不必反复问「定位好了没」。
+        """
+        now = self.get_clock().now()
+        if self._last_status_time is not None:
+            age = (now - self._last_status_time).nanoseconds / 1e9
+            if age < self._status_period:
+                return
+        self._last_status_time = now
+        try:
+            payload = json.dumps(self._build_status().as_dict(),
+                                 ensure_ascii=False)
+            msg = String()
+            msg.data = payload
+            self._status_pub.publish(msg)
+        except Exception as exc:                   # noqa: BLE001
+            self.get_logger().warn('发布定位状态失败: %s' % exc)
 
     def _check_scan_health(self) -> None:
         """激光消失时立即告警一次 —— 没有激光，全局定位不可能收敛。
@@ -1021,7 +1317,11 @@ class AutoLocalizer(Node):
         # ★ 粒子云已经够集中时，绝不能再全局重撒（2026-10-31）
         # ----------------------------------------------------------
         # 之前只要「没进 CONVERGED」就无脑重撒。但没进 CONVERGED 有
-        # 两种完全不同的原因：
+        # ========================================================
+        # ★ 粒子云已经够好时，绝不能再全局重撒（2026-10-31）
+        # --------------------------------------------------------
+        # 之前只要「没进 CONVERGED」就无脑重撒。但没进 CONVERGED
+        # 有两种完全不同的原因：
         #   (a) 粒子云真的没收敛      → 重撒是对的
         #   (b) 粒子云已经很集中，只是**地图校验**不通过（例如位姿落在
         #       未知区）            → 重撒是灾难
@@ -1030,25 +1330,27 @@ class AutoLocalizer(Node):
         # 位姿瞬间跳 1.83m，然后重新收敛、再次超时、再次跳走 ——
         # 每 120 秒循环一次。用户看到的就是「车自己隔一会儿蹦一下」。
         #
-        # 所以：σ 已达标的场合，只告警不重撒，也不终止（保留监控）。
-        # 真正的修法是换一张覆盖完整的地图。
+        # 2026-11-01 补充：这个分支原先只挡 σ 达标的情况，
+        # 而事故里 σ=0.112m 差 0.032m 就没被挡住，照样重撒乱飘。
+        # 现在把「匹配率高 + 位姿稳定」也算进来 —— 物理证据足够强时
+        # 同样不许重撒。见下面的 almost_converge_scale 分支。
         # ==========================================================
         if self._cov_below_converge():
             if not self._blocked_by_map_warned:
                 self._blocked_by_map_warned = True
-                _, why = self._check_pose_on_map()
+                _, why, _hard = self._check_pose_on_map()
                 self.get_logger().error(
                     '⚠️ 粒子云已经很集中（σ_xy=%.3fm σ_yaw=%.1f°），却无法'
                     '判定收敛：%s\n'
-                    '   这不是定位算法的问题，而是**地图覆盖不全**：位姿落在'
-                    '地图未知/障碍区域。\n'
                     '   已**不做**全局重撒 —— 那会把这个本来正确的位姿直接'
                     '扔掉，造成米级瞬移。\n'
-                    '   正确做法：换一张建图时覆盖完整的图，或重新建图。'
+                    '   当前 %s\n'
+                    '   若地图未知区过多，建议重建一张覆盖完整的图。'
                     % (math.sqrt(max(0.0, max(self._latest_cov[0],
                                               self._latest_cov[1]))),
                        math.degrees(math.sqrt(max(0.0,
-                                                  self._latest_cov[2]))), why))
+                                                  self._latest_cov[2]))),
+                       why, self._fmt_match()))
             # 不重撒、不终止，继续盯着（若换图/移动后恢复正常会自动收敛）
             self._start_time = self.get_clock().now()
             self._converged_since = None
@@ -1080,6 +1382,30 @@ class AutoLocalizer(Node):
                                               self._latest_cov[1]))),
                        math.degrees(math.sqrt(max(0.0, self._latest_cov[2]))),
                        self.converge_cov_xy))
+            self._start_time = self.get_clock().now()
+            self._converged_since = None
+            return
+
+        # ========================================================
+        # ★ 物理证据很强时同样不许重撒（2026-11-01 新增）
+        # --------------------------------------------------------
+        # 上一条只看 σ。但 σ 可能因为粒子略散而超线，而位姿其实一直是
+        # 对的 —— 事故里 σ=0.112m / 收敛线 0.08m 就是这种情况，
+        # 差 0.032m 没被上一条挡住，120s 一到照样重撒、照样乱飘。
+        #
+        # 现在加一条：**匹配率 ≥ good_rate 且位姿稳定**，说明激光与地图
+        # 高度吻合、估计值也不再变化，这时重撒纯属破坏。
+        # ========================================================
+        match = self._match
+        stable, _stable_sec = self._stability.last
+        if (match is not None and match.rate is not None
+                and match.rate >= self._assessor.good_rate and stable):
+            if self._nearly_converged_reported < 3:
+                self._nearly_converged_reported += 1
+                self.get_logger().info(
+                    '已 %.0fs 未达标，但激光匹配 %.0f%% 且位姿已稳定，'
+                    '**不重撒**（σ 只是参考项，物理证据更可靠）'
+                    % (elapsed, match.rate * 100))
             self._start_time = self.get_clock().now()
             self._converged_since = None
             return
@@ -1154,6 +1480,17 @@ class AutoLocalizer(Node):
         return '(σ_xy=%.3fm, σ_yaw=%.1f°)' % (
             math.sqrt(max(0.0, max(var_x, var_y))),
             math.degrees(math.sqrt(max(0.0, var_yaw))))
+
+    def _fmt_match(self) -> str:
+        """匹配率的一行描述。"""
+        m = self._match
+        if m is None:
+            return '(匹配率：无激光/无地图)'
+        if m.rate is None:
+            return '(匹配率：样本不足 hit=%d miss=%d unk=%d)' % (
+                m.hit, m.miss, m.unknown)
+        return '(匹配率=%.0f%% 命中%d/%d, 覆盖率%.0f%%)' % (
+            m.rate * 100, m.hit, m.hit + m.miss, m.coverage * 100)
 
     def _log_periodically(self, message: str) -> None:
         now = self.get_clock().now()

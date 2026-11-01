@@ -31,6 +31,7 @@ navigation_service.py
   - 支持连续导航（不重复初始化）
 """
 
+import json
 import math
 import os
 import threading
@@ -111,6 +112,10 @@ class NavigationService:
         self._pose_latest = None        # {'x','y','yaw'}
         self._pose_stamp = None         # time.time()
         self._pose_std = None           # (σ_xy, σ_yaw) 供定位质量判断
+        # /localization_status（auto_localizer 发的 JSON）缓存。
+        # 里面有激光-地图匹配率、位姿稳定性、进度等，比只看 σ 靠谱得多。
+        self._loc_status = None
+        self._loc_status_stamp = None
         self._pose_ready = False
         self._pose_lock = threading.Lock()
         try:
@@ -119,12 +124,13 @@ class NavigationService:
             print('[NavigationService] ⚠️ 启动 /amcl_pose 监听失败: %s' % exc)
 
     def _start_pose_monitor(self):
-        """创建独立节点订阅 /amcl_pose，并用后台线程 spin。"""
+        """创建独立节点订阅 /amcl_pose 与 /localization_status，后台线程 spin。"""
         self._ensure_rclpy()
 
         from geometry_msgs.msg import PoseWithCovarianceStamped
         from rclpy.executors import SingleThreadedExecutor
         from rclpy.node import Node
+        from std_msgs.msg import String
 
         class _PoseMonitor(Node):
             def __init__(monitor_self, svc):
@@ -133,6 +139,11 @@ class NavigationService:
                 monitor_self.sub = monitor_self.create_subscription(
                     PoseWithCovarianceStamped, '/amcl_pose',
                     monitor_self._cb, 10)
+                # 定位质量状态：auto_localizer 每 0.5s 发一次 JSON。
+                # ★ 用 RELIABLE（默认 QoS）：发布端也是默认值，匹配。
+                monitor_self.loc_sub = monitor_self.create_subscription(
+                    String, '/localization_status',
+                    monitor_self._loc_cb, 10)
                 monitor_self.get_logger().info(
                     'amcl_pose_monitor 已启动（独立 spin，供位置查询使用）')
 
@@ -154,6 +165,18 @@ class NavigationService:
                         'x': float(p.x), 'y': float(p.y), 'yaw': float(yaw)}
                     monitor_self._svc._pose_stamp = time.time()
                     monitor_self._svc._pose_std = (std_xy, std_yaw)
+
+            def _loc_cb(monitor_self, msg):
+                """缓存 /localization_status。解析失败就忽略这一帧。"""
+                try:
+                    data = json.loads(msg.data)
+                except Exception:       # noqa: BLE001
+                    return
+                if not isinstance(data, dict):
+                    return
+                with monitor_self._svc._pose_lock:
+                    monitor_self._svc._loc_status = data
+                    monitor_self._svc._loc_status_stamp = time.time()
 
         self._pose_node = _PoseMonitor(self)
         self._pose_executor = SingleThreadedExecutor()
@@ -493,6 +516,18 @@ class NavigationService:
 
         结论：**定位没收敛就不该允许导航**。这个判断必须放在代码层，
         不能指望用户或 AI 自己去注意日志。
+
+        ============================================================
+        2026-11-01 二次修订：优先用 /localization_status
+        ============================================================
+        只看 σ 会两头出错：
+          * 真收敛了但 σ 因为粒子略散而超线 → 误挡（事故里 σ=0.112m）
+          * 假收敛了但 σ 很小               → 误放
+        现在优先读 auto_localizer 发的 /localization_status，里面有
+        激光-地图匹配率这个物理证据，以及 auto_localizer 自己的综合
+        判定（ready / reason / hint）。
+
+        状态话题不可用（auto_localizer 没在跑）时，退回只看 σ。
         """
         ok_xy = float(os.environ.get('FISHBOT_LOC_OK_STD_XY', '0.30'))
         ok_yaw = float(os.environ.get('FISHBOT_LOC_OK_STD_YAW', '0.30'))
@@ -500,7 +535,47 @@ class NavigationService:
         with self._pose_lock:
             stamp = self._pose_stamp
             std = self._pose_std
+            status = dict(self._loc_status) if self._loc_status else None
+            status_stamp = self._loc_status_stamp
 
+        # ---------- 路线 1：有 /localization_status ----------
+        if status is not None and status_stamp is not None:
+            if time.time() - status_stamp <= 5.0:   # 发布周期 0.5s
+                ready = bool(status.get('ready'))
+                std_xy = status.get('std_xy')
+                std_xy = None if std_xy is None else float(std_xy)
+                std_yaw_deg = status.get('std_yaw_deg')
+                std_yaw = (None if std_yaw_deg is None
+                           else float(std_yaw_deg) / 57.29578)
+                reason = str(status.get('reason') or '')
+                if ready:
+                    extra = []
+                    mr = status.get('match_rate')
+                    if mr is not None:
+                        extra.append('激光匹配率 %.0f%%' % (float(mr) * 100))
+                    if std_xy is not None:
+                        extra.append('σ_xy %.3fm' % std_xy)
+                    return (True, std_xy, std_yaw,
+                            '定位已就绪'
+                            + ('（%s）' % '，'.join(extra) if extra else ''))
+
+                # 未就绪：把原因说清楚，别只甩一句"未收敛"
+                parts = []
+                if reason:
+                    parts.append(reason)
+                mr = status.get('match_rate')
+                if mr is not None:
+                    parts.append('激光匹配率 %.0f%%' % (float(mr) * 100))
+                if std_xy is not None:
+                    parts.append('σ_xy %.3fm' % std_xy)
+                hint = str(status.get('hint') or '')
+                msg = '定位未就绪' + ('：' + '，'.join(parts) if parts else '')
+                if hint:
+                    msg += '\n   ' + hint
+                return False, std_xy, std_yaw, msg
+            # 话题过期：auto_localizer 可能已经停了，继续走 σ 路线
+
+        # ---------- 路线 2：没有状态话题，只能看 σ ----------
         if stamp is None or std is None:
             # 从没收到过 /amcl_pose：可能是 AMCL 刚重启。
             # 此时无法判断，放行（否则每次冷启动都导航不了）。
@@ -519,6 +594,22 @@ class NavigationService:
                 '定位未收敛（σ_xy=%.2fm σ_yaw=%.1f°，门限 %.2fm/%.1f°）'
                 % (std_xy, std_yaw * 57.29578,
                    ok_xy, ok_yaw * 57.29578))
+
+    def get_localization_status_raw(self):
+        """返回 /localization_status 的原始 dict（供网页状态条使用）。
+
+        没有数据或已过期（>5s）时返回 None。
+        """
+        with self._pose_lock:
+            status = dict(self._loc_status) if self._loc_status else None
+            stamp = self._loc_status_stamp
+        if status is None or stamp is None:
+            return None
+        age = time.time() - stamp
+        if age > 5.0:
+            return None
+        status['age'] = round(age, 2)
+        return status
 
     def get_target_points(self) -> list:
         """

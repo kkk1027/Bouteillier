@@ -1614,8 +1614,38 @@ class CarController(Node):
             self.pose_callback,
             10
         )
-        
+
+        # ============================================================
+        # 定位质量状态（2026-11-01）
+        # ------------------------------------------------------------
+        # auto_localizer 每 0.5s 发一次 JSON，内含激光-地图匹配率、
+        # 位姿稳定性、进度和给用户看的原因/建议。
+        # 直接转给前端，这样网页顶部的定位状态条能实时显示
+        # 「还要等多久 / 为什么没好 / 该怎么帮着收敛」，
+        # 用户不需要反复问「好了没」。
+        # ============================================================
+        try:
+            from std_msgs.msg import String as _RosString
+            self.loc_status_subscription = self.create_subscription(
+                _RosString, '/localization_status',
+                self.loc_status_callback, 10)
+        except Exception as exc:            # noqa: BLE001
+            self.loc_status_subscription = None
+            self.get_logger().warn(f"订阅 /localization_status 失败: {exc}")
+
         self.get_logger().info("ROS2节点初始化完成，已订阅/map和/amcl_pose")
+
+    def loc_status_callback(self, msg):
+        """把 auto_localizer 的定位状态转发到网页。
+
+        ★ 这里不解析、不改写，原样透传 JSON —— 解析逻辑只保留一份在
+          auto_localizer 里，避免前后端各有一套"什么算收敛"的判据。
+        """
+        try:
+            self.socketio.emit('loc_status', {'raw': msg.data})
+        except Exception as exc:            # noqa: BLE001
+            self.get_logger().debug(f'定位状态转发失败: {exc}')
+
     def battery_callback(self, msg):
         """电池电量回调"""
         self.current_battery = msg.data

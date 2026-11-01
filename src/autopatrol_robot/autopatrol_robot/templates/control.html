@@ -7,6 +7,37 @@
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="default">
     <title>Bouteillier Home-家居巡检机器人系统</title>
+
+    <!-- ==================== PWA：添加到主屏幕 ====================
+         下面这些全部是「增强」，浏览器不支持也不影响页面使用。
+
+         ★ 决定「像不像 App」的是 apple-mobile-web-app-capable：
+           iOS 从主屏图标启动时进入独立全屏（无地址栏/无工具栏）。
+           它 **不要求 HTTPS** —— 所以 http://172.20.10.5:5000
+           这种明文局域网地址下同样生效，这正是选 PWA 而非签名的理由。
+
+         ★ apple-mobile-web-app-status-bar-style 保持 default：
+           状态栏不压到内容上，.topbar 的 top:0 就不用改。
+           换成 black-translucent 会全屏延伸，但需要给 .topbar
+           加 safe-area-inset-top，改动面大、风险高，不值得。
+
+         ★ apple-touch-icon 必须是不透明的方形 PNG（不要自己切圆角），
+           iOS 会自己套遮罩。图标由 scripts/make_pwa_icons.py 生成。
+         ============================================================ -->
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="Bouteillier">
+    <meta name="application-name" content="Bouteillier">
+    <meta name="theme-color" content="#f08c3c">
+
+    <link rel="manifest" href="/manifest.json">
+    <link rel="icon" type="image/png" sizes="192x192"
+          href="/static/icons/icon-192.png">
+    <link rel="icon" type="image/png" sizes="512x512"
+          href="/static/icons/icon-512.png">
+    <link rel="apple-touch-icon" sizes="180x180"
+          href="/static/icons/apple-touch-icon-180.png">
+    <link rel="apple-touch-icon"
+          href="/static/icons/apple-touch-icon-180.png">
     <style>
         .container {
             max-width: 1400px;
@@ -2171,6 +2202,92 @@
 
         .status-float .status-dot { width: 8px; height: 8px; }
 
+        /* ============================================================
+           定位状态条（2026-11-01）
+           ------------------------------------------------------------
+           解决的核心痛点：「小车位姿看起来收敛了，实际却没有」——
+           用户只能一遍遍问"好了没"。
+           现在把 auto_localizer 算出来的激光-地图匹配率、σ、位姿稳定性
+           和进度实时摊开给人看，还直接告诉用户"该怎么帮着收敛"。
+           ============================================================ */
+        .loc-bar {
+            position: fixed;
+            left: 50%;
+            transform: translateX(-50%);
+            top: 10px;
+            z-index: 60;
+            width: min(430px, calc(100vw - 190px));
+            padding: 7px 13px 8px;
+            border-radius: 14px;
+            background: rgba(255, 250, 243, 0.94);
+            backdrop-filter: blur(10px);
+            border: 1px solid var(--w-line);
+            box-shadow: 0 6px 18px rgba(150, 105, 62, 0.14);
+            font-size: 11.5px;
+            color: var(--w-sub);
+            /* 收起状态：只留一条细边，不挡视线 */
+            transition: opacity .25s ease, transform .25s ease;
+        }
+        .loc-bar.is-hidden { opacity: 0; pointer-events: none; }
+        .loc-bar.is-ready  { border-color: #b7d9a8; }
+        .loc-bar.is-bad    { border-color: #e0a99b; }
+
+        .loc-head {
+            display: flex;
+            align-items: center;
+            gap: 7px;
+            white-space: nowrap;
+        }
+        .loc-dot {
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            flex: 0 0 auto;
+            background: #d9c8b3;
+            box-shadow: 0 0 0 3px rgba(217, 200, 179, .22);
+            transition: background .25s ease, box-shadow .25s ease;
+        }
+        .loc-dot.is-ready { background: #5fa845; box-shadow: 0 0 0 3px rgba(95,168,69,.18); }
+        .loc-dot.is-bad   { background: #d0664f; box-shadow: 0 0 0 3px rgba(208,102,79,.18); }
+        .loc-dot.is-busy  { background: #e0a33c; box-shadow: 0 0 0 3px rgba(224,163,60,.18); }
+
+        .loc-title { color: var(--w-ink); font-weight: 600; }
+        .loc-meta  { margin-left: auto; font-variant-numeric: tabular-nums; }
+
+        .loc-track {
+            margin-top: 5px;
+            height: 4px;
+            border-radius: 999px;
+            background: #f1e5d5;
+            overflow: hidden;
+        }
+        .loc-fill {
+            height: 100%;
+            width: 0%;
+            border-radius: 999px;
+            background: linear-gradient(90deg, #e0a33c, #5fa845);
+            transition: width .3s ease;
+        }
+        .loc-bar.is-ready .loc-fill { background: #5fa845; }
+
+        /* 原因/建议：只在没就绪时出现，就绪后自动收起省地方 */
+        .loc-reason {
+            margin-top: 4px;
+            line-height: 1.45;
+            color: var(--w-sub);
+            display: none;
+        }
+        .loc-reason.is-on { display: block; }
+        .loc-reason b { color: var(--w-ink); font-weight: 600; }
+
+        @media (max-width: 640px) {
+            .loc-bar {
+                width: calc(100vw - 120px);
+                padding: 6px 10px 7px;
+                font-size: 10.5px;
+            }
+            .loc-reason { font-size: 10.5px; }
+        }
+
         /* 操作页里 chat-shell 要给顶部胶囊留位置 */
         .view-app .chat-shell { inset: 0; }
 
@@ -2994,8 +3111,149 @@
             82%  { transform: translateY(-6px) scale(0.98, 1.02); }
             100% { transform: translateY(0) scale(1, 1); }
         }
+
+        /* ============================================================
+           遥控面板：内部尺寸整体减半
+           ------------------------------------------------------------
+           改造前在 390px 宽的手机上量的实际尺寸：
+             面板宽 365px、高 486px（占屏幕 58%），
+             摇杆底座 220px、摇杆头 80px
+           底座比屏幕窄边的一半还宽，把地图挤得只剩一条缝。
+
+           这里把面板及其内部几何按 1/2 缩放。
+
+           ★ 为什么全部加 .widget[data-widget="joystick"] 前缀
+             .widget-head / .widget-title / .widget-badge /
+             .widget-close / .widget-body 是三个浮层共用的类，
+             不限定就会把摄像头和地图面板一起缩小。
+
+           ★ 为什么放在样式表最后
+             靠源码顺序压过上面那些通用规则和 @media(max-width:900px)
+             里的 ".widget[data-widget=joystick]{width:100vw-20px}"，
+             这样不用回头改上千行旧 CSS，日后想调也只改这一块。
+
+           ★ 字号没有严格减半
+             13.5px 的一半是 6.75px，根本看不清。所以：
+             几何尺寸（摇杆、间距、内边距）严格 1/2，
+             字号按 ~80% 收并保留可读下限（正文不老于 11px）。
+           ============================================================ */
+
+        /* ---- 面板容器 ---- */
+        .widget[data-widget="joystick"] {
+            width: 200px;
+        }
+
+        /* 手机竖屏：不再撑满宽度，留给地图看 ---- */
+        @media (max-width: 900px) {
+            .widget[data-widget="joystick"] {
+                width: min(200px, calc(100vw - 20px));
+            }
+        }
+
+        /* ---- 标题栏 ---- */
+        .widget[data-widget="joystick"] .widget-head {
+            gap: 5px;
+            padding: 6px 7px 6px 8px;
+        }
+
+        .widget[data-widget="joystick"] .widget-title {
+            gap: 4px;
+            font-size: 11px;
+        }
+
+        .widget[data-widget="joystick"] .widget-badge {
+            font-size: 9px;
+            padding: 1px 5px;
+        }
+
+        .widget[data-widget="joystick"] .widget-close {
+            width: 20px;
+            height: 20px;
+            border-radius: 6px;
+            font-size: 12px;
+        }
+
+        /* ---- 内容区 ---- */
+        .widget[data-widget="joystick"] .widget-body {
+            padding: 8px;
+        }
+
+        /* ---- 摇杆：220 → 110 ---- */
+        .widget[data-widget="joystick"] .joystick-base {
+            width: 110px;
+            height: 110px;
+            /* 投影跟着缩，否则小圆盘拖着一团大阴影显得脏 */
+            box-shadow:
+                0 5px 10px rgba(160, 112, 60, 0.20),
+                inset 0 1px 2px rgba(255, 255, 255, 0.92),
+                inset 0 -2px 5px rgba(214, 168, 116, 0.28);
+        }
+
+        /* ---- 摇杆头：80 → 40 ---- */
+        .widget[data-widget="joystick"] .joystick-thumb {
+            width: 40px;
+            height: 40px;
+            font-size: 14px;
+            box-shadow:
+                0 2px 6px rgba(160, 112, 60, 0.28),
+                inset 0 -1px 3px rgba(210, 158, 100, 0.35);
+        }
+
+        /* ---- 方向提示 ---- */
+        .widget[data-widget="joystick"] .direction-indicator {
+            margin-top: 6px;
+            padding: 3px 8px;
+            font-size: 11px;
+        }
+
+        /* ---- 速度滑块 ---- */
+        .widget[data-widget="joystick"] .speed-item {
+            margin-bottom: 10px;
+        }
+
+        .widget[data-widget="joystick"] .speed-item label {
+            margin-bottom: 4px;
+            font-size: 11px;
+        }
+
+        /* 轨道比原来略高（5 → 4 太细手指不好描）
+           滑块的拖动性比视觉等比重要，这里只缩到 4px */
+        .widget[data-widget="joystick"] input[type="range"] {
+            height: 4px;
+            border-radius: 4px;
+        }
+
+        .widget[data-widget="joystick"] input[type="range"]::-webkit-slider-thumb {
+            width: 12px;
+            height: 12px;
+        }
+
+        .widget[data-widget="joystick"] input[type="range"]::-moz-range-thumb {
+            width: 12px;
+            height: 12px;
+        }
     </style>
-    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <!-- ==================== Socket.IO 客户端 ====================
+         原来直连 cdn.socket.io。问题：手机开热点时如果蜂窝信号差/被墙，
+         这个 44KB 的公网请求一旦失败，整个控制台直接白屏 ——
+         而机器人本身就在局域网里，根本不需要联网。
+
+         改为「本地优先 + CDN 兜底」：
+           1. 先从本机 Flask 取 static/vendor/socket.io.min.js（局域网，快且稳）
+           2. 只有在本地文件缺失时才回退到公网 CDN
+         两份都是 4.5.4，与原有版本一致，不影响与服务端
+         flask-socketio 的协议兼容性。 -->
+    <script src="/static/vendor/socket.io.min.js"></script>
+    <script>
+        if (!window.io) {
+            document.write(
+                '<script src="https://cdn.socket.io/4.5.4/socket.io.min.js"><\/script>'
+            );
+        }
+    </script>
+    <!-- PWA 增强层：SW 注册 / 屏幕常亮 / 独立模式侦测。
+         全部静默降级，加载失败也不影响主逻辑（defer 保证在 DOM 后执行）。 -->
+    <script defer src="/static/pwa.js"></script>
 </head>
 <body class="app-shell">
 
@@ -3227,6 +3485,23 @@
         <span id="time-label">--:--:--</span>
     </div>
 
+    <!-- ============================================================
+         定位状态条（2026-11-01）
+         ------------------------------------------------------------
+        数据来自 auto_localizer 的 /localization_status：
+           激光-地图匹配率（物理证据）+ σ（参考）+ 位姿稳定性
+         用户不用再问"好了没"，也不用猜"看起来收敛了到底算不算"。
+         ============================================================ -->
+    <div class="loc-bar is-hidden" id="locBar">
+        <div class="loc-head">
+            <span class="loc-dot" id="locDot"></span>
+            <span class="loc-title" id="locTitle">定位状态</span>
+            <span class="loc-meta" id="locMeta"></span>
+        </div>
+        <div class="loc-track"><div class="loc-fill" id="locFill"></div></div>
+        <div class="loc-reason" id="locReason"></div>
+    </div>
+
     <!-- 对话主区 -->
     <main class="chat-shell">
         <div class="chat-column">
@@ -3297,7 +3572,7 @@
                 <button class="widget-close" data-close="joystick" title="关闭">✕</button>
             </div>
             <div class="widget-body">
-                <div class="joystick-container" style="margin: 4px 0 18px;">
+                <div class="joystick-container" style="margin: 2px 0 9px;">
                     <div class="joystick-base" id="joystickBase">
                         <div class="joystick-thumb" id="joystickThumb">●</div>
                     </div>
@@ -3306,7 +3581,7 @@
                     <div class="direction-indicator" id="directionText">⚪ 摇杆回中</div>
                 </div>
 
-                <div class="speed-item" style="margin-top: 16px;">
+                <div class="speed-item" style="margin-top: 8px;">
                     <label><span>最大线速度 (m/s)</span><span id="linear-value" class="speed-value">0.30</span></label>
                     <input type="range" id="linear-speed" min="0" max="0.30" step="0.01" value="0.30">
                 </div>
@@ -3570,7 +3845,16 @@
             centerY: rect.top + rect.height / 2,
             radius: rect.width / 2
         };
-        joystickMaxRadius = joystickBaseRect.radius - 10;
+        /* ★ 活动半径 = 底座半径 - 摇杆头半径。
+           原来写死成 `radius - 10`，那是在底座 220px / 摇杆头 80px
+           的前提下凑出来的：110 - 10 = 100，而摇杆头半径是 40，
+           所以满舵时头的边缘能跑到离圆心 140px 处，早就滑出底座了
+           （只是平时摇杆回中，没人注意到）。
+           底座缩到 110px 后这个偏差会一眼看出来，所以改成按实际
+           尺寸算，顺带把历史遗留的越界也修掉。
+           现在无论 CSS 怎么改尺寸，摇杆头都会正好贴着底座边缘。 */
+        const thumbRect = joystickThumb.getBoundingClientRect();
+        joystickMaxRadius = joystickBaseRect.radius - thumbRect.width / 2;
     }
     
     function initJoystick() {
@@ -3945,6 +4229,97 @@
     function clearChatMessages() {
         document.getElementById('chat-messages').innerHTML = '';
     }
+
+    // ==================== 定位状态条（2026-11-01） ====================
+    // 数据来自 auto_localizer 的 /localization_status。
+    //
+    // 为什么要这条 UI：
+    //   以前用户只能靠"地图上的车头图标看起来不动了"来判断定位好不好，
+    //   而这个判断经常是错的（σ 小不等于位置对，σ 略大也不等于位置错）。
+    //   现在把真实依据摊开：激光-地图匹配率（物理证据）、σ（参考项）、
+    //   位姿是否稳定，并直接告诉用户"该怎么帮着收敛"。
+    let locStatusTimer = null;
+
+    function renderLocStatus(s) {
+        const bar    = document.getElementById('locBar');
+        const dot    = document.getElementById('locDot');
+        const title  = document.getElementById('locTitle');
+        const meta   = document.getElementById('locMeta');
+        const fill   = document.getElementById('locFill');
+        const reason = document.getElementById('locReason');
+        if (!bar) return;
+
+        // 没数据就隐藏（地图没载入 / auto_localizer 没跑）
+        if (!s || !s.state) { bar.classList.add('is-hidden'); return; }
+
+        const ready = !!s.ready;
+        const bad   = !!s.veto;
+        const pct   = Math.round((s.progress || 0) * 100);
+
+        bar.classList.remove('is-hidden', 'is-ready', 'is-bad');
+        dot.classList.remove('is-ready', 'is-bad', 'is-busy');
+        if (ready) {
+            bar.classList.add('is-ready');
+            dot.classList.add('is-ready');
+            title.textContent = '定位已就绪';
+        } else if (bad) {
+            bar.classList.add('is-bad');
+            dot.classList.add('is-bad');
+            title.textContent = '定位可能错了';
+        } else {
+            dot.classList.add('is-busy');
+            title.textContent = '定位中';
+        }
+
+        fill.style.width = pct + '%';
+
+        // 第二行小字：匹配率 / σ / 稳定性，都是用户能看懂的量
+        const bits = [];
+        if (s.match_rate !== null && s.match_rate !== undefined) {
+            bits.push('匹配 ' + Math.round(s.match_rate * 100) + '%');
+        }
+        if (s.std_xy !== null && s.std_xy !== undefined) {
+            bits.push('σ ' + s.std_xy.toFixed(2) + 'm');
+        }
+        if (ready) {
+            bits.push('✓');
+        } else if (s.stable) {
+            bits.push('稳定 ' + (s.stable_sec || 0).toFixed(1) + 's');
+        } else {
+            bits.push(pct + '%');
+        }
+        meta.textContent = bits.join(' · ');
+
+        // 就绪后把长文案收起来，只留一行，不占地方
+        if (ready) {
+            reason.classList.remove('is-on');
+            reason.textContent = '';
+        } else {
+            const txt = [s.reason, s.hint].filter(Boolean).join(' · ');
+            if (txt) {
+                reason.textContent = txt;
+                reason.classList.add('is-on');
+            } else {
+                reason.classList.remove('is-on');
+            }
+        }
+    }
+
+    socket.on('loc_status', (data) => {
+        let s;
+        try {
+            s = JSON.parse(data.raw);
+        } catch (e) {
+            return;
+        }
+        renderLocStatus(s);
+        // 5 秒没新数据就自动隐藏（auto_localizer 已退出）
+        clearTimeout(locStatusTimer);
+        locStatusTimer = setTimeout(() => {
+            const bar = document.getElementById('locBar');
+            if (bar) bar.classList.add('is-hidden');
+        }, 5000);
+    });
     
     // ==================== Socket.IO 事件 ====================
     socket.on('map_data', (data) => {
