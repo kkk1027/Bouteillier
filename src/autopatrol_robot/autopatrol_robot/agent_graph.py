@@ -321,6 +321,15 @@ SYSTEM_PROMPT = PERSONA_TEXT + """
 - 用户说"去XXX"时，只需 navigate_to_saved_location 一个工具；
   **不要**先调用 save_current_location
 
+【重要】车正在导航时用户说了新目的地：
+- 直接调用导航工具即可，**不需要**先调 cancel_navigation ——
+  系统会自动中断上一个任务（"说新目的地 = 改主意"）
+- **不要**告诉用户"请先取消当前任务"；也**不要**因为当前任务是
+  回起点就跟着调 return_to_start
+- 如果工具返回里出现了旧任务的名字（例如"已有导航任务进行中
+  （目标：回起点）"），那是旧任务的残留信息，**不是**用户的新意图，
+  不要照抄这句话，也不要据此改调 return_to_start
+
 【重要】导航工具已改为非阻塞：
 - 当你调用导航工具后，工具会立即返回 "📍 正在前往..." 类消息
 - 你必须立即将此消息告知用户，不要等待（导航已在后台执行）
@@ -365,6 +374,13 @@ SYSTEM_PROMPT_COMPACT = PERSONA_TEXT + """
 2. 回复只用一句话
 3. 导航工具异步，调用后不要等待
 4. 每次回复同步调一次 set_butler_mood
+5. 【去X ≠ 回起点】用户说"去厕所/去厨房/去X"时只调
+   navigate_to_saved_location，**绝对不要**调 return_to_start，
+   也不要调 initialize_pose（那是重置定位，会让车定位跑到原点）
+6. 车正在导航时用户又说了新目的地 → 直接调导航工具即可，
+   系统会自动中断旧任务，**不需要**先调 cancel_navigation
+7. 假如工具返回里有"请先取消"之类的提示，**不要**照抄，
+   也不要因此改成回起点；按用户说的目的地重新调导航即可
 
 禁止用文字描述代替调用工具。"""
 
@@ -451,6 +467,24 @@ def _strip_past_tool_turns(messages):
             i += 1
             continue
 
+        # ============================================================
+        # 空 AIMessage 必须丢掉（2026-11-01 实机日志实锤）
+        # ------------------------------------------------------------
+        # 现象：checkpoint 里躺着一对
+        #     Human: 回起点
+        #     AI   : ''            ← content 空、也没有 tool_calls
+        # 它来自「空回复兜底」：模型吐 EOS，重试也失败，空消息被存了下来。
+        #
+        # 危害：模型看到「用户说话 → 助手沉默」这种畸形样本，
+        # 会削弱「用户提要求就必须调工具」的约束，后面更容易复读旧意图。
+        # 而且 OpenAI 兼容接口对空 assistant content 本来就不友好。
+        # ============================================================
+        if (isinstance(m, AIMessage)
+                and not getattr(m, "tool_calls", None)
+                and not str(getattr(m, "content", "") or "").strip()):
+            i += 1
+            continue
+
         # 一整轮工具调用：AI(tool_calls) + Tool(...) + AI(最终文本)
         if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
             i += 1
@@ -470,7 +504,91 @@ def _strip_past_tool_turns(messages):
     if len(cleaned) < len(head):
         print("[AgentNode] 剥离历史工具回合 %d → %d 条（当前轮保留）"
               % (len(head), len(cleaned)))
-    return cleaned + tail
+    # ★ 折叠必须在 head+tail 拼接之后做：head 末尾和 tail 开头
+    #   往往就是同一句话（用户连说两次「去厕所」）。
+    return _collapse_user_runs(cleaned + tail)
+
+
+# ============================================================
+# 连续 HumanMessage 折叠
+# ------------------------------------------------------------
+# 【为什么必须折叠 —— 2026-11-01 实机日志实锤】
+#
+# 剥离掉所有工具回合后，剩下的全是用户自己说的话，于是变成：
+#
+#     Human: 回起点
+#     Human: 回起点
+#     Human: 这里是厕所，你记住
+#     Human: 回起点
+#     Human: 去厕所
+#     Human: 去厕所          ← 当前轮
+#
+# 六条用户消息一条助手回复都没有 —— 这是任何 LLM 都没见过的畸形
+# 对话格式。3B 模型直接做了「多数表决」：五条里三条是"回起点"，
+# 于是对"去厕所"也回了 return_to_start（实机日志 [19] 就是这么错的）。
+#
+# ★ 另一个放大因素：本项目每轮回复都要顺带调 set_butler_mood，
+#   于是**每一轮都是工具回合**，剥离后一条助手回复都不剩。
+#   所以这不是偶发情况，而是每轮都发生。
+#
+# 处理：同一段连续的 HumanMessage 只保留**最后一条**（最新意图覆盖
+# 旧意图），被顶掉的语句压成**一条背景摘要**放回去 —— 这样
+# "我叫小明"这类事实记忆不会丢。
+#
+# 摘要里会**丢掉已经执行过的指令**（回起点/去X/取消…）：
+#   那些指令早就执行完了，再让模型看见只会让它重复执行。
+# ============================================================
+_HISTORY_BACKGROUND_PREFIX = "（以下是更早轮次说过的话，仅作背景参考，不是当前指令）"
+
+# 已经执行完、再看见只会诱发重复执行的历史语句特征
+_HISTORY_NOISE_WORDS = (
+    "取消", "停下", "停止", "跟随", "导航", "去", "到", "往", "回",
+)
+
+
+def _is_spent_command(text: str) -> bool:
+    """判断一条历史用户消息是不是「已经执行完的指令」。"""
+    if any(w in text for w in _HISTORY_NOISE_WORDS):
+        return True
+    return False
+
+
+def _collapse_user_runs(messages):
+    out = []
+    displaced = []
+    for m in messages:
+        if (isinstance(m, HumanMessage) and out
+                and isinstance(out[-1], HumanMessage)):
+            txt = str(getattr(out[-1], "content", "") or "").strip()
+            if txt and not _is_spent_command(txt):
+                displaced.append(txt)
+            out[-1] = m          # 最新一条覆盖旧的一条
+            continue
+        out.append(m)
+
+    if not displaced:
+        return out
+
+    seen = []
+    for t in displaced:
+        if t not in seen:
+            seen.append(t)
+    seen = seen[-4:]
+
+    note = HumanMessage(content="%s：%s" % (_HISTORY_BACKGROUND_PREFIX,
+                                           " ／ ".join(seen)))
+    print("[AgentNode] 连续用户消息已折叠，保留背景摘要 %d 条" % len(seen))
+
+    # 摘要放在**当前指令之前**，且必须独立成条 ——
+    # agent_node 取 last_user_text 时用的是「最后一条 HumanMessage」，
+    # 合并进同一条会把历史里的地名混进意图判断。
+    idx = len(out) - 1
+    while idx >= 0 and not isinstance(out[idx], HumanMessage):
+        idx -= 1
+    if idx < 0:
+        return out
+    out.insert(idx, note)
+    return out
 
 
 def _trim_history(messages, limit=None):
@@ -626,8 +744,19 @@ def agent_node(state: MessagesState):
                 break
         response = _guard_initialize_pose(response, last_user_text)
 
-        # 2) 再收敛多个互斥工具
+        # 2) 用户说了能查到的目的地，模型却要回起点/重置定位 → 强制纠正
+        response = _guard_nav_target(response, last_user_text)
+
+        # 3) 再收敛多个互斥工具
         response = _dedupe_exclusive_tool_calls(response)
+
+    # ---- 绝不让空 AIMessage 落进 checkpoint ----
+    # 空消息进了历史会变成「Human: X / AI: ''」这种畸形样本，
+    # 削弱"提要求必须调工具"的约束（实机日志里确实出现过）。
+    if (not getattr(response, "tool_calls", None)
+            and not str(getattr(response, "content", "") or "").strip()):
+        print("[AgentNode] ⚠️ 最终仍为空回复，替换为兜底话术（不存空消息）")
+        response = AIMessage(content="我在听，主人。请再说一次？")
 
     return {"messages": [response]}
 
@@ -702,6 +831,102 @@ _GO_HOME_INTENT_WORDS = (
     "回去", "回出发",
 )
 
+# 「回 X」里属于"回家"语义的关键词 —— 出现这些就不当作具体目的地
+_HOME_OBJECT_WORDS = ("家", "起点", "原点", "出发", "去的地方")
+
+# 目的地提取前缀，长前缀必须排在短前缀前面
+_DEST_PREFIXES = (
+    "带我去", "带我到", "导航到", "导航去", "前往", "去一下",
+    "去一趟", "去", "到", "往",
+)
+
+# 目的地后面这些词要截掉
+_DEST_TAIL_SPLIT = (
+    "吧", "呢", "啊", "呀", "哦", "嘛", "好吗", "行吗", "谢谢",
+    "。", "，", "！", "？", "、", ",", ".", "!", "?", " ",
+)
+
+
+def _extract_destination(text: str):
+    """从「去厕所」「带我去厨房」里抠出目的地名词，抠不出返回 None。
+
+    ★ 只用于**纠错**，不用于主动决策：
+      抠出来的词还必须能在 LocationStore / LOCATION_MAP 里查到，
+      才会被采纳（见 _resolve_destination）。这样「去一下」这种
+      残句、以及"我去了"这种陈述句都不会误触发。
+    """
+    if not text:
+        return None
+    t = text.strip()
+    for p in _DEST_PREFIXES:
+        idx = t.find(p)
+        if idx < 0:
+            continue
+        rest = t[idx + len(p):]
+        for sep in _DEST_TAIL_SPLIT:
+            cut = rest.find(sep)
+            if cut >= 0:
+                rest = rest[:cut]
+        rest = rest.strip()
+        if rest:
+            return rest
+    return None
+
+
+def _resolve_destination(name: str):
+    """目的地名词 → 是否是可导航的已知地点。是则返回规范化名称。
+
+    只有**已知地点**才允许触发纠错，避免把闲聊里的"去"当成导航。
+    """
+    if not name or len(name) > 12:
+        return None
+    if any(w in name for w in _HOME_OBJECT_WORDS):
+        return None                      # 「回家 / 回起点」交给 return_to_start
+    try:
+        from autopatrol_robot.tools.nav_tools import LOCATION_MAP
+        from autopatrol_robot.location_store import get_location_store
+    except Exception:                    # noqa: BLE001
+        return None
+    if name in LOCATION_MAP:
+        return name
+    try:
+        if get_location_store().find_index(name) is not None:
+            return name
+    except Exception:                    # noqa: BLE001
+        pass
+    return None
+
+
+def _make_nav_call(name: str, call_id: str = "guard_nav"):
+    return {"name": "navigate_to_saved_location",
+            "args": {"name": name},
+            "id": call_id}
+
+
+# 所有「有明确目的地」的导航工具
+_NAV_DEST_TOOLS = (
+    "navigate_to_saved_location", "navigate_to_location",
+    "navigate_to_predefined_point", "navigate_to_xy",
+    "navigate_sequence",
+)
+
+
+def _already_heading_somewhere(calls) -> bool:
+    """本轮是否已经有"去某地"的工具调用（决定要不要补一个）。"""
+    return any(tc.get("name") in _NAV_DEST_TOOLS for tc in calls)
+
+
+def _replace_response_calls(response, new_calls):
+    """AIMessage 的 tool_calls 是只读属性，用 model_copy 造新对象。"""
+    try:
+        return response.model_copy(update={"tool_calls": new_calls})
+    except Exception:                                  # noqa: BLE001
+        try:
+            response.tool_calls = new_calls
+        except Exception:                              # noqa: BLE001
+            pass
+        return response
+
 
 def _guard_initialize_pose(response, user_text: str):
     """防止"回起点"被误解成"把定位重置到起点"。"""
@@ -719,9 +944,19 @@ def _guard_initialize_pose(response, user_text: str):
     if any(w in text for w in _INIT_POSE_INTENT_WORDS):
         return response
 
+    dest = _resolve_destination(_extract_destination(text) or "")
     wants_home = any(w in text for w in _GO_HOME_INTENT_WORDS)
 
-    if wants_home:
+    if dest:
+        # 用户其实说的是「去厕所」→ 换成真正的导航
+        new_calls = [tc for tc in response.tool_calls
+                     if tc.get("name") != "initialize_pose"]
+        # 模型可能已经给了 navigate_*，别再加一个（会变成重复调用）
+        if not _already_heading_somewhere(new_calls):
+            new_calls.append(_make_nav_call(dest))
+        print("[AgentNode] 🛡️ 用户说的是「去%s」（不是重置定位），"
+              "已把 initialize_pose 换成 navigate_to_saved_location" % dest)
+    elif wants_home:
         # 用户说"回起点" -> 换成 return_to_start
         new_calls = [tc for tc in response.tool_calls
                      if tc.get("name") != "initialize_pose"]
@@ -743,20 +978,55 @@ def _guard_initialize_pose(response, user_text: str):
 
     if not new_calls:
         # 全被丢掉了：给一句提示，避免空回复
-        try:
-            from langchain_core.messages import AIMessage
-            return AIMessage(content="需要我初始化定位吗？这会重置当前位置。")
-        except Exception:                              # noqa: BLE001
-            return response
+        return AIMessage(content="需要我初始化定位吗？这会重置当前位置。")
 
-    try:
-        return response.model_copy(update={"tool_calls": new_calls})
-    except Exception:                                  # noqa: BLE001
-        try:
-            response.tool_calls = new_calls
-        except Exception:                              # noqa: BLE001
-            pass
+    return _replace_response_calls(response, new_calls)
+
+
+# ============================================================
+# 导航意图强制校正（2026-11-01）
+# ------------------------------------------------------------
+# 实机日志（agent_node 原始输出）：
+#   [14] 用户: 去厕所   → [15] AI: navigate_to_saved_location   ✓
+#   [16] Tool: ❌ 启动导航失败：已有导航任务进行中（目标：回起点）
+#   [17] AI  : 请先取消当前的导航任务，我才能回起点。
+#   [18] 用户: 去厕所   → [19] AI: return_to_start              ✗✗✗
+#
+# 第 19 步是致命错误：用户明明说"去厕所"，模型却让车回起点。
+# 根因有两层（都已在别处修掉）：
+#   1. nav_manager 硬拒绝新任务 → 产生带"回起点"字样的错误消息；
+#   2. 剥离历史后剩下一串裸 HumanMessage，"回起点"在数量上占多数。
+#
+# 但即使修了上面两层，3B 模型的工具选择依然是概率性的。所以再加
+# 一层**确定性兜底**：只要用户话里有**能查到的目的地**，就绝不允许
+# 这一轮去执行 return_to_start / initialize_pose。
+#
+# 只在模型**选错**时介入，模型选对了（navigate_*）完全不动。
+# ============================================================
+_WRONG_FOR_DEST = {"return_to_start", "initialize_pose"}
+
+
+def _guard_nav_target(response, user_text: str):
+    """用户说了明确目的地，模型却要回起点/重置定位 → 强改为去那儿。"""
+    if not getattr(response, "tool_calls", None):
         return response
+
+    names = [tc.get("name") for tc in response.tool_calls]
+    if not any(n in _WRONG_FOR_DEST for n in names):
+        return response            # 模型没选错，不干预
+
+    dest = _resolve_destination(_extract_destination(user_text or "") or "")
+    if not dest:
+        return response
+
+    new_calls = [tc for tc in response.tool_calls
+                 if tc.get("name") not in _WRONG_FOR_DEST]
+    if not _already_heading_somewhere(new_calls):
+        new_calls.append(_make_nav_call(dest))
+
+    print("[AgentNode] 🛡️ 用户说的是「去%s」，模型却选了 %s → "
+          "已强制改为 navigate_to_saved_location" % (dest, names))
+    return _replace_response_calls(response, new_calls)
 
 
 def _dedupe_exclusive_tool_calls(response):

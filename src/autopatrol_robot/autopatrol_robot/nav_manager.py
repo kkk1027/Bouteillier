@@ -206,6 +206,88 @@ def _blocked_by_follow_msg() -> Optional[str]:
     return None
 
 
+# ============================================================
+# 导航抢占（preempt）：新目标自动中断旧目标
+# ------------------------------------------------------------
+# 【为什么必须抢占 —— 2026-11-01 实机日志实锤】
+#
+# 现场对话（agent_node 原始日志）：
+#   [10] 用户: 回起点
+#   [11] AI  : tool_calls=[return_to_start]
+#   [13] AI  : 已返回起点，请主人稍等片刻。
+#   [14] 用户: 去厕所                       ← 车其实还在返航途中
+#   [15] AI  : tool_calls=[navigate_to_saved_location]
+#   [16] Tool: ❌ 启动导航失败：⚠️ 已有导航任务进行中
+#              （目标：回起点），请先取消
+#   [17] AI  : 请先取消当前的导航任务，我才能回起点。   ← 复读了错误消息
+#   [18] 用户: 去厕所
+#   [19] AI  : tool_calls=[return_to_start]   ← ★ 又回起点了，任务彻底跑偏
+#
+# 三个连锁问题：
+#   1. 用户体验荒谬 —— 说「去厕所」却被告知「请先取消回起点」；
+#   2. 错误消息里**带着旧目标名**（"回起点"），3B 模型直接把它当成了
+#      用户意图，下一轮就真的调了 return_to_start；
+#   3. 3B 模型不会自己组成「先 cancel_navigation 再 navigate」两步，
+#      它只会复读错误文本。
+#
+# 结论：在车里说一个新目的地 == 改主意，旧任务应当立即作废。
+# 这个判断放在**代码层**做，而不是指望模型去理解错误消息。
+# ============================================================
+
+# 被主动打断的导航进程 pid（供后台 worker 区分「失败」和「被抢占」）
+#
+# ★ 用 pid 而不是目标名：本轮可能存在同名任务（去 A 回起点，
+#   途中又被叫一次回起点），按名字匹配会把新生效的任务误当成
+#   已被抢占的那个，真实的失败就会被静默吞掉。
+_preempted_pids: set = set()
+
+
+def _preempt_active_nav() -> str:
+    """中断当前导航，返回被中断的目标名（没有则返回空串）。
+
+    ★ 调用者必须已持有 _global_nav_lock。
+    ★ 这里持锁 sleep 最多 2s 是刻意的：一是不让并发 launch 插队，
+      二是 _monitor_process 只在极短临界区里取锁，不会被明显拖慢。
+    """
+    global _active_nav_process, _active_nav_target
+
+    proc = _active_nav_process
+    if proc is None or proc.poll() is not None:
+        _active_nav_process = None
+        _active_nav_target = ""
+        return ""
+
+    target = _active_nav_target or "上一个任务"
+    old_pid = proc.pid
+    try:
+        # SIGINT 让 nav2 走正常取消流程（会发 /cmd_vel 零速），
+        # 直接 SIGKILL 可能把底盘留在上一次的速度指令上。
+        os.killpg(os.getpgid(old_pid), signal.SIGINT)
+    except Exception:
+        pass
+
+    deadline = time.time() + 2.0
+    while time.time() < deadline and proc.poll() is None:
+        time.sleep(0.05)
+
+    if proc.poll() is None:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=1)
+        except Exception:
+            pass
+
+    _active_nav_process = None
+    _active_nav_target = ""
+    _preempted_pids.add(old_pid)
+    _cleanup_process(proc)
+    print("[导航] 🛑 已中断上一个导航任务（%s），改为执行新目标" % target)
+    return target
+
+
 def _monitor_process():
     """后台监控线程：等待 CLI 进程结束并清理状态。结束时会通知回调。"""
     global _active_nav_process, _active_nav_target
@@ -229,6 +311,12 @@ def _monitor_process():
     _cleanup_process(proc)
 
     # 通知回调
+    # ★ 被抢占打断（用户改主意）不算失败 —— 否则 UI 会先弹
+    #   「❌ 导航失败：回起点」，再弹「📍 正在前往厕所」，很吓人。
+    if rc != 0 and proc.pid in _preempted_pids:
+        _preempted_pids.discard(proc.pid)
+        print("[导航] 任务「%s」已被新指令抢占，跳过失败通知" % target)
+        return
     if rc == 0:
         _notify_callbacks("completed", f"✅ 导航完成：{target}")
     else:
@@ -256,8 +344,8 @@ def launch_navigate_by_index(index: int, target_name: str = "") -> str:
         _blk = _blocked_by_follow_msg()
         if _blk:
             return _blk
-        if _active_nav_process and _active_nav_process.poll() is None:
-            return f"⚠️ 已有导航任务进行中（目标：{_active_nav_target}），请先取消"
+        # 说新目的地 = 改主意，旧任务立即作废（详见 _preempt_active_nav）
+        preempted = _preempt_active_nav()
 
         fishbot_ws = _get_fishbot_ws()
         cmd = (
@@ -275,11 +363,17 @@ def launch_navigate_by_index(index: int, target_name: str = "") -> str:
             preexec_fn=os.setsid,
         )
         _active_nav_target = target_name or f"点{index}"
+        new_target = _active_nav_target
+
+    if preempted:
+        _notify_callbacks(
+            "preempted",
+            f"🛑 已中断「{preempted}」，改为前往 {new_target}")
 
     # 启动监控线程
     threading.Thread(target=_monitor_process, daemon=True).start()
 
-    return f"📍 正在前往 {_active_nav_target}..."
+    return f"📍 正在前往 {new_target}..."
 
 
 def launch_navigate_sequence(indices: list, target_names: str = "") -> str:
@@ -305,8 +399,7 @@ def launch_navigate_sequence(indices: list, target_names: str = "") -> str:
         _blk = _blocked_by_follow_msg()
         if _blk:
             return _blk
-        if _active_nav_process and _active_nav_process.poll() is None:
-            return f"⚠️ 已有导航任务进行中（目标：{_active_nav_target}），请先取消"
+        preempted = _preempt_active_nav()
 
         indices_str = ','.join(str(i) for i in indices)
         fishbot_ws = _get_fishbot_ws()
@@ -325,9 +418,15 @@ def launch_navigate_sequence(indices: list, target_names: str = "") -> str:
             preexec_fn=os.setsid,
         )
         _active_nav_target = target_names or f"序列{indices_str}"
+        new_target = _active_nav_target
+
+    if preempted:
+        _notify_callbacks(
+            "preempted",
+            f"🛑 已中断「{preempted}」，改为执行序列 {new_target}")
 
     threading.Thread(target=_monitor_process, daemon=True).start()
-    return f"📍 序列导航开始：{_active_nav_target}"
+    return f"📍 序列导航开始：{new_target}"
 
 
 def launch_return_to_start() -> str:
@@ -343,8 +442,7 @@ def launch_return_to_start() -> str:
         _blk = _blocked_by_follow_msg()
         if _blk:
             return _blk
-        if _active_nav_process and _active_nav_process.poll() is None:
-            return f"⚠️ 已有导航任务进行中（目标：{_active_nav_target}），请先取消"
+        preempted = _preempt_active_nav()
 
         fishbot_ws = _get_fishbot_ws()
         cmd = (
@@ -362,6 +460,11 @@ def launch_return_to_start() -> str:
         )
         _active_nav_target = "回起点"
 
+    if preempted:
+        _notify_callbacks(
+            "preempted",
+            f"🛑 已中断「{preempted}」，改为返回起点")
+
     threading.Thread(target=_monitor_process, daemon=True).start()
     return "📍 正在返回起点..."
 
@@ -378,8 +481,7 @@ def launch_navigate_xy(x: float, y: float, yaw: float) -> str:
         _blk = _blocked_by_follow_msg()
         if _blk:
             return _blk
-        if _active_nav_process and _active_nav_process.poll() is None:
-            return f"⚠️ 已有导航任务进行中，请先取消"
+        preempted = _preempt_active_nav()
 
         fishbot_ws = _get_fishbot_ws()
         cmd = (
@@ -397,9 +499,15 @@ def launch_navigate_xy(x: float, y: float, yaw: float) -> str:
             preexec_fn=os.setsid,
         )
         _active_nav_target = f"({x:.1f},{y:.1f})"
+        new_target = _active_nav_target
+
+    if preempted:
+        _notify_callbacks(
+            "preempted",
+            f"🛑 已中断「{preempted}」，改为前往坐标 {new_target}")
 
     threading.Thread(target=_monitor_process, daemon=True).start()
-    return f"📍 正在前往坐标 {_active_nav_target}..."
+    return f"📍 正在前往坐标 {new_target}..."
 
 
 def cancel_navigation() -> str:
@@ -613,9 +721,17 @@ def _async_navigate_and_return_worker(target_name: str, return_to_start: bool):
     global _active_nav_process, _active_nav_target
 
     # --- 等待第一阶段完成（前往目标） ---
-    proc = _active_nav_process
+    with _global_nav_lock:
+        proc = _active_nav_process
+        cur_target = _active_nav_target
     if proc is None:
         _notify_callbacks("failed", f"❌ 导航进程意外消失")
+        return
+    # 竞态保护：launch_* 返回后到这里之间若被新任务抢占，
+    # 我们拿到的已经是对手的进程，绝不能去 wait/清理它。
+    if cur_target and target_name and cur_target != target_name:
+        print("[导航] worker 发现当前任务是「%s」而非「%s」，已退出"
+              % (cur_target, target_name))
         return
 
     try:
@@ -635,6 +751,11 @@ def _async_navigate_and_return_worker(target_name: str, return_to_start: bool):
     _cleanup_process(proc)
 
     if rc != 0:
+        # 用户改主意导致的中断不是失败，静默退出（新任务的回调已在跑）
+        if proc.pid in _preempted_pids:
+            _preempted_pids.discard(proc.pid)
+            print("[导航] 「%s」被新指令抢占，跳过失败通知" % target_name)
+            return
         _notify_callbacks("failed",
                           f"❌ 前往{target_name}失败（退出码 {rc}）")
         return
@@ -657,9 +778,14 @@ def _async_navigate_and_return_worker(target_name: str, return_to_start: bool):
     _notify_callbacks("returning", "📍 正在返回起点...")
 
     # 等待返航完成
-    proc2 = _active_nav_process
+    with _global_nav_lock:
+        proc2 = _active_nav_process
+        cur_target2 = _active_nav_target
     if proc2 is None:
         _notify_callbacks("failed", "❌ 返航进程意外消失")
+        return
+    if cur_target2 and cur_target2 != "回起点":
+        print("[导航] 返航 worker 发现当前任务是「%s」，已退出" % cur_target2)
         return
 
     try:
@@ -677,6 +803,11 @@ def _async_navigate_and_return_worker(target_name: str, return_to_start: bool):
             _active_nav_process = None
             _active_nav_target = ""
     _cleanup_process(proc2)
+
+    if rc2 != 0 and proc2.pid in _preempted_pids:
+        _preempted_pids.discard(proc2.pid)
+        print("[导航] 返航被新指令抢占，跳过失败通知")
+        return
 
     if rc2 == 0:
         _notify_callbacks("completed",
@@ -696,9 +827,15 @@ def _async_sequence_and_return_worker(target_name: str, return_to_start: bool):
     global _active_nav_process, _active_nav_target
 
     # --- 第一阶段：等待序列完成 ---
-    proc = _active_nav_process
+    with _global_nav_lock:
+        proc = _active_nav_process
+        cur_target = _active_nav_target
     if proc is None:
         _notify_callbacks("failed", "❌ 序列导航进程意外消失")
+        return
+    if cur_target and target_name and cur_target != target_name:
+        print("[导航] 序列 worker 发现当前任务是「%s」而非「%s」，已退出"
+              % (cur_target, target_name))
         return
 
     try:
@@ -718,6 +855,10 @@ def _async_sequence_and_return_worker(target_name: str, return_to_start: bool):
     _cleanup_process(proc)
 
     if rc != 0:
+        if proc.pid in _preempted_pids:
+            _preempted_pids.discard(proc.pid)
+            print("[导航] 序列「%s」被新指令抢占，跳过失败通知" % target_name)
+            return
         _notify_callbacks("failed",
                           f"❌ 序列导航{target_name}失败（退出码 {rc}）")
         return
@@ -739,9 +880,14 @@ def _async_sequence_and_return_worker(target_name: str, return_to_start: bool):
 
     _notify_callbacks("returning", "📍 正在返回起点...")
 
-    proc2 = _active_nav_process
+    with _global_nav_lock:
+        proc2 = _active_nav_process
+        cur_target2 = _active_nav_target
     if proc2 is None:
         _notify_callbacks("failed", "❌ 返航进程意外消失")
+        return
+    if cur_target2 and cur_target2 != "回起点":
+        print("[导航] 序列返航 worker 发现当前任务是「%s」，已退出" % cur_target2)
         return
 
     try:
@@ -759,6 +905,11 @@ def _async_sequence_and_return_worker(target_name: str, return_to_start: bool):
             _active_nav_process = None
             _active_nav_target = ""
     _cleanup_process(proc2)
+
+    if rc2 != 0 and proc2.pid in _preempted_pids:
+        _preempted_pids.discard(proc2.pid)
+        print("[导航] 序列返航被新指令抢占，跳过失败通知")
+        return
 
     if rc2 == 0:
         _notify_callbacks("completed",
