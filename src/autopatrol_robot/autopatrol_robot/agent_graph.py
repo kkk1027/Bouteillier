@@ -4,7 +4,10 @@ agent_graph.py
 """
 
 import os
+import json
+import difflib
 import random
+import re
 from typing import Literal
 
 import httpx
@@ -355,15 +358,30 @@ SYSTEM_PROMPT = PERSONA_TEXT + """
 #
 # 实测（fishbot-qwen:3b, 23 工具）：精简版 6/6 次全部正确调用，
 # 单轮 0.5~0.6s；完整版 0/6。所以这里按 provider 分流。
+#
+# ★ 2026-11-01 血泪补充：这段提示词的**长度本身**就是敏感参数
+# ------------------------------------------------------------
+# 为了把「去X ≠ 保存X」讲清楚，我曾把下面几行扩写到 1101 字符
+# （多了规则 8/9 和一大段解释）。结果这个 3B 模型当场崩掉：
+#
+#   旧提示 827 字符    这里是书房 5/5   去书房 5/5   记住这是书房 5/5
+#   新提示 1101 字符   这里是书房 0/5   去书房 4/5   记住这是书房 3/5
+#
+# 它不是「理解得不够」，而是上下文一拥挤就退化成口头应声：
+# 「知道了，主人。」——一个工具都不调。
+#
+# 结论：**这里的每一条规则都有成本**。讲道理的地方应该放进工具
+# 描述（模型对那里注意力最高），或者干脆在代码层做确定性拦截
+# （见 _guard_save_intent）。提示词只留最短的映射表。
+# 改这个字符串之前请先跑 tools/test_tool_choice.py。
 # ============================================================
 SYSTEM_PROMPT_COMPACT = PERSONA_TEXT + """
 
-工具映射（★ 先看动词，再看名词）：
-- 去X / 带我去X / 到X → navigate_to_saved_location
+工具映射：
+- 去X → navigate_to_saved_location
 - 先去A再去B/依次去 → navigate_sequence
-- 回起点/回去/回家 → return_to_start
-- 只有出现「记住」「记成」「这里是」「记作」时才用 save_current_location
-  ★ 光说「去书房」**不是**保存！车已经在书房时也只能去，不能存
+- 回起点/回去 → return_to_start
+- 这里是X/记成X → save_current_location（去X不是保存）
 - 在哪 → get_current_position
 - 电量 → get_battery_status
 - 天气 → get_weather
@@ -384,11 +402,6 @@ SYSTEM_PROMPT_COMPACT = PERSONA_TEXT + """
    系统会自动中断旧任务，**不需要**先调 cancel_navigation
 7. 假如工具返回里有"请先取消"之类的提示，**不要**照抄，
    也不要因此改成回起点；按用户说的目的地重新调导航即可
-8. 【去X ≠ 保存X】用户只说"去书房"时调 navigate_to_saved_location，
-   **绝对不要**调 save_current_location —— 那会把书房的位置改写成
-   车现在所在的位置，地点就废了
-9. save_current_location 只在一个句式下使用：「这里是X」「记住这是X」
-   「把这里记成X」。没听到"记住/记成/这里是"，就不要保存
 
 禁止用文字描述代替调用工具。"""
 
@@ -696,73 +709,40 @@ def agent_node(state: MessagesState):
     if hasattr(response, 'content'):
         print(f"[AgentNode] content: {str(response.content)[:200]!r}")
 
+    # ---- 文本化工具调用恢复 ----
+    # 实测：模型会把调用写成普通文本 'return_to_start()'，此时
+    # tool_calls 为空，车不会动；这段文字还会进 checkpoint 变成
+    # 下一轮的「范例」。必须在做任何其它判断之**前**恢复，
+    # 否则后面的「空回复兜底」和守卫都看不到这个调用。
+    response = _recover_textual_tool_calls(response)
+    if getattr(response, 'tool_calls', None):
+        print("[AgentNode] 恢复后 tool_calls: "
+              f"{[tc.get('name') for tc in response.tool_calls]}")
+
+    last_user_text = ""
+    last_human = None
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            last_human = m
+            last_user_text = str(getattr(m, "content", "") or "")
+            break
+
     # ---- 空回复兜底 ----
     # 小模型偶尔会「一句话都不说」。对话就断了，用户会以为程序卡死。
-    # 这里重试一次：去掉历史、只留系统提示 + 最后一句话。
-    if (not getattr(response, "tool_calls", None)
-            and not str(getattr(response, "content", "") or "").strip()):
-        print("[AgentNode] ⚠️ 模型返回空，去掉历史重试一次")
-        last_human = None
-        for m in reversed(messages):
-            if isinstance(m, HumanMessage):
-                last_human = m
-                break
-        if last_human is not None:
-            try:
-                response = llm_with_tools.invoke([
-                    SystemMessage(content=_nonce_prompt(ACTIVE_SYSTEM_PROMPT)),
-                    last_human,
-                ])
-                print(f"[AgentNode] 重试结果: tool_calls="
-                      f"{[tc.get('name') for tc in (getattr(response, 'tool_calls', None) or [])]} "
-                      f"content={str(getattr(response, 'content', ''))[:120]!r}")
-            except Exception as e:  # noqa: BLE001
-                print(f"[AgentNode] 重试失败: {e}")
+    # 重试一次：去掉历史、只留系统提示 + 最后一句话。
+    response = _retry_if_empty(response, last_human)
+    # 重试出来的也可能是文本化调用，同样要恢复
+    response = _recover_textual_tool_calls(response)
 
     # ============================================================
-    # 单轮 tool_calls 互斥收敛（2026-11-01）
+    # 统一后处理（2026-11-01）
     # ------------------------------------------------------------
-    # 实测故障：用户说「去厕所」，3B 模型一次吐出 3 个工具：
-    #   ['save_current_location', 'return_to_start',
-    #    'navigate_to_saved_location']
-    # 后果是三重灾难：
-    #   1. save_current_location 把**当前位置**存成了「厕所」→ 数据污染
-    #   2. return_to_start 起了一个导航进程
-    #   3. navigate_to_saved_location 再起一个 →
-    #      「已有导航任务进行中（目标：回起点）」，真正的任务失败
-    #
-    # 为什么必须在代码层拦：3B 模型的工具选择是**确定性错误**，
-    # 同一句话每次都错，调 prompt 只能降低概率，不能消除。
-    # 而且用户说的目的地永远比 return_to_start 更明确，
-    # 额外调 return_to_start 纯属重复。
-    #
-    # 规则：
-    #   - 导航类工具之间互斥，只保留模型输出的**第一个**
-    #   - 同轮出现导航类时，丢弃 save_current_location
-    #     （"去X"里不存在"顺便把当前位置记成X"的合理意图）
-    #   - 非控制类工具（set_butler_mood / get_weather 等）原样保留
+    # 模型返回之后的所有确定性纠错都在 postprocess_response 里，
+    # 顺序与理由见该函数的注释。这里**不加 if tool_calls 判断**：
+    # 位置查询护栏恰恰要在「模型没调任何工具却开口编答案」时才生效，
+    # 加了外层判断它永远跑不到。
     # ============================================================
-    if getattr(response, "tool_calls", None):
-        last_user_text = ""
-        for m in reversed(messages):
-            if isinstance(m, HumanMessage):
-                last_user_text = str(getattr(m, "content", "") or "")
-                break
-
-        # ★ 2026-11-01：原来这里还有一步"拦掉误触发的重定位工具"，
-        #   现在那个工具已从工具列表彻底删除，防线从"运行时拦截"
-        #   前移到"根本不存在这个选项"。
-
-        # 1) 用户说了能查到的目的地，模型却要回起点 → 强制纠正
-        response = _guard_nav_target(response, last_user_text)
-
-        # 2) 用户只是要去，模型却要"记住这里" → 强制纠正
-        #    （本轮事故：「去书房」被写成 save_current_location，
-        #      把真实坐标覆盖成了车所在的原点附近）
-        response = _guard_save_intent(response, last_user_text)
-
-        # 3) 再收敛多个互斥工具
-        response = _dedupe_exclusive_tool_calls(response)
+    response = postprocess_response(response, last_user_text)
 
     # ---- 绝不让空 AIMessage 落进 checkpoint ----
     # 空消息进了历史会变成「Human: X / AI: ''」这种畸形样本，
@@ -924,8 +904,6 @@ def _make_nav_call(name: str, call_id: str = "guard_nav"):
     return {"name": "navigate_to_saved_location",
             "args": {"name": name},
             "id": call_id}
-
-
 # 所有「有明确目的地」的导航工具
 _NAV_DEST_TOOLS = (
     "navigate_to_saved_location", "navigate_to_location",
@@ -939,16 +917,303 @@ def _already_heading_somewhere(calls) -> bool:
     return any(tc.get("name") in _NAV_DEST_TOOLS for tc in calls)
 
 
-def _replace_response_calls(response, new_calls):
+def _replace_response_calls(response, new_calls, clear_content=False):
     """AIMessage 的 tool_calls 是只读属性，用 model_copy 造新对象。"""
+    update = {"tool_calls": new_calls}
+    if clear_content:
+        update["content"] = ""
     try:
-        return response.model_copy(update={"tool_calls": new_calls})
+        return response.model_copy(update=update)
     except Exception:                                  # noqa: BLE001
         try:
             response.tool_calls = new_calls
+            if clear_content:
+                response.content = ""
         except Exception:                              # noqa: BLE001
             pass
         return response
+
+
+# ============================================================
+# 文本化工具调用恢复（2026-11-01）
+# ------------------------------------------------------------
+# 实机日志（用户提供的两轮原始输出）：
+#   用户: 这里是书房，你记住
+#   AI  : 'odge_to_saved_location("书房")'    ← 只是一段**文字**
+#   用户: 回起点
+#   AI  : 'return_to_start()'                 ← 同样只是文字
+#
+# 模型把工具调用写成了普通文本，`tool_calls` 为空，于是：
+#   1. 车一步不动 —— 没有任何工具真的被执行；
+#   2. 这段文字作为 AIMessage 进了 checkpoint，变成下一轮的
+#      「回答范例」，模型接着模仿，越错越离谱。
+#
+# 为什么会退化成文本：Ollama 对 Qwen 的工具调用解析依赖模型自己
+# 输出 <tool_call> 标记。3B 模型一旦上下文拥挤（工具 schema 大、
+# 系统提示词长），就不再输出该标记。而且开头几个字符会被吞掉
+# （navigate_to_ → odge_to_），像是解析器把匹配到的前缀当成标记
+# 消费掉了。
+#
+# 修法分两层：
+#   · 结构侧：精简工具描述 + 缩短系统提示词（实测能把退化从 10/10
+#     降到偶发）—— 见 SYSTEM_PROMPT_COMPACT 上方注释；
+#   · 这里：确定性恢复，把文本里的调用重新变成真正的 tool_call。
+#     名字允许缺开头（后缀匹配），参数支持 JSON 和单个字符串两种。
+# ============================================================
+
+_TOOL_OBJ_BY_NAME = {t.name: t for t in ACTIVE_TOOLS}
+# ★ 12 字符：至少要能覆盖 'saved_location'（14）这种程度。
+#   原来写 8 时，'location' 这种通用词会被猜成 save_current_location。
+_TOOL_SUFFIX_MIN = 12
+_MAX_CALL_TEXT = 240          # 超过这个长度当成正常回复，不当工具调用
+
+# ★ 实施破坏性动作的工具：**只允许精确名字**，不允许模糊匹配。
+#   实测 'saved_location' 与 navigate_to_saved_location、
+#   delete_saved_location 的公共后缀都是 14，按相似度打分时
+#   delete 因为名字更短反而得分更高 —— 差点把「去书房」恢复成
+#   「删书房」。恢复层宁可漏，不能猜错。
+_NO_FUZZY_TOOLS = {
+    "delete_saved_location",
+    "clear_all_saved_locations",
+}
+
+_JSON_OBJ_RE = re.compile(r"\{[\s\S]*\}")
+_QUOTED_RE = re.compile(r"[\"'“”‘’]([^\"'“”‘’\n]{1,40})[\"'“”‘’]")
+_CALL_HEAD_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]{1,60})\s*([\s\S]*)$")
+
+
+def _common_suffix_len(a: str, b: str) -> int:
+    n = min(len(a), len(b))
+    k = 0
+    while k < n and a[-1 - k] == b[-1 - k]:
+        k += 1
+    return k
+
+
+def _match_tool_name(raw: str):
+    """把模型写的名字映射到真实工具名，允许缺开头几个字符。
+
+    'navigate_to_saved_location' → 自己
+    'avigate_to_saved_location'  → navigate_to_saved_location（缺 n）
+    'odge_to_saved_location'     → navigate_to_saved_location
+
+    打分 = (公共后缀长度, 整体相似度)。
+    只有**唯一最高分**才采纳 —— 打成平手宁可不恢复，
+    也不能调错工具把车开走。
+    """
+    if not raw:
+        return None
+    name = raw.strip().strip(".`*\"' ").lower()
+    if not name:
+        return None
+    # 模型常把下划线写成空格：'odge saved_location'
+    name = re.sub(r"\s+", "_", name.strip())
+
+    exact = {n.lower(): n for n in _TOOL_OBJ_BY_NAME}
+    if name in exact:
+        return exact[name]
+
+    scored = []
+    for n in _TOOL_OBJ_BY_NAME:
+        if n in _NO_FUZZY_TOOLS:
+            continue                     # 破坏性动作不接受模糊匹配
+        ln = n.lower()
+        suf = _common_suffix_len(ln, name)
+        if suf < _TOOL_SUFFIX_MIN:
+            continue
+        ratio = difflib.SequenceMatcher(None, ln, name).ratio()
+        scored.append((suf, ratio, n))
+    if not scored:
+        return None
+
+    scored.sort(reverse=True)
+    best = scored[0]
+    if len(scored) > 1 and scored[1][:2] == best[:2]:
+        return None                      # 平手，不猜
+    return best[2]
+
+
+def _arg_names(tool_name: str):
+    tool = _TOOL_OBJ_BY_NAME.get(tool_name)
+    if tool is None:
+        return []
+    try:
+        return list((tool.args_schema.model_json_schema().get("properties") or {}).keys())
+    except Exception:                                  # noqa: BLE001
+        return []
+
+
+def _first_arg_name(tool_name: str):
+    """工具的「第一个参数」叫什么（处理 write("xx") 这种单参数简写）。"""
+    tool = _TOOL_OBJ_BY_NAME.get(tool_name)
+    if tool is None:
+        return None
+    try:
+        schema = tool.args_schema.model_json_schema()
+    except Exception:                                  # noqa: BLE001
+        return None
+    required = schema.get("required") or []
+    props = list((schema.get("properties") or {}).keys())
+    if required:
+        return required[0]
+    return props[0] if props else None
+
+
+def _missing_required(tool_name: str, args: dict) -> bool:
+    tool = _TOOL_OBJ_BY_NAME.get(tool_name)
+    if tool is None:
+        return True
+    try:
+        required = tool.args_schema.model_json_schema().get("required") or []
+    except Exception:                                  # noqa: BLE001
+        return False
+    return any(r not in args for r in required)
+
+
+def _try_json_call(text: str):
+    """OpenAI 风格的整段 JSON：{"name": ..., "arguments": {...}}"""
+    m = _JSON_OBJ_RE.search(text or "")
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(0))
+    except Exception:                                  # noqa: BLE001
+        return None
+    if not isinstance(data, dict):
+        return None
+    raw_name = data.get("name") or data.get("tool") or data.get("function")
+    if not isinstance(raw_name, str):
+        return None
+    tool = _match_tool_name(raw_name)
+    if tool is None:
+        return None
+    args = data.get("arguments") or data.get("args") or {}
+    if not isinstance(args, dict):
+        args = {}
+    if _missing_required(tool, args):
+        return None
+    return tool, args
+
+
+def _parse_textual_call(text: str):
+    """从一段文本里解析出一个工具调用，解析不出返回 None。"""
+    if not text:
+        return None
+    raw = str(text).strip()
+    if not raw or len(raw) > _MAX_CALL_TEXT:
+        return None
+
+    # 去掉 markdown 栅栏 / XML 标记 / 尾部句号
+    for marker in ("<tool_call>", "</tool_call>", "<function_call>",
+                   "</function_call>", "```json", "```"):
+        raw = raw.replace(marker, " ")
+    raw = raw.strip(" \t\r\n`*。.，,")
+
+    # ① 整段就是一个 OpenAI 风格的 JSON 调用
+    call = _try_json_call(raw)
+    if call:
+        return call
+
+    head = _CALL_HEAD_RE.match(raw)
+    if not head:
+        return None
+    # ★ 名字里可能带空格（'odge saved_location'），所以不能只看正则的
+    #   第一段 —— 在第一个括号/冒号处切断，前面都当名字。
+    cut = len(raw)
+    for ch in "({:：":
+        i = raw.find(ch)
+        if 0 <= i < cut:
+            cut = i
+    tool = _match_tool_name(raw[:cut])
+    if tool is None:
+        return None
+
+    rest = raw[cut:].strip()
+    # ★ 不要去掉 { [—— 那会把后面的 JSON 对象切开，json.loads 一定失败，
+    #   结果退化成把第一个引号里的键名当成参数值（实测 set_butler_mood
+    #   会变成 action='action'）。
+    rest = rest.lstrip("(（[:：").strip()
+
+    args = {}
+    valid = _arg_names(tool)
+    if rest:
+        m = _JSON_OBJ_RE.search(rest)
+        if m:
+            try:
+                data = json.loads(m.group(0))
+            except Exception:                          # noqa: BLE001
+                data = None
+            if isinstance(data, dict):
+                if isinstance(data.get("arguments"), dict):
+                    args = dict(data["arguments"])
+                elif isinstance(data.get("args"), dict):
+                    args = dict(data["args"])
+                else:
+                    args = dict(data)
+                # 包装键只在该工具**不叫这个参数名**时才丢弃。
+                # navigate_to_saved_location 的参数恰恰就叫 name，
+                # 无差别丢弃会把 {"name":"书房"} 变成空参数。
+                for wrapper in ("name", "tool", "function"):
+                    if wrapper in args and wrapper not in valid:
+                        args.pop(wrapper)
+        if not args:
+            m2 = _QUOTED_RE.search(rest)
+            if m2:
+                key = _first_arg_name(tool)
+                if key:
+                    args = {key: m2.group(1)}
+
+    if _missing_required(tool, args):
+        return None
+    return tool, args
+
+
+def _recover_textual_tool_calls(response):
+    """模型把工具调用写成了文本 → 恢复成真正的 tool_call。
+
+    · 恢复成功：清空 content（这段���字不能进 checkpoint，否则会被
+      下一轮当成范例模仿），设置 tool_calls。
+    · 看起来像调用但认不出工具：也清空 content，让后面的「空回复
+      兜底」重试一次模型。
+    · 普通文本：原样返回。
+    """
+    if getattr(response, "tool_calls", None):
+        return response                      # 已经是真工具调用，不动
+    content = str(getattr(response, "content", "") or "")
+    if not content.strip():
+        return response
+
+    parsed = _parse_textual_call(content)
+    if parsed:
+        tool, args = parsed
+        print("[AgentNode] ♻️ 模型把工具调用写成了文本 %r → 恢复为 %s(%s)"
+              % (content.strip()[:60], tool, args))
+        try:
+            return response.model_copy(
+                update={"content": "",
+                        "tool_calls": [{"name": tool, "args": args,
+                                        "id": "recovered_%d" % random.randint(0, 9999)}]})
+        except Exception:                              # noqa: BLE001
+            try:
+                response.content = ""
+                response.tool_calls = [{"name": tool, "args": args,
+                                        "id": "recovered"}]
+            except Exception:                          # noqa: BLE001
+                pass
+            return response
+
+    # 看着像调用语法却认不出 → 当空回复处理，触发重试
+    if _CALL_HEAD_RE.match(content.strip()) and \
+            ("(" in content or "{" in content or ":" in content) and \
+            len(content.strip()) <= 80:
+        print("[AgentNode] ⚠️ 模型输出了类似工具调用的文本但无法识别: %r"
+              % content.strip()[:80])
+        try:
+            return response.model_copy(update={"content": ""})
+        except Exception:                              # noqa: BLE001
+            response.content = ""
+            return response
+    return response
 
 
 # ============================================================
@@ -1078,6 +1343,61 @@ def _guard_save_intent(response, user_text: str):
     return _replace_response_calls(response, new_calls)
 
 
+# ============================================================
+# 「我在哪」的确定性护栏（2026-11-01）
+# ------------------------------------------------------------
+# 实测（fishbot-qwen:3b）：
+#   用户: 我在哪        → get_current_position ✓
+#   用户: 当前位置      → get_current_position ✓
+#   用户: 现在在哪      → 不调工具，直接编一句回复 ✗✗✗
+#          '我在主人指定的目的地等待指令。'
+#
+# 编造当前位置比查一下危险得多 —— 用户会据此判断车在哪，进而
+# 下达错误的导航。所以这里只要「用户在问位置」且「模型一个工具都没调」，
+# 就强制去查真实位置。
+#
+# 只在**没有任何工具调用**时介入：模型已经调了别的工具说明它读懂了
+# 意图，不该被这一层改写。
+# ============================================================
+
+# 只认明确的「问位置」句式，避免把「书房在哪」这类导航查询抢过来
+_POS_QUERY_WORDS = ("在哪", "哪儿", "哪里", "当前位置", "现在位置",
+                    "什么位置", "坐标")
+
+_POS_QUERY_EXCLUDE = ("去", "带我去", "前往", "导航", "回", "记", "保存", "删除")
+
+
+def _is_position_query(text: str) -> bool:
+    t = (text or "").strip()
+    if not t or len(t) > 16:
+        return False
+    if any(w in t for w in _POS_QUERY_EXCLUDE):
+        return False
+    if not any(w in t for w in _POS_QUERY_WORDS):
+        return False
+    # 「书房在哪」里的「书房」是已知地点 → 交给导航，不当成问自己位置
+    if _resolve_destination(t) is not None:
+        return False
+    return True
+
+
+def _guard_position_query(response, user_text: str):
+    """用户在问位置，模型却没调工具就开口 → 强制查真实位置。"""
+    if getattr(response, "tool_calls", None):
+        return response
+    if not _is_position_query(user_text):
+        return response
+
+    print("[AgentNode] 🛡️ 用户问的是位置，模型却直接编了一句 %r → "
+          "已强制调用 get_current_position"
+          % str(getattr(response, "content", ""))[:40])
+    return _replace_response_calls(
+        response,
+        [{"name": "get_current_position", "args": {},
+          "id": "guard_position"}],
+        clear_content=True)
+
+
 def _dedupe_exclusive_tool_calls(response):
     """收敛单轮 tool_calls：导航类互斥，避免抢进程 + 数据污染。"""
     calls = list(response.tool_calls)
@@ -1111,6 +1431,64 @@ def _dedupe_exclusive_tool_calls(response):
 
     print("[AgentNode] ⚠️ 同一轮多个冲突工具 %s → 只保留 %s（丢弃 %s）"
           % (names, kept_nav.get("name"), dropped))
+    return _replace_response_calls(response, new_calls)
+
+
+# ============================================================
+# 统一后处理入口
+# ------------------------------------------------------------
+# 模型返回之后的**所有**确定性纠错都在这里，顺序不能乱：
+#
+#   1. 文本化调用恢复   把 'return_to_start()' 变回真 tool_call。
+#                        必须最先，否则后面所有守卫都看不见这个调用。
+#   2. 导航目标纠错     用户说了目的地却要回起点 → 改成去那儿。
+#   3. 保存意图纠错     用户只是要去却调了 save → 改成导航。
+#   4. 位置查询纠错     用户问在哪却直接编答案 → 强制查真实位置。
+#   5. 互斥工具收敛     同一轮多个导航工具只留优先级最高的。
+#
+# 测试里也调这个函数，保证「单测通过」等价于「生产路径通过」——
+# 之前把守卫散在 agent_node 里时，测试只能各测各的，管线顺序错了
+# 单测发现不了。
+# ============================================================
+def postprocess_response(response, user_text: str):
+    response = _recover_textual_tool_calls(response)
+    response = _guard_nav_target(response, user_text)
+    response = _guard_save_intent(response, user_text)
+    response = _guard_position_query(response, user_text)
+    response = _dedupe_exclusive_tool_calls(response)
+    return response
+
+
+def _retry_if_empty(response, last_human_message):
+    """模型返回空（既无 tool_calls 也无 content）时，去掉历史重试一次。
+
+    3B 模型偶尔会「一句话都不说」，对话就断了，用户会以为程序卡死。
+    重试时只给「系统提示 + 最后一句话」，上下文短了命中率明显更高。
+
+    抽成函数是为了让测试能跑**生产同一条路径**：之前这段逻辑写在
+    agent_node 里，测试只能自己模拟，于是「空回复时生产会重试、
+    测试不会」这种差异永远暴露不出来。
+    """
+    if getattr(response, "tool_calls", None):
+        return response
+    if str(getattr(response, "content", "") or "").strip():
+        return response
+    if last_human_message is None:
+        return response
+
+    print("[AgentNode] ⚠️ 模型返回空，去掉历史重试一次")
+    try:
+        retried = llm_with_tools.invoke([
+            SystemMessage(content=_nonce_prompt(ACTIVE_SYSTEM_PROMPT)),
+            last_human_message,
+        ])
+        print("[AgentNode] 重试结果: tool_calls="
+              f"{[tc.get('name') for tc in (getattr(retried, 'tool_calls', None) or [])]} "
+              f"content={str(getattr(retried, 'content', ''))[:120]!r}")
+        return retried
+    except Exception as e:                             # noqa: BLE001
+        print(f"[AgentNode] 重试失败: {e}")
+        return response
 
     # AIMessage 的 tool_calls 是只读属性，用 model_copy 造一个新对象
     try:

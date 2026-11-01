@@ -102,11 +102,7 @@ def _geocode(city):
 
 @tool
 def get_weather(city: str = "") -> str:
-    """查天气：当前天气 + 未来三天预报。
-
-    用户问天气、下不下雨、冷不冷时用。city 填中文城市名，
-    用户没说城市就留空，用默认城市。
-    """
+    """查询天气。用户没说城市就留空 city，用默认城市。"""
     import os
 
     city = (city or "").strip()
@@ -177,11 +173,7 @@ def get_weather(city: str = "") -> str:
 
 @tool
 def get_current_datetime() -> str:
-    """获取当前日期、时间、星期。
-
-    用户问"今天几号/几点/星期几"，或话题涉及"今天/今年"时先调此工具，
-    不要凭训练记忆猜日期。
-    """
+    """获取当前日期时间。问几号/几点/星期几时用。"""
     now = datetime.datetime.now()
     weekday = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
     return "🕐 现在是 %s %s（%s）" % (

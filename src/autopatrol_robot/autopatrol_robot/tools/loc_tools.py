@@ -31,11 +31,7 @@ class DeleteSavedLocationInput(BaseModel):
 
 @tool
 def list_locations() -> str:
-    """
-    列出所有可用地点（预定义 + 自定义）。
-
-    当用户问"有哪些地点"、"可以去哪里"时使用此工具。
-    """
+    """列出所有可用地点（预定义 + 自定义）。用户问有哪些地点时用。"""
     store = get_location_store()
     custom = store.list_all()
 
@@ -61,11 +57,7 @@ def list_locations() -> str:
 
 @tool(args_schema=SaveLocationInput)
 def save_current_location(name: str) -> str:
-    """
-    将机器人当前位置保存为指定名称的自定义地点。
-
-    当用户说"这里是厕所"、"把这里记作书房"时使用此工具。
-    """
+    """把当前位置保存为自定义地点。用户说这里是X、把这里记成X时用。"""
     # ★ 直接向 NavigationService 要结构化坐标，不再解析中文文本。
     #   原实现是 `get_current_position.invoke({})` 然后用正则从
     #   "📍 当前位置: x=1.23米..." 里抠数字，一旦提示文案改动就全部失效，
@@ -146,16 +138,10 @@ def save_current_location(name: str) -> str:
 
 @tool(args_schema=NavigateToSavedInput)
 def navigate_to_saved_location(name: str) -> str:
-    """
-    导航到之前保存的自定义地点。
-
-    当用户说"去厕所"、"去书房"时使用此工具。
-    如果名称不是自定义地点，会回退尝试预定义地点。
-
-    ★ 2026-11-01 用户确认：**只去，不自动回起点**。
-      原来硬编码 return_to_start=True，用户只说“去厕所”，到了之后
-      车又自己跑回起点 —— 完全不是他要的。这条流程已彻底删除。
-    """
+    # ★ 2026-11-01 用户确认：**只去，不自动回起点**。
+    #   原来硬编码 return_to_start=True，用户只说"去厕所"，到了之后
+    #   车又自己跑回起点 —— 完全不是他要的。这条流程已彻底删除。
+    """导航到已保存的地点。用户说"去X"时用。找不到会回退预定义地点。"""
     from autopatrol_robot.nav_manager import launch_navigate_with_return_async
 
     store = get_location_store()
@@ -200,11 +186,7 @@ def list_saved_locations() -> str:
 
 @tool(args_schema=DeleteSavedLocationInput)
 def delete_saved_location(name: str) -> str:
-    """
-    删除之前保存的自定义地点。
-
-    当用户说"删除厕所"、"忘记这个位置"、"清除书房"时使用此工具。
-    """
+    """删除自定义地点。用户说删除X时用。"""
     store = get_location_store()
     return store.delete(name)
 

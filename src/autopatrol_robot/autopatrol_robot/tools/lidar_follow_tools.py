@@ -162,11 +162,7 @@ def stop_lidar_follow_process(force: bool = False) -> bool:
 # ============================================================
 @tool
 def start_lidar_follow() -> str:
-    """开启雷达跟随：小车会跟着前方 40cm 内出现的障碍物移动，保持约 50cm 距离。
-
-    当用户说"开始雷达跟随"、"用雷达跟着我"、"跟着我走"、"雷达跟随"时使用。
-    注意：这是用激光雷达测距跟随，不是摄像头；与「看护模式」互斥。
-    """
+    """开启雷达跟随（跟前方 40cm 内障碍物，保持约 50cm）。用户说跟着我走时用。"""
     global _follow_process
 
     _write_log('=== 请求启动雷达跟随 ===')
@@ -285,10 +281,7 @@ def start_lidar_follow() -> str:
 
 @tool
 def stop_lidar_follow() -> str:
-    """关闭雷达跟随，让小车停下来。
-
-    当用户说"停止雷达跟随"、"别跟着我了"、"关闭跟随"时使用。
-    """
+    """停止雷达跟随。用户说别跟着我了时用。"""
     if not is_lidar_follow_running():
         return 'ℹ️ 雷达跟随未在运行'
 
@@ -303,10 +296,7 @@ def stop_lidar_follow() -> str:
 
 @tool
 def get_lidar_follow_status() -> str:
-    """查询雷达跟随的运行状态。
-
-    当用户问"雷达跟随开了吗"、"跟随状态"时使用。
-    """
+    """查询雷达跟随状态。"""
     if not is_lidar_follow_running():
         return '🔴 雷达跟随未运行'
 

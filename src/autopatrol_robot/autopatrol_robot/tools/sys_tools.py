@@ -11,11 +11,7 @@ from autopatrol_robot.location_store import get_location_store
 
 @tool
 def get_current_position() -> str:
-    """获取机器人当前在地图中的位置和朝向。
-
-    当用户问"我在哪"、"当前位置"时使用此工具。
-    返回的坐标是 map 坐标系下的 AMCL 定位结果。
-    """
+    """获取当前位置和朝向。用户说我在哪、现在在哪时用。"""
     try:
         from autopatrol_robot.navigation_service import get_global_nav_service
 
@@ -70,11 +66,7 @@ def get_current_position() -> str:
 
 @tool
 def get_battery_status() -> str:
-    """
-    获取机器人电池电量。
-
-    当用户问"电量多少"、"还有电吗"时使用。
-    """
+    """查询电池电量。用户问电量多少/还有电吗时用。"""
     return "🔋 电池状态: 正常（详细电量请检查硬件话题）"
 
 

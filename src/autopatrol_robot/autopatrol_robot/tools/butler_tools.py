@@ -73,12 +73,7 @@ class ButlerActionInput(BaseModel):
 
 @tool("set_butler_mood", args_schema=ButlerActionInput)
 def set_butler_mood(action: str, text: Optional[str] = None) -> str:
-    """让管家机器人做表情动作。纯视觉，不控制硬件。
-
-    几乎每次回复都可顺手调一次，让肢体语言和语气一致。
-    挑选：执行指令→approve，等待→think，失败→deny，
-    需澄清→scratch，成功→happy。不要连续两次用同一个动作。
-    """
+    """设置管家动作：approve/think/deny/scratch/happy/wave/listen。几乎每次都调。"""
     if action not in ACTIONS:
         return '⚠️ 不支持的动作: %s（可用: %s）' % (action, _ACTION_HINT)
     if text:
@@ -101,12 +96,7 @@ class ButlerSayInput(BaseModel):
 
 @tool("butler_say", args_schema=ButlerSayInput)
 def butler_say(text: str, action: Optional[str] = 'happy') -> str:
-    """让管家机器人头顶冒出一句短话（附带一个动作）。
-
-    和你返回给用户的正文不同：气泡是**角色在说话**，应当口语化、
-    拟人化，例如「我这就去看看」「有点难办呢」。
-    正文照常写完整回答，气泡只是点睛。
-    """
+    """让管家头顶冒一句口语化的短话（不超过14字）。"""
     act = action if action in ACTIONS else 'happy'
     t = (text or '').strip()
     if not t:
@@ -124,12 +114,7 @@ class ButlerIdleInput(BaseModel):
 
 @tool("randomize_butler_idle", args_schema=ButlerIdleInput)
 def randomize_butler_idle() -> str:
-    """让管家随机挑一个待机小动作（播放一次）。
-
-    用于「角色长时间没人理、自己找点事做」的场景。
-    一般不需要 AI 主动调 —— 前端已经内置了本地待机轮换，
-    这个工具是给后端定时任务或特殊编排用的。
-    """
+    """随机播放一个待机动作。前端已内置本地轮换，一般不用主动调。"""
     import random
     pool = ['happy', 'think', 'scratch', 'deny', 'wave', 'listen']
     act = random.choice(pool)

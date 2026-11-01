@@ -118,22 +118,13 @@ def navigate_to_xy(x: float, y: float, yaw: float = 0.0) -> str:
 
 @tool
 def cancel_navigation() -> str:
-    """
-    取消当前正在执行的导航任务。
-
-    当用户说"停下"、"停止导航"、"取消"时使用此工具。
-    """
+    """取消当前导航。用户说停下/取消时用。"""
     return _cancel_nav()
 
 
 @tool(args_schema=NavigateSequenceInput)
 def navigate_sequence(locations: list[str]) -> str:
-    """
-    依次导航到多个地点。
-
-    用户说"先去A再去B"、"从A到B再到C"、"依次去A和B"时用。
-    locations 是所有地点的列表，如 ["厨房", "客厅"]。
-    """
+    """依次导航到多个地点，用户说先去A再去B时用。"""
     if not locations:
         return "❌ 导航队列为空"
 
@@ -174,19 +165,11 @@ def navigate_sequence(locations: list[str]) -> str:
 
 @tool
 def return_to_start() -> str:
-    """
-    让机器人返回起点位置（使用 fishbot_application nav_to_pose）。
-
-    当用户说"回家"、"回起点"、"返回起点"时使用此工具。
-    """
+    """返回起点。用户说回家/回起点时用。"""
     return launch_return_to_start()
 
 
 @tool
 def get_navigation_status() -> str:
-    """
-    查询当前导航任务状态。
-
-    当用户问"导航怎么样了"、"到了吗"时使用此工具。
-    """
+    """查询导航状态。用户问到了吗时用。"""
     return get_nav_status()
