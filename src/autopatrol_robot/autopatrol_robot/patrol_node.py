@@ -11,6 +11,18 @@ from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Imu
 import time
 from std_msgs.msg import Bool
+
+# ============================================================
+# 导航循环的僵尸防护参数（2026-11-01）
+# ------------------------------------------------------------
+# nav2 掉线后 isTaskComplete() 永远不会变 True，原来的 while 会无限
+# 循环、日志刷同一行 ETA，进程又不响应父进程信号（setsid），最后变成
+# 刷不掉的僵尸，一直占着 /navigate_to_pose 的 action client。
+# ============================================================
+NAV_STALL_TIMEOUT_SEC = 20.0    # 反馈连续不变化多久判失联
+NAV_MAX_WALL_SEC = 900.0        # 单次导航墙钟硬上限
+
+
 class ServoClient:
     """舵机控制（语音播报）客户端 — 复用已有 Node，避免 ROS2 实体泄漏"""
     def __init__(self, node: Node = None):
@@ -305,6 +317,20 @@ class PatrolNode(BasicNavigator):
         self.goToPose(target_pose)
         last_status_time = time.time()
 
+        # ============================================================
+        # 僵尸防护（2026-11-01 实机事故）
+        # ------------------------------------------------------------
+        # nav2 被关掉后，action goal 永远没有 result，isTaskComplete()
+        # 永远返回 False → 这里会无限循环。实测 nav_to_pose 就这样卡了
+        # 二十多分钟，日志里每秒刷同一行 ETA，父进程重启也管不到它
+        # （preexec_fn=os.setsid 让它独立成会话组）。
+        #
+        # 两道保险：反馈长时间不变化 → 判失联；墙钟硬上限。
+        # ============================================================
+        wall_start = time.time()
+        last_fb_sig = None
+        last_fb_change = time.time()
+
         while not self.isTaskComplete():
             if self._nav_canceled:
                 self.get_logger().info('导航已被取消')
@@ -320,10 +346,28 @@ class PatrolNode(BasicNavigator):
                 remaining = Duration.from_msg(
                     feedback.estimated_time_remaining
                 ).nanoseconds / 1e9
+                sig = (round(remaining, 2),
+                       round(float(feedback.distance_remaining), 2))
+                if last_fb_sig is None or sig != last_fb_sig:
+                    last_fb_sig = sig
+                    last_fb_change = now
                 self.get_logger().info(
                     f'预计剩余: {remaining:.1f}s, '
                     f'距离: {feedback.distance_remaining:.2f}m'
                 )
+            # 保险 1：反馈长时间不变化 → Nav2 大概率掉线
+            if now - last_fb_change > NAV_STALL_TIMEOUT_SEC:
+                self.get_logger().error(
+                    f'⚠️ 反馈已 {NAV_STALL_TIMEOUT_SEC:.0f}s 无变化，'
+                    f'判定与 Nav2 失联，主动退出（避免僵尸进程）')
+                self.cancelTask()
+                return
+            # 保险 2：墙钟总超时
+            if now - wall_start > NAV_MAX_WALL_SEC:
+                self.get_logger().error(
+                    f'⚠️ 导航已运行 {NAV_MAX_WALL_SEC:.0f}s 仍无结果，主动退出')
+                self.cancelTask()
+                return
             # 降频到 ~5Hz，避免 isTaskComplete 的 spin_until_future_complete
             # 无间隔重复调用导致 executor 竞态
             time.sleep(0.1)
@@ -364,6 +408,11 @@ class PatrolNode(BasicNavigator):
         self.goToPose(target_pose)
         last_status_time = time.time()
 
+        # 僵尸防护，同 nav_to_pose（详见顶部常量注释）
+        wall_start = time.time()
+        last_fb_sig = None
+        last_fb_change = time.time()
+
         while not self.isTaskComplete():
             if self._nav_canceled:
                 self.get_logger().info('导航已被取消')
@@ -378,10 +427,26 @@ class PatrolNode(BasicNavigator):
                 remaining = Duration.from_msg(
                     feedback.estimated_time_remaining
                 ).nanoseconds / 1e9
+                sig = (round(remaining, 2),
+                       round(float(feedback.distance_remaining), 2))
+                if last_fb_sig is None or sig != last_fb_sig:
+                    last_fb_sig = sig
+                    last_fb_change = now
                 self.get_logger().info(
                     f'预计剩余: {remaining:.1f}s, '
                     f'距离: {feedback.distance_remaining:.2f}m'
                 )
+            if now - last_fb_change > NAV_STALL_TIMEOUT_SEC:
+                self.get_logger().error(
+                    f'⚠️ 反馈已 {NAV_STALL_TIMEOUT_SEC:.0f}s 无变化，'
+                    f'判定与 Nav2 失联，主动退出（避免僵尸进程）')
+                self.cancelTask()
+                return 'servo_failed'
+            if now - wall_start > NAV_MAX_WALL_SEC:
+                self.get_logger().error(
+                    f'⚠️ 导航已运行 {NAV_MAX_WALL_SEC:.0f}s 仍无结果，主动退出')
+                self.cancelTask()
+                return 'servo_failed'
             time.sleep(0.1)
 
         result = self.getResult()

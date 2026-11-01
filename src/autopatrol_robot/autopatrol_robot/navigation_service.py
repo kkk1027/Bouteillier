@@ -31,6 +31,8 @@ navigation_service.py
   - 支持连续导航（不重复初始化）
 """
 
+import math
+import os
 import threading
 import time
 from enum import Enum
@@ -108,6 +110,7 @@ class NavigationService:
         self._pose_node = None
         self._pose_latest = None        # {'x','y','yaw'}
         self._pose_stamp = None         # time.time()
+        self._pose_std = None           # (σ_xy, σ_yaw) 供定位质量判断
         self._pose_ready = False
         self._pose_lock = threading.Lock()
         try:
@@ -136,13 +139,21 @@ class NavigationService:
             def _cb(monitor_self, msg):
                 p = msg.pose.pose.position
                 q = msg.pose.pose.orientation
-                import math
                 yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
                                  1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+                # 协方差对角线：0=var(x)，7=var(y)，35=var(yaw)
+                # 转成标准差，方便和"米/弧度"直接比。
+                cov = msg.pose.covariance
+                try:
+                    std_xy = math.sqrt(max(0.0, max(cov[0], cov[7])))
+                    std_yaw = math.sqrt(max(0.0, cov[35]))
+                except Exception:       # noqa: BLE001
+                    std_xy = std_yaw = float('inf')
                 with monitor_self._svc._pose_lock:
                     monitor_self._svc._pose_latest = {
                         'x': float(p.x), 'y': float(p.y), 'yaw': float(yaw)}
                     monitor_self._svc._pose_stamp = time.time()
+                    monitor_self._svc._pose_std = (std_xy, std_yaw)
 
         self._pose_node = _PoseMonitor(self)
         self._pose_executor = SingleThreadedExecutor()
@@ -467,6 +478,47 @@ class NavigationService:
         if detailed:
             return pos, reason
         return pos
+
+    def get_localization_quality(self):
+        """返回当前 AMCL 定位质量：(ok, std_xy, std_yaw, reason)。
+
+        ============================================================
+        为什么需要这个接口（2026-11-01 实机事故）
+        ============================================================
+        现场：载入地图后 auto_localizer 做了全局定位（粒子云撒满全图），
+        120 秒都没收敛（σ_xy 一直在 0.1~1.7m 之间晃）。可这时候用户说了
+        「去厕所」，导航照样启动 —— 车按着**错误的位姿**往前开，位姿在
+        地图上乱飘，越开 σ 越大，120s 到期又重撒一遍粒子，形成
+        「有规律乱飘」的死循环。
+
+        结论：**定位没收敛就不该允许导航**。这个判断必须放在代码层，
+        不能指望用户或 AI 自己去注意日志。
+        """
+        ok_xy = float(os.environ.get('FISHBOT_LOC_OK_STD_XY', '0.30'))
+        ok_yaw = float(os.environ.get('FISHBOT_LOC_OK_STD_YAW', '0.30'))
+
+        with self._pose_lock:
+            stamp = self._pose_stamp
+            std = self._pose_std
+
+        if stamp is None or std is None:
+            # 从没收到过 /amcl_pose：可能是 AMCL 刚重启。
+            # 此时无法判断，放行（否则每次冷启动都导航不了）。
+            return True, None, None, '尚未收到 /amcl_pose，无法判断定位质量'
+
+        age = time.time() - stamp
+        if age > 3.0:
+            return True, std[0], std[1], 'AMCL 位姿已过期（%.1fs 前）' % age
+
+        std_xy, std_yaw = std
+        if std_xy <= ok_xy and std_yaw <= ok_yaw:
+            return (True, std_xy, std_yaw,
+                    '定位良好（σ_xy=%.2fm σ_yaw=%.1f°）'
+                    % (std_xy, std_yaw * 57.29578))
+        return (False, std_xy, std_yaw,
+                '定位未收敛（σ_xy=%.2fm σ_yaw=%.1f°，门限 %.2fm/%.1f°）'
+                % (std_xy, std_yaw * 57.29578,
+                   ok_xy, ok_yaw * 57.29578))
 
     def get_target_points(self) -> list:
         """

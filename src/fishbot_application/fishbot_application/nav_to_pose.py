@@ -7,6 +7,30 @@ from tf_transformations import quaternion_from_euler
 import time
 
 
+# ============================================================
+# 僵尸防护（2026-11-01 实机事故）
+# ------------------------------------------------------------
+# 现场：nav2 栈被关掉之后，本节点还在跑，日志里每秒刷
+#       预计: 9.098794967 s 后到达
+#      预计: 9.098794967 s 后到达      ← 同一行重复了几十次
+# 原因：nav2 没了 → action goal 永远没有 result →
+#       navigator.isTaskComplete() 永远 False → while 死循环。
+#       又因为 stdout/stderr 被 DEVNULL、父进程（web_controller）
+#       重启后也失去了对它的管控 → 变成刷新不掉的僵尸进程，
+#       一直占着 /navigate_to_pose 的 action client。
+#
+# 原来唯一的兜底是 `feedback.navigation_time > 600s`，
+# 但 nav2 掉线时 feedback 根本不更新，那个条件永远不成立。
+#
+# 现在加两道保险：
+#   1. 反馈「没变化」超时：连续 STALL_TIMEOUT 秒拿到同一份
+#      estimated_time_remaining → 判定失去连接，主动退出；
+#   2. 墙钟总超时：从启动算起 MAX_WALL_SEC 秒还没结果 → 退出。
+# ============================================================
+STALL_TIMEOUT_SEC = 20.0      # 反馈连续不变化多久就认为失联
+MAX_WALL_SEC = 900.0          # 单次导航墙钟硬上限
+
+
 def main():
     rclpy.init()
     navigator = BasicNavigator()
@@ -29,15 +53,43 @@ def main():
     goal_pose.pose.orientation.w = q[3]
     # 发送目标接收反馈结果
     navigator.goToPose(goal_pose)
+
+    wall_start = time.time()
+    last_eta = None
+    last_eta_change = time.time()
+
     while not navigator.isTaskComplete():
         feedback = navigator.getFeedback()
-        navigator.get_logger().info(
-            f'预计: {Duration.from_msg(feedback.estimated_time_remaining).nanoseconds / 1e9} s 后到达')
+        if feedback is not None:
+            eta = Duration.from_msg(
+                feedback.estimated_time_remaining).nanoseconds / 1e9
+            if last_eta is None or abs(eta - last_eta) > 1e-3:
+                last_eta = eta
+                last_eta_change = time.time()
+            navigator.get_logger().info(f'预计: {eta} s 后到达')
+            # 超时自动取消
+            if Duration.from_msg(feedback.navigation_time) > Duration(
+                    seconds=600.0):
+                navigator.cancelTask()
+        else:
+            navigator.get_logger().warn('尚未收到导航反馈')
+
+        now = time.time()
+        # ---- 保险 1：反馈长时间不变化 → nav2 大概率已掉线 ----
+        if now - last_eta_change > STALL_TIMEOUT_SEC:
+            navigator.get_logger().error(
+                f'⚠️ 反馈已 {STALL_TIMEOUT_SEC:.0f}s 无变化，'
+                f'判定与 Nav2 失联，主动退出（避免变成僵尸进程）')
+            break
+        # ---- 保险 2：墙钟总超时 ----
+        if now - wall_start > MAX_WALL_SEC:
+            navigator.get_logger().error(
+                f'⚠️ 导航已运行 {MAX_WALL_SEC:.0f}s 仍无结果，主动退出')
+            navigator.cancelTask()
+            break
+
         # 每秒刷新 nav_status=True，维持 ESP32 心跳防止丢包触发闲时降噪
         nav_status_pub.publish(Bool(data=True))
-        # 超时自动取消
-        if Duration.from_msg(feedback.navigation_time) > Duration(seconds=600.0):
-            navigator.cancelTask()
         time.sleep(1.0)
     # 最终结果判断
     result = navigator.getResult()

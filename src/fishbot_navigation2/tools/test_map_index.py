@@ -79,7 +79,7 @@ check('该分支在 _trigger_global_localization 之前',
       tb.find('_cov_below_converge') < tb.find('_trigger_global_localization')
       if '_trigger_global_localization' in tb else True)
 check('新增 _cov_below_converge 方法',
-      'def _cov_below_converge(self) -> bool:' in CODE)
+      'def _cov_below_converge(self, scale: float = 1.0) -> bool:' in CODE)
 
 
 # ============================================================

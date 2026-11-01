@@ -207,6 +207,53 @@ def _blocked_by_follow_msg() -> Optional[str]:
 
 
 # ============================================================
+# 定位质量闸门（2026-11-01 实机事故）
+# ------------------------------------------------------------
+# 现场日志（auto_localizer + amcl_tracer）：
+#   11:47:25  载入地图 → 全局定位开始（粒子云撒满全图）
+#   11:47:25 ~ 11:50:03   σ_xy 一直在 0.11 ~ 1.69m 之间晃，**从未收敛**
+#   11:48:05  却启动了 return_to_start  → 车按错误位姿开动
+#   11:49:49  又启动了去厕所的导航        → σ_xy 被拉到 1.69m
+#   11:49:25  120s 超时 → 重新撒粒子     → 位姿再次全图乱跳
+#   结果：用户看到「小车在地图上的位姿有规律乱飘」
+#
+# 责任划分很清楚：**定位没收敛时就不该允许导航**。
+# 车按错误位姿行驶只会让 σ 越来越大，进而触发重撒，形成正反馈。
+#
+# 阈值可通过环境变量调整：
+#   FISHBOT_LOC_OK_STD_XY   默认 0.30 m
+#   FISHBOT_LOC_OK_STD_YAW  默认 0.30 rad
+#   FISHBOT_NAV_IGNORE_LOC=1  彻底关闭本闸门（调试用）
+# ============================================================
+def _localization_block_msg() -> Optional[str]:
+    """定位未收敛时返回拒绝原因，否则 None。"""
+    if os.environ.get('FISHBOT_NAV_IGNORE_LOC', '') == '1':
+        return None
+    try:
+        from autopatrol_robot.navigation_service import (
+            get_global_nav_service)
+        svc = get_global_nav_service()
+        if svc is None:
+            return None            # 导航服务还没初始化，无从判断，放行
+        ok, std_xy, std_yaw, why = svc.get_localization_quality()
+    except Exception as exc:       # noqa: BLE001 - 判断失败不能挡住导航
+        print('[导航] ⚠️ 定位质量检查失败（不影响导航）: %s' % exc)
+        return None
+
+    if ok:
+        return None
+
+    print('[导航] 🚫 定位未收敛，拒绝启动导航：%s' % why)
+    return (
+        "❌ 定位尚未收敛，现在出发会走错方向。\n"
+        "   当前 %s\n"
+        "   全局定位需要**移动/转动小车**才能收敛（静止时几乎不动）。\n"
+        "   请先缓慢推动或原地转动小车几秒，等网页上的车头图标稳住再下指令。"
+        % why
+    )
+
+
+# ============================================================
 # 导航抢占（preempt）：新目标自动中断旧目标
 # ------------------------------------------------------------
 # 【为什么必须抢占 —— 2026-11-01 实机日志实锤】
@@ -288,8 +335,27 @@ def _preempt_active_nav() -> str:
     return target
 
 
-def _monitor_process():
-    """后台监控线程：等待 CLI 进程结束并清理状态。结束时会通知回调。"""
+def _monitor_process(report: bool = True):
+    """后台监控线程：等待 CLI 进程结束并清理状态。结束时会通知回调。
+
+    report=False 时不发「completed / failed」回调 —— 供
+    「导航 + 自动返航」这类由 _async_*_worker 接管上报的流程使用。
+
+    ============================================================
+    为什么要这个开关（2026-11-01 实机日志）
+    ============================================================
+    日志里同一次到达被播报了两遍：
+        [NavPhase] completed: ✅ 导航完成：厕所
+        [NavPhase] arrived:   ✅ 已到达 厕所！
+    reason：launch_navigate_by_index 启动了 _monitor_process 盯这个
+    subprocess，而 launch_navigate_with_return_async 又启动了
+    _async_navigate_and_return_worker 盯同一个 subprocess。
+    进程一退出，两个线程都拿到 rc==0，于是各自 notify 一次。
+
+    而且语义也不对：对「到达后自动回起点」这个流程，真正的
+    completed **应该是「已回到起点」**，而不是「到达目标」。
+    所以带返航的流程一律静音 monitor，只由 worker 上报。
+    """
     global _active_nav_process, _active_nav_target
     proc = _active_nav_process
     target = _active_nav_target
@@ -310,6 +376,9 @@ def _monitor_process():
             _active_nav_target = ""
     _cleanup_process(proc)
 
+    if not report:
+        return
+
     # 通知回调
     # ★ 被抢占打断（用户改主意）不算失败 —— 否则 UI 会先弹
     #   「❌ 导航失败：回起点」，再弹「📍 正在前往厕所」，很吓人。
@@ -327,13 +396,15 @@ def _monitor_process():
 # Public API
 # ============================================================
 
-def launch_navigate_by_index(index: int, target_name: str = "") -> str:
+def launch_navigate_by_index(index: int, target_name: str = "",
+                             silent: bool = False) -> str:
     """
     通过航点索引启动 CLI 导航（非阻塞，1-based）。
 
     Args:
         index: 航点索引（1-based，与 autopatrol.launch.py 的 target_indices 一致）
         target_name: 目标名称（用于日志和状态显示）
+        silent: True 时不发回调（由上层 worker 统一上报，见 _monitor_process）
 
     Returns:
         结果描述字符串
@@ -344,6 +415,9 @@ def launch_navigate_by_index(index: int, target_name: str = "") -> str:
         _blk = _blocked_by_follow_msg()
         if _blk:
             return _blk
+        loc_blk = _localization_block_msg()
+        if loc_blk:
+            return loc_blk
         # 说新目的地 = 改主意，旧任务立即作废（详见 _preempt_active_nav）
         preempted = _preempt_active_nav()
 
@@ -371,12 +445,14 @@ def launch_navigate_by_index(index: int, target_name: str = "") -> str:
             f"🛑 已中断「{preempted}」，改为前往 {new_target}")
 
     # 启动监控线程
-    threading.Thread(target=_monitor_process, daemon=True).start()
+    threading.Thread(target=_monitor_process, args=(not silent,),
+                     daemon=True).start()
 
     return f"📍 正在前往 {new_target}..."
 
 
-def launch_navigate_sequence(indices: list, target_names: str = "") -> str:
+def launch_navigate_sequence(indices: list, target_names: str = "",
+                             silent: bool = False) -> str:
     """
     一次 subprocess 完成多目标序列导航（patrol_node 内部按序执行）。
 
@@ -399,6 +475,9 @@ def launch_navigate_sequence(indices: list, target_names: str = "") -> str:
         _blk = _blocked_by_follow_msg()
         if _blk:
             return _blk
+        loc_blk = _localization_block_msg()
+        if loc_blk:
+            return loc_blk
         preempted = _preempt_active_nav()
 
         indices_str = ','.join(str(i) for i in indices)
@@ -425,16 +504,19 @@ def launch_navigate_sequence(indices: list, target_names: str = "") -> str:
             "preempted",
             f"🛑 已中断「{preempted}」，改为执行序列 {new_target}")
 
-    threading.Thread(target=_monitor_process, daemon=True).start()
+    threading.Thread(target=_monitor_process, args=(not silent,),
+                     daemon=True).start()
     return f"📍 序列导航开始：{new_target}"
 
 
-def launch_return_to_start() -> str:
+def launch_return_to_start(silent: bool = False) -> str:
     """
     启动返航到起点 —— 使用 fishbot_application 的 nav_to_pose 节点。
 
     与 launch_navigate_by_index 一致：通过 CLI 子进程运行，
     受全局互斥锁保护，与 Web UI 导航互斥。
+
+    silent=True 时不发回调（供「导航+自动返航」worker 统一上报）。
     """
     global _active_nav_process, _active_nav_target
 
@@ -442,6 +524,9 @@ def launch_return_to_start() -> str:
         _blk = _blocked_by_follow_msg()
         if _blk:
             return _blk
+        loc_blk = _localization_block_msg()
+        if loc_blk:
+            return loc_blk
         preempted = _preempt_active_nav()
 
         fishbot_ws = _get_fishbot_ws()
@@ -465,7 +550,8 @@ def launch_return_to_start() -> str:
             "preempted",
             f"🛑 已中断「{preempted}」，改为返回起点")
 
-    threading.Thread(target=_monitor_process, daemon=True).start()
+    threading.Thread(target=_monitor_process, args=(not silent,),
+                     daemon=True).start()
     return "📍 正在返回起点..."
 
 
@@ -481,6 +567,9 @@ def launch_navigate_xy(x: float, y: float, yaw: float) -> str:
         _blk = _blocked_by_follow_msg()
         if _blk:
             return _blk
+        loc_blk = _localization_block_msg()
+        if loc_blk:
+            return loc_blk
         preempted = _preempt_active_nav()
 
         fishbot_ws = _get_fishbot_ws()
@@ -656,7 +745,9 @@ def launch_navigate_with_return_async(index: int, name: str,
         启动确认字符串
     """
     # Step 1: Launch nav to target
-    result = launch_navigate_by_index(index, name)
+    # silent=True：本流程由 worker 统一上报阶段，monitor 再报一次会变成
+    # 「completed: 导航完成：厕所」+「arrived: 已到达 厕所！」两条重复播报。
+    result = launch_navigate_by_index(index, name, silent=True)
     if "⚠️" in result:
         return f"❌ 启动导航失败：{result}"
 
@@ -696,7 +787,7 @@ def launch_navigate_sequence_async(indices: list, names: str = "",
     Returns:
         启动确认字符串
     """
-    result = launch_navigate_sequence(indices, names)
+    result = launch_navigate_sequence(indices, names, silent=True)
     if "⚠️" in result:
         return f"❌ 启动序列导航失败：{result}"
 
@@ -769,7 +860,9 @@ def _async_navigate_and_return_worker(target_name: str, return_to_start: bool):
 
     time.sleep(0.5)  # 短暂间隙
 
-    ret_result = launch_return_to_start()
+    # silent=True：返航完成后的「completed: 已回到起点」由本 worker 上报，
+    # monitor 再报一次会多出一条「✅ 导航完成：回起点」。
+    ret_result = launch_return_to_start(silent=True)
     if "⚠️" in ret_result:
         _notify_callbacks("failed",
                           f"❌ 返航启动失败：{ret_result}")
@@ -872,7 +965,7 @@ def _async_sequence_and_return_worker(target_name: str, return_to_start: bool):
 
     time.sleep(0.5)
 
-    ret_result = launch_return_to_start()
+    ret_result = launch_return_to_start(silent=True)
     if "⚠️" in ret_result:
         _notify_callbacks("failed",
                           f"❌ 返航启动失败：{ret_result}")

@@ -1097,6 +1097,13 @@ _UNIQUE_MARKS = (
     'fishbot_navigation2/lib/fishbot_navigation2/auto_localizer.py',
     'micro_ros_agent',
     'micro-ros-agent',
+    # ★ 导航子进程（2026-11-01 补）
+    # 这两个由 nav_manager 用 preexec_fn=os.setsid 拉起，自成会话组，
+    # web_controller 一重启就彻底失去管控。实测 nav_to_pose 在 nav2 关闭
+    # 后卡在 isTaskComplete() 死循环里跑了二十多分钟，一直占着
+    # /navigate_to_pose 的 action client，导致后续导航全部异常。
+    'fishbot_application/lib/fishbot_application/nav_to_pose',
+    'autopatrol_robot/lib/autopatrol_robot/patrol_node',
     # 建图模式（manual_mapping.launch.py）会起这些
     'cartographer_ros/cartographer_node',
     'cartographer_occupancy_grid_node',
@@ -2337,6 +2344,30 @@ def main():
     signal.signal(signal.SIGTERM, _signal_handler)
 
     rclpy.init()
+
+    # ============================================================
+    # 启动时清理上一轮遗留的导航子进程（2026-11-01 实机事故）
+    # ------------------------------------------------------------
+    # nav_manager 用 preexec_fn=os.setsid 拉起 nav_to_pose / patrol_node，
+    # 它们自成会话组，web_controller 一退出就彻底失去管控（不随父进程
+    # 的进程组信号退出）。
+    #
+    # 实测：nav2 被关掉后 nav_to_pose 卡在 isTaskComplete() 死循环里
+    # 跑了二十多分钟、日志每秒刷同一行 ETA，一直占着 /navigate_to_pose
+    # 的 action client —— 导致之后所有导航都异常，而且用户以为服务已
+    # 经全停了。
+    #
+    # 所以在**每次启动**时就扫一遍，把上一轮的残骸清掉。
+    # ============================================================
+    try:
+        from autopatrol_robot.nav_manager import (
+            _reap_orphan_nav_processes, get_global_nav_lock)
+        with get_global_nav_lock():
+            n = _reap_orphan_nav_processes()
+        if n:
+            print("🧹 启动清理：已回收 %d 个上一轮遗留的导航进程" % n)
+    except Exception as exc:               # noqa: BLE001 - 不能挡住启动
+        print("⚠️ 启动清理导航孤儿进程失败（不影响启动）: %s" % exc)
 
     # 创建 NavigationService（统一导航入口，AI 和 Web 共享）
     # 注意：不在此处 wait_until_ready()——Nav2 由用户通过 Web UI 的

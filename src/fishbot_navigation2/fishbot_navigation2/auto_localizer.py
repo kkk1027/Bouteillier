@@ -110,6 +110,9 @@ class AutoLocalizer(Node):
         self.declare_parameter('converge_hold_sec', 3.0)
         self.declare_parameter('timeout_sec', 120.0)
         self.declare_parameter('timeout_retries', 2)
+        # 超时时若 σ 已在收敛线 N 倍以内，视为「已很接近」，不重撒
+        # （重撒会把本来正确的位姿扔掉 → 米级瞬移 → 有规律乱飘）
+        self.declare_parameter('almost_converge_scale', 2.5)
         # ==========================================================
         # 收敛后是否还刷新 map→odom（2026-10-31 二次修订）
         # ----------------------------------------------------------
@@ -205,6 +208,8 @@ class AutoLocalizer(Node):
         # 传），实际行为已改由 good_enough_cov_xy/yaw 自适应控制。
         self.timeout_retries = int(
             self.get_parameter('timeout_retries').value)
+        self.almost_converge_scale = max(
+            1.0, float(self.get_parameter('almost_converge_scale').value))
         self.collapse_cov_xy = float(
             self.get_parameter('collapse_cov_xy').value)
         self.collapse_cov_yaw = float(
@@ -266,6 +271,8 @@ class AutoLocalizer(Node):
         self._last_collapse_time = None
         # 是否已就「粒子好但地图校验不过」告警过
         self._blocked_by_map_warned = False
+        # “已很接近收敛所以不重撒”的提示已打印次数（限流）
+        self._nearly_converged_reported = 0
         # 激光健康度：用于区分「车没动」与「根本没激光」
         self._scan_count = 0
         self._last_scan_time = None
@@ -668,17 +675,23 @@ class AutoLocalizer(Node):
         return (std_xy <= self.good_enough_cov_xy
                 and std_yaw <= self.good_enough_cov_yaw)
 
-    def _cov_below_converge(self) -> bool:
+    def _cov_below_converge(self, scale: float = 1.0) -> bool:
         """协方差是否已达到**收敛判据**（但可能被地图校验卡住）。
 
         用于区分「粒子云真的没收敛」与「粒子云很好但地图校验不过」：
         前者需要重撒，后者绝不能重撒（会把正确位姿扔掉）。
+
+        Args:
+            scale: 放宽倍数。scale=2.5 表示只要 σ 在收敛线 2.5 倍以内
+                就算「已经很接近」，此时重撒同样是灾难。
         """
         if self._latest_cov is None:
             return False
         var_x, var_y, var_yaw = self._latest_cov
-        return (math.sqrt(max(0.0, max(var_x, var_y))) <= self.converge_cov_xy
-                and math.sqrt(max(0.0, var_yaw)) <= self.converge_cov_yaw)
+        return (math.sqrt(max(0.0, max(var_x, var_y)))
+                <= self.converge_cov_xy * scale
+                and math.sqrt(max(0.0, var_yaw))
+                <= self.converge_cov_yaw * scale)
 
     def _maybe_request_nomotion(self, now) -> None:
         # ==========================================================
@@ -1040,6 +1053,37 @@ class AutoLocalizer(Node):
             self._start_time = self.get_clock().now()
             self._converged_since = None
             return
+
+        # ========================================================
+        # ★ 粒子云「已经很接近收敛」时也不要重撒（2026-11-01）
+        # --------------------------------------------------------
+        # 实测（2026-11-01 事故日志）：
+        #   σ_xy 从 1.50m 一路降到 0.11m（72s 时），但收敛线是 0.08m ——
+        #   差 0.03m 就判失败，120s 一到把粒子云撒满全图，
+        #   位姿瞬间全图乱跳，然后重新收敛、再次超时、再次跳走。
+        #   用户看到的就是「有规律乱飘」。
+        #
+        # σ 已降到收敛线 2.5 倍以内，说明**定位基本是对的**，
+        # 重撒只会把对的扔掉。此时改为延长截止时间（不重撒），
+        # 给 AMCL 更多时间自然收敛。
+        # ========================================================
+        if self._latest_cov is not None and \
+                self._cov_below_converge(scale=self.almost_converge_scale):
+            if self._nearly_converged_reported < 3:
+                self._nearly_converged_reported += 1
+                self.get_logger().info(
+                    '已 %.0fs 未达标，但粒子云已很集中'
+                    '（σ_xy=%.3fm σ_yaw=%.1f°，门限 %.3fm），'
+                    '**不重撒**，延长等待'
+                    % (elapsed,
+                       math.sqrt(max(0.0, max(self._latest_cov[0],
+                                              self._latest_cov[1]))),
+                       math.degrees(math.sqrt(max(0.0, self._latest_cov[2]))),
+                       self.converge_cov_xy))
+            self._start_time = self.get_clock().now()
+            self._converged_since = None
+            return
+
         # 超时不等于定位失败：粒子云没收敛往往只是这一轮撒得不好。
         # 重撒一次粒子通常就能成功，所以先重试再放弃。
         # 地图压根没收到时重试没意义，直接走超时诊断。
