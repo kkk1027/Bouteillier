@@ -2304,8 +2304,8 @@
             transform: translateX(-50%);
             top: 10px;
             z-index: 60;
-            width: min(430px, calc(100vw - 190px));
-            padding: 7px 13px 8px;
+            width: min(360px, calc(100vw - 170px));
+            padding: 6px 12px 7px;
             border-radius: 14px;
             background: rgba(255, 250, 243, 0.94);
             backdrop-filter: blur(10px);
@@ -2330,15 +2330,52 @@
            就绪后收成一颗小药丸（圆点 + 就绪 + 匹配率），不占地方但一直在。
            药丸本身仍然可以读，只是不再需要那么大一块。
            ============================================================ */
-        .loc-bar.is-pill {
-            width: auto;
-            padding: 6px 14px;
-            border-radius: 999px;
+        /* ★ 2026-11-01 再收一档：就绪后只留一个点。
+              用户反馈"缩略成点或者保留最小的必要信息，现在还是太明显了"。
+              所以不再保留文字胶囊 —— 就一个 20px 的圆点，半透明地挂在
+              顶部中间。想看细节就点它（触屏）或悬停（桌面），
+              展开成一行文字，再点一次收回去。 */
+        .loc-bar.is-min {
+            width: 20px;
+            height: 20px;
+            padding: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 50%;
+            opacity: .5;
+            box-shadow: none;
+            background: rgba(255, 250, 243, .55);
+            transition: opacity .25s ease, width .2s ease,
+                        height .2s ease, padding .2s ease;
         }
-        .loc-bar.is-pill .loc-track,
-        .loc-bar.is-pill .loc-reason { display: none; }
-        .loc-bar.is-pill .loc-head { gap: 6px; }
-        .loc-bar.is-pill .loc-meta { margin-left: 10px; }
+        .loc-bar.is-min .loc-head { gap: 0; }
+        .loc-bar.is-min .loc-title,
+        .loc-bar.is-min .loc-meta,
+        .loc-bar.is-min .loc-track,
+        .loc-bar.is-min .loc-reason { display: none; }
+
+        /* 悬停 / 点开时才展开成一行 */
+        .loc-bar.is-min:hover,
+        .loc-bar.is-min.is-open {
+            width: auto;
+            height: auto;
+            padding: 5px 12px;
+            border-radius: 999px;
+            opacity: 1;
+            box-shadow: 0 4px 14px rgba(150, 105, 62, .12);
+            background: rgba(255, 250, 243, .94);
+        }
+        .loc-bar.is-min:hover .loc-title,
+        .loc-bar.is-min.is-open .loc-title,
+        .loc-bar.is-min:hover .loc-meta,
+        .loc-bar.is-min.is-open .loc-meta { display: inline; }
+
+        /* 未就绪时也压低存在感：字号更小、整体半透明 */
+        .loc-bar:not(.is-min) {
+            font-size: 11px;
+            opacity: .88;
+        }
 
         .loc-head {
             display: flex;
@@ -3062,9 +3099,9 @@
             animation: btWinePour 4.6s ease-in-out both;
         }
 
-        /* 右手抬起来扶着杯子 */
+        /* 右手抬起来扶着杯子（抬得比之前低一点，免得整条胳膊甩出去） */
         .butler-unit.is-wine .bt-arm.r {
-            transform: rotate(-58deg) translateY(-14px);
+            transform: rotate(-42deg) translateY(-9px);
         }
 
         .butler-unit.is-wine .bt-eye {
@@ -3080,15 +3117,22 @@
             14%  { opacity: 1; transform: translate(0, 0) rotate(0deg) scale(1); }
             /* 2. 倾倒：绕杯脚转到近乎水平 */
             28%  { opacity: 1; transform: rotate(0deg); }
-            40%  { opacity: 1; transform: rotate(-78deg); }
-            52%  { opacity: 1; transform: rotate(-70deg); }
-            /* 3. 轻轻摇晃 */
-            62%  { opacity: 1; transform: rotate(-18deg); }
-            68%  { opacity: 1; transform: rotate(-30deg); }
-            74%  { opacity: 1; transform: rotate(-14deg); }
-            80%  { opacity: 1; transform: rotate(-26deg); }
+            40%  { opacity: 1; transform: rotate(-74deg); }
+            52%  { opacity: 1; transform: rotate(-67deg); }
+            /* 3. 轻轻摇晃（2026-11-01 调整）
+               ----------------------------------------------------
+               用户反馈："摇晃红酒杯只轻微摇晃，不要大幅移动"。
+               原来在 -14° ~ -30° 之间摆 16°，屏幕上是整个杯子甩出去，
+               像在泼酒。现在收到 -63° ~ -71° 之间只摆 8°，
+               而且始终保持在"还端着"的姿态里 —— 是手腕的微动，
+               不是整条手臂在甩。 */
+            60%  { opacity: 1; transform: rotate(-63deg); }
+            66%  { opacity: 1; transform: rotate(-71deg); }
+            72%  { opacity: 1; transform: rotate(-64deg); }
+            78%  { opacity: 1; transform: rotate(-70deg); }
+            84%  { opacity: 1; transform: rotate(-66deg); }
             /* 4. 放回背后 */
-            92%  { opacity: 1; transform: rotate(0deg) translate(0, 0); }
+            93%  { opacity: 1; transform: rotate(0deg) translate(0, 0); }
             100% { opacity: 0; transform: translate(-26px, 16px) rotate(-20deg) scale(.7); }
         }
 
@@ -4624,7 +4668,7 @@
         bar.classList.remove('is-hidden');
 
         if (!s || !s.state) {
-            bar.classList.remove('is-ready', 'is-bad', 'is-pill');
+            bar.classList.remove('is-ready', 'is-bad', 'is-min', 'is-open');
             dot.classList.remove('is-ready', 'is-bad', 'is-busy');
             title.textContent = '定位未启动';
             meta.textContent = '';
@@ -4640,8 +4684,8 @@
 
         bar.classList.remove('is-ready', 'is-bad');
         dot.classList.remove('is-ready', 'is-bad', 'is-busy');
-        // 就绪 → 收缩成药丸；未就绪 → 展开显示进度和原因
-        bar.classList.toggle('is-pill', ready);
+        // 就绪 → 收缩成一个点；未就绪 → 展开显示进度和原因
+        bar.classList.toggle('is-min', ready);
         if (ready) {
             bar.classList.add('is-ready');
             dot.classList.add('is-ready');
@@ -4688,6 +4732,18 @@
             }
         }
     }
+
+    // 定位点：点一下展开成一行说明，再点收回。
+    // 桌面端靠 :hover 也能展开，但触屏没有 hover，必须有这个开关。
+    (function initLocTap() {
+        const bar = document.getElementById('locBar');
+        if (!bar) return;
+        bar.addEventListener('click', function (e) {
+            e.stopPropagation();
+            if (!bar.classList.contains('is-min')) return;   // 未就绪时本来就展开
+            bar.classList.toggle('is-open');
+        });
+    })();
 
     socket.on('loc_status', (data) => {
         let s;
@@ -5497,26 +5553,34 @@
     // 位移写在 SVG 用户坐标里（viewBox 1600x900），所以不同屏幕尺寸下
     // 的相对位移量一致。远近层系数不同 → 产生纵深。
     // ============================================================
+    // ============================================================
+    // 移动视角（2026-11-01 重做）
+    // ------------------------------------------------------------
+    // 原来这里有 4 层 .room-layer[data-depth] 的视差：鼠标一动，
+    // 不同景深的 SVG 各自平移不同距离。
+    //
+    // 背景换成"实时算出来的斜二轴测世界"之后，那些图层没了，
+    // 这个函数就静默返回了 —— 用户立刻发现"触控移动视角的设计消失了"。
+    //
+    // 现在的做法：整幅场景包在 <g id="camRoot"> 里，拖动时只平移这一层。
+    //   · 墙和地板都已经画到屏幕之外，所以平移永远不会露出边缘；
+    //   · 不重算任何世界坐标，碰撞/机器人位置完全不受影响；
+    //   · 位移幅度限制在屏宽 3%、屏高 2.2% —— 有"镜头在动"的感觉，
+    //     又不至于让人晕。
+    // 鼠标和触摸都监听，指针离开后缓慢回正。
+    // ============================================================
     function initParallax() {
-        const scene = document.getElementById('roomScene');
-        if (!scene) return;
-        const layers = Array.prototype.slice.call(
-            scene.querySelectorAll('.room-layer[data-depth]'));
-        if (!layers.length) return;
+        // ★ 不能写 window.World：World 是 <script> 顶层的一个 const，
+        //   它只生成全局词法绑定，并不会挂到 window 上。
+        //   一开始写成 window.World 判断，结果这里每次都提前 return ——
+        //   拖动视角看起来"功能消失了"，其实是被自己的守卫挡掉了。
+        if (typeof World === 'undefined' || typeof World.setCam !== 'function') return;
 
         let tx = 0, ty = 0, raf = null;
 
         function apply() {
             raf = null;
-            for (let i = 0; i < layers.length; i++) {
-                const el = layers[i];
-                const d = parseFloat(el.getAttribute('data-depth')) || 1;
-                // 位移单位是 CSS px（这些是 <svg> 根元素，走普通
-                // HTML 元素的 transform，不是 SVG 内部坐标）
-                el.style.transform =
-                    'translate3d(' + (tx * d * 26).toFixed(1) + 'px,' +
-                                     (ty * d * 15).toFixed(1) + 'px,0)';
-            }
+            World.setCam(tx, ty);
         }
 
         function aim(clientX, clientY) {
@@ -5529,16 +5593,30 @@
             aim(e.clientX, e.clientY);
         }, { passive: true });
 
+        // 触摸：手指拖动时跟随。用 touchmove 而不是 touchstart，
+        // 这样轻点按钮不会让画面突然跳一下。
         window.addEventListener('touchmove', function (e) {
             if (e.touches && e.touches[0]) {
                 aim(e.touches[0].clientX, e.touches[0].clientY);
             }
         }, { passive: true });
 
-        document.addEventListener('mouseleave', function () {
+        // 松手 / 指针离开 → 回正
+        function recentre() {
             tx = 0; ty = 0;
             if (!raf) raf = requestAnimationFrame(apply);
-        });
+        }
+        window.addEventListener('touchend', recentre, { passive: true });
+        window.addEventListener('touchcancel', recentre, { passive: true });
+        document.addEventListener('mouseleave', recentre);
+
+        // 手机摇晃（设备方向）：有就用，没有也无所谓
+        window.addEventListener('deviceorientation', function (e) {
+            if (e.gamma === null || e.beta === null) return;
+            tx = Math.max(-1, Math.min(1, e.gamma / 28));
+            ty = Math.max(-1, Math.min(1, (e.beta - 45) / 28));
+            if (!raf) raf = requestAnimationFrame(apply);
+        }, { passive: true });
     }
 
     // ============================================================
@@ -6036,8 +6114,8 @@
     const World = (function () {
         const C45 = Math.SQRT1_2;                  // cos45° = sin45° ≈ .7071
 
-        // 房间：x ∈ [-w/2, w/2]，y ∈ [0, d]，墙高 wallH
-        const ROOM = { w: 7.2, d: 4.4, wallH: 2.75 };
+        // 房间尺寸（w / d 会在 layout() 里按预设覆盖，wallH 由 layout 计算）
+        const ROOM = { w: 7.2, d: 4.4, wallH: 3.2 };
 
         // 家具清单
         //   x0 / y0 = 底面「前左角」    w = x 方向宽    d = y 方向进深
@@ -6050,12 +6128,12 @@
         //   表现为「完全不动的假死」。
         //   现在把地毯挪到沙发脚下（和沙发共用同一块区域，不额外占地方），
         //   茶几往右后方挪，正面留出一条贯穿左右的空地当"跑道"。
-        const ITEMS = [
+        const WIDE_ITEMS = [
             { id: 'rug', kind: 'rug', layer: 0, soft: true,
               x0: -3.30, y0: 2.70, w: 2.45, d: 1.50, h: 0.02,
               c: '#ffd6a6', name: '地毯' },
             { id: 'window', kind: 'window', layer: 1, soft: true,
-              x0: -0.60, y0: 4.26, w: 2.45, d: 0.14, h: 1.45, z0: 0.62,
+              x0: -0.60, y0: 4.10, w: 2.45, d: 0.14, h: 1.45, z0: 0.62,
               c: '#fff5dc', name: '窗户' },
             { id: 'sofa', kind: 'sofa', layer: 1,
               x0: -3.35, y0: 3.05, w: 2.35, d: 1.05, h: 0.80,
@@ -6066,13 +6144,92 @@
             { id: 'table', kind: 'table', layer: 1,
               x0: 0.15, y0: 2.35, w: 1.30, d: 0.78, h: 0.46,
               c: '#f0d3a8', name: '茶几' },
+            // 落地灯：细高物件，把中景的竖向空间填起来
+            { id: 'lamp', kind: 'floorlamp', layer: 1,
+              x0: 2.96, y0: 1.30, w: 0.42, d: 0.42, h: 1.86,
+              c: '#ffd9a0', name: '落地灯' },
         ];
 
-        // 机器人可达范围（世界坐标）。留 0.45 的边距，
+        // 竖屏专用布局（2026-11-01）
+        // ------------------------------------------------------------
+        // 【为什么手机上要换一套】
+        //   斜二轴测里，屏幕能装下的行走宽度 ≈ vw/k，
+        //   而行走区域本身的屏幕跨度是 (Δx + Δy·cos45°)·k。
+        //   竖屏 vw 很小，若沿用 7.2m 宽的横厅，要么房间缩成一条，
+        //   要么机器人走到边上就出画。所以竖屏改成"窄而深"的户型：
+        //   宽度收到 4.8，家具沿纵深排布，沙发居中靠后，两侧留出通道。
+        // ★ 为什么竖屏要"窄而深"（第三次调整，前两次都留白过多）：
+        //   屏幕上"墙 + 前景"的总高度 = vh − d·cos45°·k，是不随 k 变的。
+        //   也就是说：地板在屏幕上的高度只取决于 d（进深）和 k。
+        //   d = 3.2 时算出来地板只占 39%、墙占 61% —— 手机上半屏全是墙，
+        //   这就是"太空"的数学原因。
+        //   把进深拉到 5.6 之后，地板占到约六成，墙退到三成多，
+        //   再叠上窗户 / 挂画 / 搁板 / 吊灯，画面才真正被填满。
+        // ★ 摆放约束（竖屏专用，比横屏苛刻）
+        //   手机放得很大，真正能走的只有中间一条约 1.4m 宽的通道
+        //   （见 layout() 里的 MIN_WALK）。所以家具必须让开这条通道，
+        //   否则机器人会在出生点被卡住 —— 这个坑已经踩过一次。
+        //   茶几和沙发都放在通道左侧，右边留给机器人走；
+        //   盆栽和落地灯放到通道右侧，纯粹是画面里的景。
+        const TALL_ITEMS = [
+            { id: 'rug', kind: 'rug', layer: 0, soft: true,
+              x0: -2.35, y0: 2.35, w: 2.15, d: 1.35, h: 0.02,
+              c: '#ffd6a6', name: '地毯' },
+            { id: 'window', kind: 'window', layer: 1, soft: true,
+              x0: -0.95, y0: 5.46, w: 1.90, d: 0.14, h: 1.55, z0: 1.05,
+              c: '#fff5dc', name: '窗户' },
+            { id: 'sofa', kind: 'sofa', layer: 1,
+              x0: -2.35, y0: 2.55, w: 1.90, d: 0.95, h: 0.80,
+              c: '#ffcf9f', name: '沙发' },
+            { id: 'table', kind: 'table', layer: 1,
+              x0: -1.60, y0: 1.10, w: 1.05, d: 0.65, h: 0.44,
+              c: '#f0d3a8', name: '茶几' },
+            { id: 'plant', kind: 'plant', layer: 1,
+              x0: 1.15, y0: 2.30, w: 0.60, d: 0.60, h: 0.98,
+              c: '#d99566', name: '盆栽' },
+            { id: 'lamp', kind: 'floorlamp', layer: 1,
+              x0: 1.30, y0: 0.95, w: 0.40, d: 0.40, h: 1.85,
+              c: '#ffd9a0', name: '落地灯' },
+        ];
+
+        // 墙面装饰（不可碰撞，只贴在 y = d 的后墙上）
+        //   x = 中心世界横坐标   z = 中心离地高度   w/h = 尺寸
+        const WIDE_DECOR = [
+            { kind: 'frame', x: 2.55, z: 1.62, w: 1.05, h: 0.78,
+              c: '#ffeacd', art: '#f0c79a' },
+            { kind: 'frame', x: -0.72, z: 1.78, w: 0.66, h: 0.52,
+              c: '#fff0d8', art: '#e8b98c' },
+            { kind: 'sconce', x: 1.30, z: 1.62 },
+            { kind: 'pendant', x: 1.85, z: 2.38 },
+        ];
+
+        // 竖屏的墙很高（房间只占下半屏），所以装饰要分层往高处摆，
+        // 否则顶上会留一大片空墙。
+        const TALL_DECOR = [
+            { kind: 'frame', x: -1.62, z: 1.95, w: 0.85, h: 0.66,
+              c: '#ffeacd', art: '#f0c79a' },
+            { kind: 'sconce', x: 1.42, z: 2.10 },
+            { kind: 'shelf', x: 0.05, z: 3.55 },
+            { kind: 'frame', x: -0.95, z: 4.55, w: 1.05, h: 0.78,
+              c: '#fff0d8', art: '#e8b98c' },
+            { kind: 'sconce', x: 1.62, z: 5.10 },
+            { kind: 'pendant', x: 0.55, z: 3.05 },
+        ];
+
+        // 当前生效的预设（由 layout() 覆盖）
+        let ITEMS = WIDE_ITEMS;
+        let DECOR = WIDE_DECOR;
+
+        // 机器人可达范围（世界坐标）。留出边距，
         // 免得它跑到墙里或者一半身子伸出地板外。
         const BOUNDS = { x0: -3.10, x1: 3.10, y0: 0.45, y1: 3.95 };
+        const WIDE_BOUNDS = { x0: -3.10, x1: 3.10, y0: 0.45, y1: 3.95 };
+        const TALL_BOUNDS = { x0: -1.55, x1: 1.55, y0: 0.50, y1: 3.85 };
 
         let k = 100;          // 每个世界单位多少像素
+        let viewW = 390, viewH = 844;   // 最近一次取景的视口尺寸
+        let camRoot = null;             // 场景根 <g>，拖动视角时平移它
+        let camDX = 0, camDY = 0;       // 当前视角偏移（px）
         let ox = 0, oy = 0;   // 世界原点 (0,0,0) 的屏幕位置
         let svgEl = null;
         const obstacles = [];
@@ -6084,6 +6241,31 @@
                 x: ox + (wx + wy * C45) * k,
                 y: oy - (wy * C45 + (wz || 0)) * k
             };
+        }
+
+        // 视口尺寸变了就说明该重新取景。
+        // 为什么要轮询而不是只靠 resize 事件：
+        //   实测在某些嵌入环境（比如 VS Code 内置浏览器、部分安卓 WebView）
+        //   改变窗口尺寸并不会派发 resize，结果整个场景停留在旧尺寸上 ——
+        //   画面缩在左上角，右下角一大片空白。每帧比一下宽高，代价可以忽略。
+        function needsLayout() {
+            return viewW !== (window.innerWidth || 390) ||
+                   viewH !== (window.innerHeight || 844);
+        }
+
+        // 视角平移：只动场景根节点，不重算任何世界坐标
+        function applyCam() {
+            if (!camRoot) return;
+            camRoot.setAttribute(
+                'transform',
+                'translate(' + camDX.toFixed(1) + ',' + camDY.toFixed(1) + ')');
+        }
+
+        function setCam(dx, dy) {
+            // 位移有上限，避免拖太狠把墙的全貌拖出来
+            camDX = Math.max(-1, Math.min(1, dx)) * (viewW * 0.030);
+            camDY = Math.max(-1, Math.min(1, dy)) * (viewH * 0.022);
+            applyCam();
         }
 
         // 按比例调亮/调暗一个 #rrggbb 颜色
@@ -6317,6 +6499,41 @@
             return o;
         }
 
+        // ============================================================
+        // 落地灯（2026-11-01）
+        // ------------------------------------------------------------
+        // 加它的目的是填竖向空间：竖屏时房间只占下半屏，上半屏全靠墙，
+        // 有一盏 1.8m 高的细高物件，视线会被带上去，画面不至于"空"。
+        // ============================================================
+        function drawFloorLamp(it) {
+            const cx = it.x0 + it.w / 2, cy = it.y0 + it.d / 2, h = it.h;
+            const sw = it.w * 0.66;
+            let o = '';
+
+            // 灯罩散出的暖光（先画，让它成为背景光晕）
+            const gp = proj(cx, cy, h - 0.22);
+            o += '<circle cx="' + gp.x.toFixed(1) + '" cy="' + gp.y.toFixed(1) +
+                 '" r="' + (k * 0.72).toFixed(1) + '" fill="url(#winGlow)" opacity=".85"/>';
+
+            // 底盘
+            const bp = proj(cx, cy, 0.01);
+            o += '<ellipse cx="' + bp.x.toFixed(1) + '" cy="' + bp.y.toFixed(1) +
+                 '" rx="' + (it.w * 0.44 * k).toFixed(1) +
+                 '" ry="' + (it.w * 0.44 * k * C45).toFixed(1) +
+                 '" fill="#e0bb90"/>';
+
+            // 灯杆
+            o += box(cx - 0.035, cy - 0.035, 0.07, 0.07, 0.02, h - 0.36,
+                     '#cfa47c', { r: 0.03, edge: false });
+
+            // 灯罩：下宽上窄，用两层箱体叠出锥度
+            o += box(cx - sw / 2, cy - sw / 2, sw, sw, h - 0.36, 0.18,
+                     it.c, { r: 0.06 });
+            o += box(cx - sw * 0.36, cy - sw * 0.36, sw * 0.72, sw * 0.72,
+                     h - 0.21, 0.13, shade(it.c, 1.06), { r: 0.05 });
+            return o;
+        }
+
         function drawWindow(it) {
             const x0 = it.x0, x1 = x0 + it.w;
             const yy = it.y0 + it.d;                 // 贴在最后面的墙面上
@@ -6379,46 +6596,68 @@
 
         // ---------------- 房间本体 ----------------
 
+        // ============================================================
+        // 把墙 / 地板画得比视口大（2026-11-01）
+        // ------------------------------------------------------------
+        // 用户反馈："电脑端的场景没有覆盖整个页面，墙体没有继续延伸"。
+        //
+        // 成因：房间是一个有限长的盒子。桌面宽屏时 k 被高度约束住，
+        //   地板在屏幕上只占约 85% 宽，左右两侧就漏出背景色；
+        //   墙只有 2.75 高，屏幕上墙面到顶就没了，上面同样漏。
+        //
+        // 对策：不再把房间当成"看得见的盒子"，而是当成"一直延伸出去"的
+        //   空间 —— 地板往前（y 负方向）延伸出屏幕，后墙往右延伸出屏幕，
+        //   墙往上长到屏幕之外。SVG 会自动裁掉视口外的部分，
+        //   所以只需要保证"延伸得足够远"，视觉上就是无缝的。
+        //
+        //   ★ 左墙不能跟着地板往左延伸：它是 x = -HW 的平面，
+        //     地面若越过 x = -HW，那面墙会变成一块立在房间中间的隔断。
+        //     所以地板左边界严格等于 -HW，并靠 layout() 保证 -HW 在屏幕外。
+        // ============================================================
         function drawRoom() {
             const HW = ROOM.w / 2, D = ROOM.d, WH = ROOM.wallH;
+            const vw = viewW, vh = viewH;
+
+            // 往右、往前、往上各延伸多少世界单位才算够
+            const EXT_X = (vw / k) * 1.2 + 2;
+            const EXT_Y = (vh / (C45 * k)) * 1.2 + 2;
+            const xR = HW + EXT_X;          // 地板 / 后墙的右边界
+            const yF = -EXT_Y;              // 地板的前边界
 
             let o = '';
-            // 背景（后墙以外的区域统一刷成墙面色）
+            // 背景兜底（正常情况会被下面的几何完全盖住）
             o += '<rect x="0" y="0" width="100%" height="100%" fill="url(#wallGrad)"/>';
 
-            // 左墙：x = -HW 的平面。它在这条斜边的"上方"，
-            // 因为进深轴朝右上，左边这面墙的远端被拉到右边，
-            // 所以墙面朝向观察者，是可见的那一面。
-            // ★ 墙面用平涂但叠一层光影渐变：三面墙都不再用描边，
-            //   改成靠"面与面之间的明度差"分界 —— 描边会让整个房间
-            //   像线稿，而明度差看起来才是光打出来的。
-            o += face([proj(-HW, 0, 0), proj(-HW, D, 0),
-                       proj(-HW, D, WH), proj(-HW, 0, WH)],
-                      '#f2e0c6', 'ogSide', 0);
-
-            // 后墙：y = D 的平面
-            o += face([proj(-HW, D, 0), proj(HW, D, 0),
-                       proj(HW, D, WH), proj(-HW, D, WH)],
+            // 后墙：y = D 的平面。先画，因为左墙在它前面，要压住它。
+            o += face([proj(-HW, D, 0), proj(xR, D, 0),
+                       proj(xR, D, WH), proj(-HW, D, WH)],
                       '#fbf2e6', 'ogFront', 0);
 
-            // 地板（比墙略暖、略暗，才不会让房间"发白"）
-            o += face([proj(-HW, 0, 0), proj(HW, 0, 0),
-                       proj(HW, D, 0), proj(-HW, D, 0)],
+            // 左墙：x = -HW 的平面。往前往上延伸（y 到 yF、z 到 WH），
+            // 这样它左边和上边都跑到屏幕外，不会露边。
+            o += face([proj(-HW, yF, 0), proj(-HW, D, 0),
+                       proj(-HW, D, WH), proj(-HW, yF, WH)],
+                      '#f2e0c6', 'ogSide', 0);
+
+            // 地板：左边界固定 -HW（与左墙贴合），右/前均延伸出屏幕
+            o += face([proj(-HW, yF, 0), proj(xR, yF, 0),
+                       proj(xR, D, 0), proj(-HW, D, 0)],
                       '#f7e6cb', 'ogTop', 0);
 
             // 地板缝：等 y 的线（平行于 x 轴）+ 等 x 的线（沿 45° 进深轴）
-            // ★ 透明度从 0.55 降到 0.3，越靠后的线越淡（模拟远处的雾化），
-            //   这样地板看起来是"延伸出去"的，而不是一张网格纸。
+            // ★ 透明度按进深递减（模拟远处雾化），越靠后越淡，
+            //   地板看起来才是"延伸出去"的，而不是一张网格纸。
             let g = '<g stroke="#e3c8a2" stroke-width="1" fill="none">';
-            for (let y = 0.8; y < D; y += 0.8) {
-                const a = (0.34 * (1 - (y / D) * 0.7)).toFixed(2);
+            for (let y = 0; y < D; y += 0.8) {
+                const a = (0.32 * (1 - (y / D) * 0.7)).toFixed(2);
                 g += '<line opacity="' + a + '" x1="' + proj(-HW, y, 0).x.toFixed(1) +
                      '" y1="' + proj(-HW, y, 0).y.toFixed(1) +
-                     '" x2="' + proj(HW, y, 0).x.toFixed(1) +
-                     '" y2="' + proj(HW, y, 0).y.toFixed(1) + '"/>';
+                     '" x2="' + proj(xR, y, 0).x.toFixed(1) +
+                     '" y2="' + proj(xR, y, 0).y.toFixed(1) + '"/>';
             }
-            for (let x = -HW + 0.9; x < HW; x += 0.9) {
-                const a = (0.30 * (1 - (Math.abs(x) / HW) * 0.45)).toFixed(2);
+            for (let x = -HW; x < xR; x += 0.9) {
+                const a = (0.28 * (1 - (Math.abs(x) / Math.max(HW, 1)) * 0.45)).toFixed(2);
+                if (parseFloat(a) <= 0) continue;
                 g += '<line opacity="' + a + '" x1="' + proj(x, 0, 0).x.toFixed(1) +
                      '" y1="' + proj(x, 0, 0).y.toFixed(1) +
                      '" x2="' + proj(x, D, 0).x.toFixed(1) +
@@ -6428,10 +6667,8 @@
             o += g;
 
             // ============================================================
-            // 窗户投在地板上的光斑（2026-11-01）
+            // 窗户投在地板上的光斑
             // ------------------------------------------------------------
-            // 【为什么这一块能顶一大截效果】
-            //   上一版的问题不只是"棱角多"，更是"房间不像有光源"——
             //   一整面墙都是同一个亮度，谁也不信这屋里开了盏灯。
             //   从窗户往房间里投一块梯形光斑（越远越淡），
             //   观众立刻就能读出"光从这个窗口进来"，立体感立刻就有了。
@@ -6440,18 +6677,131 @@
             const win = ITEMS.filter(function (x) { return x.kind === 'window'; })[0];
             if (win) {
                 const wx0 = win.x0 - 0.35, wx1 = win.x0 + win.w + 0.35;
-                const yBack = win.y0, yFront = 1.05;
+                const yBack = win.y0, yFront = 0.55;
                 o += face([proj(wx0, yFront, 0.004), proj(wx1, yFront, 0.004),
                            proj(wx1 - 0.25, yBack, 0.004),
                            proj(wx0 + 0.25, yBack, 0.004)],
                           '#fff3cd', 'ogSun', 0);
             }
 
-            // 后墙 + 左墙的踢脚线（用圆角矩形而不是硬多边形）
-            o += face([proj(-HW, D, 0), proj(HW, D, 0),
-                       proj(HW, D, 0.13), proj(-HW, D, 0.13)], '#ecdcc0', 'ogFront', 0);
-            o += face([proj(-HW, 0, 0), proj(-HW, D, 0),
-                       proj(-HW, D, 0.13), proj(-HW, 0, 0.13)], '#e6d3b4', 'ogSide', 0);
+            // 墙面装饰（画框 / 壁灯）
+            o += drawDecor();
+
+            // 后墙 + 左墙的踢脚线
+            o += face([proj(-HW, D, 0), proj(xR, D, 0),
+                       proj(xR, D, 0.13), proj(-HW, D, 0.13)], '#ecdcc0', 'ogFront', 0);
+            o += face([proj(-HW, yF, 0), proj(-HW, D, 0),
+                       proj(-HW, D, 0.13), proj(-HW, yF, 0.13)], '#e6d3b4', 'ogSide', 0);
+            return o;
+        }
+
+        // ============================================================
+        // 墙面装饰（2026-11-01）
+        // ------------------------------------------------------------
+        // 手机竖屏时房间只占屏幕下半部分，上半部分全是墙。
+        // 光是空的墙会显得"场景太空"，所以挂两幅画 + 壁灯，
+        // 让墙面也有内容。它们不可碰撞，纯装饰。
+        // 后墙是 y = D 的平面，在这上面 x→水平、z→垂直，不剪切，
+        // 所以直接按矩形算两个对角点即可。
+        // ============================================================
+        function drawDecor() {
+            const D = ROOM.d;
+            let o = '';
+            for (let i = 0; i < DECOR.length; i++) {
+                const d = DECOR[i];
+                if (d.kind === 'frame') {
+                    const tl = proj(d.x - d.w / 2, D, d.z + d.h / 2);
+                    const br = proj(d.x + d.w / 2, D, d.z - d.h / 2);
+                    const w = br.x - tl.x, h = br.y - tl.y;
+                    const rad = Math.max(2, w * 0.06);
+                    const outer = roundedPath([
+                        { x: tl.x, y: tl.y }, { x: tl.x + w, y: tl.y },
+                        { x: tl.x + w, y: tl.y + h }, { x: tl.x, y: tl.y + h }
+                    ], rad);
+                    o += '<path d="' + outer + '" fill="#f6e6cf" ' +
+                         'filter="url(#softShadow)"/>';
+                    const iw = w * 0.82, ih = h * 0.80;
+                    const ix = tl.x + (w - iw) / 2, iy = tl.y + (h - ih) / 2;
+                    const inner = roundedPath([
+                        { x: ix, y: iy }, { x: ix + iw, y: iy },
+                        { x: ix + iw, y: iy + ih }, { x: ix, y: iy + ih }
+                    ], rad * 0.6);
+                    o += '<path d="' + inner + '" fill="' + d.c + '"/>';
+                    o += '<path d="M' + ix.toFixed(1) + ',' + (iy + ih * 0.82).toFixed(1) +
+                         'L' + (ix + iw * 0.34).toFixed(1) + ',' + (iy + ih * 0.40).toFixed(1) +
+                         'L' + (ix + iw * 0.56).toFixed(1) + ',' + (iy + ih * 0.62).toFixed(1) +
+                         'L' + (ix + iw * 0.78).toFixed(1) + ',' + (iy + ih * 0.34).toFixed(1) +
+                         'L' + (ix + iw).toFixed(1) + ',' + (iy + ih * 0.82).toFixed(1) +
+                         'Z" fill="' + d.art + '"/>';
+                    o += '<circle cx="' + (ix + iw * 0.72).toFixed(1) + '" cy="' +
+                         (iy + ih * 0.26).toFixed(1) + '" r="' + (iw * 0.06).toFixed(1) +
+                         '" fill="#ffcf7a"/>';
+                } else if (d.kind === 'pendant') {
+                    // 吊灯：从很高的地方垂下来，填屏幕上半部的大片空墙，
+                    // 同时给房间一个明确的"光源"，光感立刻合理。
+                    const py = (d.y === undefined) ? D * 0.42 : d.y;
+                    const top = proj(d.x, py, ROOM.wallH);
+                    const bot = proj(d.x, py, d.z);
+                    // 吊线
+                    o += '<line x1="' + top.x.toFixed(1) + '" y1="' + top.y.toFixed(1) +
+                         '" x2="' + bot.x.toFixed(1) + '" y2="' + bot.y.toFixed(1) +
+                         '" stroke="#d9b48f" stroke-width="' +
+                         Math.max(1, k * 0.012).toFixed(1) + '"/>';
+                    // 灯罩下方的光晕
+                    o += '<ellipse cx="' + bot.x.toFixed(1) + '" cy="' + (bot.y + k * 0.10).toFixed(1) +
+                         '" rx="' + (k * 0.62).toFixed(1) +
+                         '" ry="' + (k * 0.62 * C45).toFixed(1) +
+                         '" fill="url(#winGlow)" opacity=".8"/>';
+                    // 灯罩：上窄下宽的梯形
+                    const wTop = 0.14, wBot = 0.46, hh = 0.34;
+                    const p1 = proj(d.x - wBot / 2, py, d.z);
+                    const p2 = proj(d.x + wBot / 2, py, d.z);
+                    const p3 = proj(d.x + wTop / 2, py, d.z + hh);
+                    const p4 = proj(d.x - wTop / 2, py, d.z + hh);
+                    o += '<path d="' + roundedPath([p1, p2, p3, p4], k * 0.03) +
+                         '" fill="#ffe0b0" filter="url(#softShadow)"/>';
+                    o += '<path d="' + roundedPath([p1, p2, p3, p4], k * 0.03) +
+                         '" fill="url(#ogTop)"/>';
+                } else if (d.kind === 'shelf') {
+                    // 墙上的搁板 + 两本小书，用来填中段以上的空墙
+                    const bw = 1.15, bh = 0.10;
+                    const tl = proj(d.x - bw / 2, D, d.z + bh / 2);
+                    const br = proj(d.x + bw / 2, D, d.z - bh / 2);
+                    const w = br.x - tl.x, hh = br.y - tl.y;
+                    o += '<rect x="' + tl.x.toFixed(1) + '" y="' + tl.y.toFixed(1) +
+                         '" width="' + w.toFixed(1) + '" height="' + hh.toFixed(1) +
+                         '" rx="' + (hh * 0.4).toFixed(1) + '" fill="#efdcbf" ' +
+                         'filter="url(#softShadow)"/>';
+                    // 搁板上的物件：两个小方块 + 一个小瓶子
+                    const items = [
+                        { dx: -0.38, dw: 0.13, dh: 0.24, c: '#e8705f' },
+                        { dx: -0.20, dw: 0.11, dh: 0.20, c: '#7fbf7f' },
+                        { dx: 0.10, dw: 0.10, dh: 0.30, c: '#f5b942' },
+                        { dx: 0.34, dw: 0.16, dh: 0.16, c: '#c9d8ea' }
+                    ];
+                    for (let q = 0; q < items.length; q++) {
+                        const it2 = items[q];
+                        const bx0 = d.x + it2.dx - it2.dw / 2;
+                        const p1 = proj(bx0, D, d.z + bh / 2 + it2.dh);
+                        const p2 = proj(bx0 + it2.dw, D, d.z + bh / 2);
+                        o += '<rect x="' + p1.x.toFixed(1) + '" y="' + p1.y.toFixed(1) +
+                             '" width="' + (p2.x - p1.x).toFixed(1) +
+                             '" height="' + (p2.y - p1.y).toFixed(1) +
+                             '" rx="' + Math.max(1, (p2.x - p1.x) * 0.15).toFixed(1) +
+                             '" fill="' + it2.c + '"/>';
+                    }
+                } else if (d.kind === 'sconce') {
+                    const p = proj(d.x, D, d.z);
+                    const r = k * 0.55;
+                    o += '<circle cx="' + p.x.toFixed(1) + '" cy="' + p.y.toFixed(1) +
+                         '" r="' + r.toFixed(1) + '" fill="url(#winGlow)" opacity=".7"/>';
+                    const sw = Math.max(5, k * 0.10), sh = Math.max(9, k * 0.18);
+                    o += '<rect x="' + (p.x - sw / 2).toFixed(1) +
+                         '" y="' + (p.y - sh * 0.35).toFixed(1) +
+                         '" width="' + sw.toFixed(1) + '" height="' + sh.toFixed(1) +
+                         '" rx="' + (sw * 0.4).toFixed(1) + '" fill="#f0d3a8"/>';
+                }
+            }
             return o;
         }
 
@@ -6466,6 +6816,10 @@
             obstacles.length = 0;
             for (let i = 0; i < ITEMS.length; i++) {
                 const it = ITEMS[i];
+                // ★ 地毯是铺在地上的贴花，实物机器人是直接碾过去的，
+                //   把它当成障碍物纯属建模失误 —— 早期版本就因为地毯
+                //   占了小半个房间，把机器人堵在出生点动弹不得。
+                if (it.kind === 'rug') continue;
                 obstacles.push({
                     x0: it.x0, x1: it.x0 + it.w,
                     y0: it.y0, y1: it.y0 + it.d,
@@ -6491,6 +6845,7 @@
                 else if (it.kind === 'table') art = drawTable(it);
                 else if (it.kind === 'plant') art = drawPlant(it);
                 else if (it.kind === 'window') art = drawWindow(it);
+                else if (it.kind === 'floorlamp') art = drawFloorLamp(it);
                 if (!art) continue;
 
                 // 地毯贴在地板上、窗户嵌在墙里 —— 这两样不加投影，
@@ -6554,23 +6909,105 @@
                   '</filter>' +
                 '</defs>';
 
-            svgEl.innerHTML = defs + drawRoom() + body;
+            // ★ 整幅场景包在一个 <g> 里：拖动视角时只平移这一层，
+            //   不必重算任何坐标（墙和地板都已经画到屏幕外，平移不会露边）。
+            svgEl.innerHTML = defs + '<g id="camRoot">' +
+                             drawRoom() + body + '</g>';
+            camRoot = svgEl.querySelector('#camRoot');
+            if (camRoot && camDX) applyCam();
         }
 
+        // ============================================================
+        // 取景（2026-11-01 重写）
+        // ------------------------------------------------------------
+        // 三个目标同时满足：
+        //   1) 整个可行走区域必须留在屏幕内（机器人不能走出画面）；
+        //   2) 竖屏不许留大片空白；
+        //   3) 墙要一直延伸到屏幕外（否则宽屏两侧会露背景）。
+        //
+        // 关键约束（斜二轴测特有）：
+        //   行走区域的屏幕跨度 = (Δx + Δy·cos45°)·k
+        //   因为沿进深走时，屏幕上同时往右也往上 —— 房间越深，
+        //   要装下它需要的横向像素就越多。这是竖屏取景的真正瓶颈。
+        //   所以先从这条约束反推 k 的上限，再和"想放多大"取小。
+        // ============================================================
         function layout() {
             const vw = window.innerWidth || 390;
             const vh = window.innerHeight || 844;
+            viewW = vw;
+            viewH = vh;
+
+            // ---- 1. 选布局 ----
+            // 竖屏（含方屏）用紧凑户型，横屏用宽厅。
+            const portrait = vh > vw * 1.04;
+            const preset = portrait
+                ? { w: 4.6, d: 5.6, items: TALL_ITEMS, decor: TALL_DECOR, b: TALL_BOUNDS }
+                : { w: 7.2, d: 4.4, items: WIDE_ITEMS, decor: WIDE_DECOR, b: WIDE_BOUNDS };
+
+            ROOM.w = preset.w;
+            ROOM.d = preset.d;
+            ITEMS = preset.items;
+            DECOR = preset.decor;
+            BOUNDS.x0 = preset.b.x0; BOUNDS.x1 = preset.b.x1;
+            BOUNDS.y0 = preset.b.y0; BOUNDS.y1 = preset.b.y1;
+
             const spanW = ROOM.w + ROOM.d * C45;
             const spanH = ROOM.d * C45;
 
-            // k 同时受「地板宽度别超屏太多」和「地板高度别占满屏」约束
-            let kk = Math.min(vw * 1.36 / spanW, vh * 0.50 / spanH);
-            k = Math.max(24, Math.min(kk, 190));
+            // ---- 2. 想放多大：地板宽度占屏宽的倍数 ----
+            // 竖屏必须放得更大，否则房间缩成屏幕下方一条，上面全空。
+            const kWant = (vw * (portrait ? 2.15 : 1.18)) / spanW;
 
-            // 让地板在水平方向居中：地板中心在世界 (0, d/2)
-            ox = vw * 0.5 - (ROOM.d * C45 * 0.5) * k;
-            // 地板前沿（y = 0）落在屏幕 86% 高度处
-            oy = vh * 0.86;
+            // ---- 3. 放大到什么程度还可以走 ----
+            // 关键推导（不依赖取景原点，很好用）：
+            //   屏幕上能装下的行走宽度
+            //     = vw/k − Δy·cos45°
+            //   于是"至少留 MIN_WALK 宽的可行走区域"给出 k 的上限：
+            //     k ≤ vw / (MIN_WALK + Δy·cos45°)
+            // 手机放大后必然有一部分房间被裁掉 —— 用户已明确允许，
+            // 下面第 4b 步会把可行走范围收进可见区域，保证机器人不出画。
+            const MIN_WALK = 1.6;
+            const dy = BOUNDS.y1 - BOUNDS.y0;
+            const kMaxWalk = vw / (MIN_WALK + dy * C45);
+
+            k = Math.max(26, Math.min(Math.min(kWant, kMaxWalk), 210));
+            if (spanW * k < vw * 1.02) k = Math.max(k, (vw * 1.02) / spanW);
+
+            // ---- 4. 取景原点 ----
+            // ox：让**可行走区域的中段**落在屏幕中间，
+            // 而不是让"地板中心"居中。原因：进深会把画面往右推，
+            // 若按地板中心对齐，机器人实际能走的那一小块会偏到右半边，
+            // 左边空出一大片用不上的地板。
+            const yMid = (BOUNDS.y0 + BOUNDS.y1) * 0.5;
+            ox = vw * 0.5 - yMid * C45 * k;
+            // 兜一道：左墙 x=-HW 必须落在屏幕左边界之外，
+            // 否则会露出"房间外面"的一条空白。
+            const leftWallX = ox - (ROOM.w / 2) * k;
+            if (leftWallX > 0) ox -= leftWallX + 2;
+
+            // oy：地板前沿（y=0）落在屏幕下方约 90% 处
+            oy = vh * 0.90;
+
+            // ---- 4b. 把可行走范围收进真正看得到的区域 ----
+            // 屏幕可视的世界 x 区间随 y 变化（进深越大越偏右），
+            // 所以取"最靠前的下界"和"最靠后的上界"的交集。
+            const vxMin = -ox / k - BOUNDS.y0 * C45;
+            const vxMax = (vw - ox) / k - BOUNDS.y1 * C45;
+            const pad = 0.12;
+            const nx0 = Math.max(BOUNDS.x0, vxMin + pad);
+            const nx1 = Math.min(BOUNDS.x1, vxMax - pad);
+            if (nx1 - nx0 > 0.5) { BOUNDS.x0 = nx0; BOUNDS.x1 = nx1; }
+
+            // ---- 5. 墙高自适应：保证墙顶跑出屏幕上边缘 ----
+            // ★ 这里踩过一次坑：墙在屏幕上是平行四边形，它的"顶边"是
+            //   一条从左下到右上的斜线。要让整条斜线都在屏幕上方，
+            //   约束的是**近端**那个角（x = -HW, y = 0），不是远端角：
+            //     近端角屏幕 y = oy − wallH·k  ≤ 0  →  wallH ≥ oy/k
+            //   一开始按远端角算（oy/k − d·cos45°），结果远端的墙确实
+            //   顶到屏幕外了，但左上角仍露出一块背景 —— 正是用户反馈的
+            //   "墙体没有继续延伸"。
+            const needWH = oy / k;
+            ROOM.wallH = Math.max(2.75, needWH + 0.6);
 
             rebuild();
         }
@@ -6585,10 +7022,12 @@
             proj: proj,
             layout: layout,
             botScale: botScale,
+            setCam: setCam,
+            needsLayout: needsLayout,
             obstacles: obstacles,
             bounds: BOUNDS,
             room: ROOM,
-            items: ITEMS
+            getItems: function () { return ITEMS; }
         };
     })();
 
@@ -6700,6 +7139,39 @@
 
         function render() {
             if (!stage) return;
+            // ★ 取景变化（旋转屏幕 / 改窗口大小）时会重算可行走范围，
+            //   机器人可能正好落在新范围之外。此时 firstHit 会把四周
+            //   都判成"墙"，它一步也走不动 —— 表现为卡死在原地。
+            //   这里每帧软钳一下，越界就拉回最近的有效位置。
+            const BB = World.bounds;
+            if (bx < BB.x0 || bx > BB.x1 || by < BB.y0 || by > BB.y1) {
+                bx = Math.max(BB.x0, Math.min(BB.x1, bx));
+                by = Math.max(BB.y0, Math.min(BB.y1, by));
+                walking = false;
+            }
+            // ★ 卡在家具里就挪到最近的空位（2026-11-01）
+            //   横竖屏切换会换一整套户型（家具位置全变），机器人还停在
+            //   旧户型的坐标上 —— 那个点在新户型里可能正好在茶几内部。
+            //   firstHit 对它恒为真，于是每一帧都是"撞到 → 停住"，
+            //   表现为疯狂撞墙、一步也走不动。这里主动把它挪出来。
+            if (firstHit(bx, by)) {
+                let moved = false;
+                for (let r = 0.15; r <= 3.2 && !moved; r += 0.15) {
+                    for (let a = 0; a < 16; a++) {
+                        const th = a / 16 * Math.PI * 2;
+                        const nx = bx + Math.cos(th) * r;
+                        const ny = by + Math.sin(th) * r;
+                        if (!firstHit(nx, ny)) {
+                            bx = nx; by = ny;
+                            walking = false;
+                            tgtX = nx; tgtY = ny;
+                            moved = true;
+                            break;
+                        }
+                    }
+                }
+                if (!moved) { bx = 0; by = 1.15; walking = false; }
+            }
             const sc = World.botScale();
             const feet = World.proj(bx, by, 0);
             // 缩放原点在 50% 100%（脚底中心），所以缩放不会移动这个点
@@ -6732,6 +7204,12 @@
             // 标签页切回来时 dt 会很大，夹住避免"瞬移穿过家具"
             if (dt > 0.10) dt = 0.10;
             if (dt <= 0) return;
+
+            // 视口尺寸变了就立刻重新取景（见 World.needsLayout 的说明）
+            if (World.needsLayout()) {
+                World.layout();
+                render();
+            }
 
             if (walking && !broken) stepMove(dt);
             render();
