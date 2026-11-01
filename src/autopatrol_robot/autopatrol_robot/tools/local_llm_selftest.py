@@ -50,7 +50,7 @@ CASES = [
     ("电量还有多少", ["get_battery_status"]),
     ("先去厨房再去客厅", ["navigate_sequence"]),
     ("删除厕所这个地点", ["delete_saved_location"]),
-    ("初始化一下位姿", ["initialize_pose", "get_current_position"]),
+    ("这是哪里", ["get_current_position"]),
     ("巡检开着吗", ["get_patrol_mode_status"]),
     ("开心一点", ["set_butler_mood"]),
     ("说句话吧", ["butler_say"]),

@@ -219,8 +219,11 @@ class NavigationService:
           auto_localizer 把粒子云撒满全图 → 本函数又把先验钉到原点
           → 谁后生效谁说了算，结果随机，且大概率被拉回原点。
         实测现象就是 /amcl_pose 一直报 (0.00, 0.00, 0.00)。
-        定位初始化统一交给 auto_localizer；只在用户显式要求时
-        （initialize_pose 工具）才人工设一个。
+        定位初始化统一交给 auto_localizer；只在人工显式要求时（直接调
+        本模块的 initialize_amcl_pose()）才人工设一个。
+
+        ★ 2026-11-01：AI 工具 initialize_pose 已删除（它把位姿直接重置到
+          原点，`回起点` 时会被模型误选）。本方法作为后端 API 保留。
         """
         if self._nav2_ready:
             return True

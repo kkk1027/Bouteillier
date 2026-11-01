@@ -45,32 +45,28 @@ def get_current_position() -> str:
         return f"❌ 获取位置失败: {str(e)}"
 
 
-@tool
-def initialize_pose() -> str:
-    """重置 AMCL 的位姿估计，强制认为机器人此刻站在地图原点。
-
-    ★ 这是**破坏性**操作：它会立刻把定位跳到 (0,0)，如果车实际不在
-    原点，后续导航会全部出错。所以只在明确要求时使用。
-
-    仅当用户**明确**说下面这类话时使用：
-      "初始化位姿"、"初始化定位"、"初始化 AMCL"、"重置定位"
-      "把当前位置设成原点"
-
-    ⚠️ 不要因为用户说了"起点"二字就调这个！
-       "回起点 / 回家 / 返回起点" 是**导航**动作，
-       应该用 return_to_start，本工具不负责移动机器人。
-    """
-    try:
-        from autopatrol_robot.navigation_service import get_global_nav_service
-
-        nav_service = get_global_nav_service()
-        if nav_service is None:
-            return "⚠️ 导航服务未初始化，请先加载地图"
-
-        return nav_service.initialize_amcl_pose()
-    except Exception as e:
-        return f"❌ 初始化位姿失败: {str(e)}"
-
+# ============================================================
+# ★ 2026-11-01：`initialize_pose` 工具已**彻底删除**
+# ------------------------------------------------------------
+# 用户原话：「要不你直接把重定位回原点的工具删了吧，回起点就只会调
+#          有关起点的『回到起点』这个唯一工具」
+#
+# 删除理由（三次实机事故的正本清源）：
+#   这个工具会把 AMCL 位姿**直接重置到 (0,0,3.14)**。只要它还存在于
+#   工具列表里，3B 模型就有机会在用户说「回起点」时选中它 —— 因为
+#   「起点」二字和「回到起点」高度相似。
+#
+#   前两次修法都是"打补丁"：
+#     1. 改工具描述、加 _EXCLUSIVE_NAV_TOOLS 优先级   → 仍有漏网
+#     2. 加 _guard_initialize_pose 语义防护           → 仍有漏网
+#   根本问题是：只要这个危险工具有机会被选中，就得永远维护一层防护。
+#   直接删掉，问题从源头消失。
+#
+# 人工需要重置 AMCL 时怎么办：
+#   navigation_service.initialize_amcl_pose() 方法**仍然保留**，
+#   随时可以接成 HTTP 接口或在 RViz 里点 2D Pose Estimate。
+#   只是它不再暴露给 AI 了。
+# ============================================================
 
 @tool
 def get_battery_status() -> str:

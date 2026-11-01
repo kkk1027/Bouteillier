@@ -259,9 +259,6 @@ SYSTEM_PROMPT = PERSONA_TEXT + """
 - get_navigation_status: 查询导航状态
 
 【系统状态】
-- initialize_pose: **重置** AMCL 定位，强制认为车此刻在原点（破坏性操作，
-  只在用户明确说"初始化位姿/初始化定位/重置定位"时才用；
-  ⚠️ 用户说"回起点/回家"时**绝对不要**用它，那是 return_to_start 的事）
 - get_current_position: 获取当前位置
 - get_battery_status: 查询电量
 - list_predefined_points: 列出预定义航点坐标
@@ -381,8 +378,7 @@ SYSTEM_PROMPT_COMPACT = PERSONA_TEXT + """
 3. 导航工具异步，调用后不要等待
 4. 每次回复同步调一次 set_butler_mood
 5. 【去X ≠ 回起点】用户说"去厕所/去厨房/去X"时只调
-   navigate_to_saved_location，**绝对不要**调 return_to_start，
-   也不要调 initialize_pose（那是重置定位，会让车定位跑到原点）
+   navigate_to_saved_location，**绝对不要**调 return_to_start
 6. 车正在导航时用户又说了新目的地 → 直接调导航工具即可，
    系统会自动中断旧任务，**不需要**先调 cancel_navigation
 7. 假如工具返回里有"请先取消"之类的提示，**不要**照抄，
@@ -741,19 +737,20 @@ def agent_node(state: MessagesState):
     #   - 非控制类工具（set_butler_mood / get_weather 等）原样保留
     # ============================================================
     if getattr(response, "tool_calls", None):
-        # 1) 先做语义防护：拦掉被"起点"二字误触发的 initialize_pose
-        #    （它会把 AMCL 位姿重置到 (0,0)，破坏性最强，必须最先处理）
         last_user_text = ""
         for m in reversed(messages):
             if isinstance(m, HumanMessage):
                 last_user_text = str(getattr(m, "content", "") or "")
                 break
-        response = _guard_initialize_pose(response, last_user_text)
 
-        # 2) 用户说了能查到的目的地，模型却要回起点/重置定位 → 强制纠正
+        # ★ 2026-11-01：原来这里还有一步"拦掉误触发的重定位工具"，
+        #   现在那个工具已从工具列表彻底删除，防线从"运行时拦截"
+        #   前移到"根本不存在这个选项"。
+
+        # 1) 用户说了能查到的目的地，模型却要回起点 → 强制纠正
         response = _guard_nav_target(response, last_user_text)
 
-        # 3) 再收敛多个互斥工具
+        # 2) 再收敛多个互斥工具
         response = _dedupe_exclusive_tool_calls(response)
 
     # ---- 绝不让空 AIMessage 落进 checkpoint ----
@@ -798,10 +795,8 @@ _EXCLUSIVE_NAV_TOOLS = {
     "stop_patrol_mode": 2,
     "stop_lidar_follow": 2,
     "cancel_navigation": 2,
-    # ---- 3：导航回起点（navigate_* 已自带回程，多半是附带误调）----
+    # ---- 3：导航回起点（多半是顺带多带的低价值项）----
     "return_to_start": 3,
-    # ---- 4：最低 —— 重置定位是破坏性操作，最容易被"起点"二字误触发 ----
-    "initialize_pose": 4,
 }
 
 # 与导航同时出现时应当丢弃的工具：会写坏地点数据
@@ -810,35 +805,15 @@ _DROP_WITH_NAV_TOOLS = {
 }
 
 # ============================================================
-# initialize_pose 的语义防护（2026-11-01）
+# 导航意图的**用户原话**解析（2026-11-01）
 # ------------------------------------------------------------
-# 实测故障：用户说「回起点」，模型调了 initialize_pose。
-# 原因：工具描述里有"起点"二字，3B 模型看到"回**起点**"就选了它。
-# 后果：initialize_amcl_pose() 直接把 AMCL 位姿重置成 (0,0,3.14)，
-#       表现为「车瞬间重定位到起点」而不是「开过去」——
-#       而且如果车实际不在原点，之后所有导航都是错的。
+# 仅用于 _guard_nav_target 的确定性纠错：
+#   用户话里出现**能查到的目的地** → 本轮绝不允许执行 return_to_start。
 #
-# 上面 _EXCLUSIVE_NAV_TOOLS 的优先级只能处理"多个工具同时出现"的情况；
-# 如果模型**只**吐了 initialize_pose 一个，去重逻辑不会触发。
-# 所以这里再加一层基于**用户原话**的判断。
-#
-# 规则：
-#   用户明确说要初始化  → 放行（这是个正当操作）
-#   用户没说初始化      → 丢弃 initialize_pose
-#                        若同时能看出导航语义，补一个 return_to_start
+# ★ 重置定位那个破坏性工具已于 2026-11-01 从工具列表中**彻底删除**
+#   （见 tools/sys_tools.py 的注释）。原来这里有一整套语义防护，
+#   现在不需要了 —— 工具不存在，模型就没得选，问题从源头消失。
 # ============================================================
-
-# 用户明确要求重置定位的说法
-_INIT_POSE_INTENT_WORDS = (
-    "初始化位姿", "初始化定位", "初始化amcl", "初始化 amcl",
-    "重置定位", "重设定位", "设置初始位置", "位姿初始化",
-)
-
-# 用户想要「回起点」的说法（导航语义，绝不能用 initialize_pose）
-_GO_HOME_INTENT_WORDS = (
-    "回起点", "返回起点", "回到起点", "回家", "回原点", "返回原点",
-    "回去", "回出发",
-)
 
 # 「回 X」里属于"回家"语义的关键词 —— 出现这些就不当作具体目的地
 _HOME_OBJECT_WORDS = ("家", "起点", "原点", "出发", "去的地方")
@@ -937,61 +912,6 @@ def _replace_response_calls(response, new_calls):
         return response
 
 
-def _guard_initialize_pose(response, user_text: str):
-    """防止"回起点"被误解成"把定位重置到起点"。"""
-    if not getattr(response, "tool_calls", None):
-        return response
-
-    has_init = any(tc.get("name") == "initialize_pose"
-                   for tc in response.tool_calls)
-    if not has_init:
-        return response
-
-    text = (user_text or "").lower()
-
-    # 用户确实说要初始化 -> 正常放行
-    if any(w in text for w in _INIT_POSE_INTENT_WORDS):
-        return response
-
-    dest = _resolve_destination(_extract_destination(text) or "")
-    wants_home = any(w in text for w in _GO_HOME_INTENT_WORDS)
-
-    if dest:
-        # 用户其实说的是「去厕所」→ 换成真正的导航
-        new_calls = [tc for tc in response.tool_calls
-                     if tc.get("name") != "initialize_pose"]
-        # 模型可能已经给了 navigate_*，别再加一个（会变成重复调用）
-        if not _already_heading_somewhere(new_calls):
-            new_calls.append(_make_nav_call(dest))
-        print("[AgentNode] 🛡️ 用户说的是「去%s」（不是重置定位），"
-              "已把 initialize_pose 换成 navigate_to_saved_location" % dest)
-    elif wants_home:
-        # 用户说"回起点" -> 换成 return_to_start
-        new_calls = [tc for tc in response.tool_calls
-                     if tc.get("name") != "initialize_pose"]
-        # 模型可能已经给了 return_to_start，别再加一遍（会触发去重日志）
-        if not any(tc.get("name") == "return_to_start" for tc in new_calls):
-            new_calls.append({
-                "name": "return_to_start",
-                "args": {},
-                "id": "guard_ret_home",
-            })
-        print("[AgentNode] 🛡️ 用户说的是回起点（不是重置定位），"
-              "已把 initialize_pose 换成 return_to_start")
-    else:
-        # 既没说要初始化、也没看出导航语义 -> 直接丢掉这个破坏性操作
-        new_calls = [tc for tc in response.tool_calls
-                     if tc.get("name") != "initialize_pose"]
-        print("[AgentNode] 🛡️ 用户未要求初始化定位，"
-              "已丢弃 initialize_pose（破坏性操作）")
-
-    if not new_calls:
-        # 全被丢掉了：给一句提示，避免空回复
-        return AIMessage(content="需要我初始化定位吗？这会重置当前位置。")
-
-    return _replace_response_calls(response, new_calls)
-
-
 # ============================================================
 # 导航意图强制校正（2026-11-01）
 # ------------------------------------------------------------
@@ -1008,15 +928,15 @@ def _guard_initialize_pose(response, user_text: str):
 #
 # 但即使修了上面两层，3B 模型的工具选择依然是概率性的。所以再加
 # 一层**确定性兜底**：只要用户话里有**能查到的目的地**，就绝不允许
-# 这一轮去执行 return_to_start / initialize_pose。
+# 这一轮去执行 return_to_start。
 #
 # 只在模型**选错**时介入，模型选对了（navigate_*）完全不动。
 # ============================================================
-_WRONG_FOR_DEST = {"return_to_start", "initialize_pose"}
+_WRONG_FOR_DEST = {"return_to_start"}
 
 
 def _guard_nav_target(response, user_text: str):
-    """用户说了明确目的地，模型却要回起点/重置定位 → 强改为去那儿。"""
+    """用户说了明确目的地，模型却要回起点 → 强改为去那儿。"""
     if not getattr(response, "tool_calls", None):
         return response
 

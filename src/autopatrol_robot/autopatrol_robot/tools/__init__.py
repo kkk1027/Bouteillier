@@ -43,7 +43,6 @@ from autopatrol_robot.tools.loc_tools import (
 # )
 from autopatrol_robot.tools.sys_tools import (
     get_current_position,
-    initialize_pose,
     get_battery_status,
     list_predefined_points,
 )
@@ -124,7 +123,6 @@ ALL_TOOLS = [
     # get_patrol_mode_status,
     # 系统状态工具
     get_current_position,
-    initialize_pose,
     get_battery_status,
     list_predefined_points,
     # 角色表现工具（纯前端视觉，不控制硬件）
@@ -156,9 +154,6 @@ ALL_TOOLS = [
 #   clear_all_saved_locations    —— 危险操作，只保留在网页按钮上
 #   list_predefined_points       —— 网页有预定义点列表
 #
-# 注意：initialize_pose **保留**。最初想砍掉（网页有按钮），
-# 但用户口头说"初始化一下位姿"很常见，且 AMCL 失锁后这是恢复手段。
-#
 # 云端大模型不受此限制，仍然用完整的 ALL_TOOLS。
 # ============================================================
 _LOCAL_TOOL_NAMES = {
@@ -176,9 +171,6 @@ _LOCAL_TOOL_NAMES = {
     # "get_patrol_mode_status",
     "get_current_position",
     "get_battery_status",
-    # 用户真的会说"初始化一下位姿"，而且 AMCL 定位失效时这是恢复手段，
-    # 不能只留在网页按钮上。实测加到 19 个工具仍稳定。
-    "initialize_pose",
     "set_butler_mood",
     "butler_say",
     "randomize_butler_idle",
