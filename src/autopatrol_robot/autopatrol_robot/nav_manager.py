@@ -730,6 +730,73 @@ def wait_for_nav_completion(timeout: float = 600.0) -> tuple:
 #   需要回起点时，用户说「回起点」调 return_to_start 工具即可。
 # ============================================================
 
+# ============================================================
+# "目标就在脚下" 检查（2026-11-01）
+# ------------------------------------------------------------
+# 实机现象：用户从起点说"去厕所"，车一动不动，日志却报
+# 「[NavPhase] arrived: ✅ 已到达 厕所！」。
+#
+# 查明原因是**坐标录错了**，不是导航坏了：
+#     起点 initial_point = (0.0000,  0.0000)
+#     厕所 custom_points = (0.0557, -0.0023)   ← 相距 5.6 厘米
+# nav2 的 xy_goal_tolerance 默认 0.25 米，目标一进去就判定成功。
+#
+# 与其让用户看到"已到达"却车没动（以为系统骗人），不如直接说清楚：
+# 这个点就在你脚下，八成是录点时机器人没真正站在那儿。
+# ============================================================
+_GOAL_AT_FEET_M = 0.30
+
+
+def _goal_at_feet_msg(name: str, tx: float, ty: float) -> Optional[str]:
+    """目标点就在机器人当前位置附近时，返回提示文案；否则返回 None。
+
+    任何异常都返回 None（宁可放行导航，也不要因为检查本身出错而卡死）。
+    """
+    try:
+        # 延迟导入：navigation_service 顶层就 import 了本模块，会循环依赖
+        from autopatrol_robot.navigation_service import get_global_nav_service
+
+        svc = get_global_nav_service()
+        if svc is None:
+            return None
+        pos, _reason = svc.get_current_position(detailed=True)
+        if pos is None:
+            return None
+        dist = ((tx - pos['x']) ** 2 + (ty - pos['y']) ** 2) ** 0.5
+    except Exception:                                  # noqa: BLE001
+        return None
+
+    if dist > _GOAL_AT_FEET_M:
+        return None
+
+    # 区分两种"原地不动"，否则提示文不对题：
+    #   A. 目标本身就贴着地图原点 → 大概率录点录错了
+    #   B. 目标在远处，但车已经在那儿了 → 只是不需要再走
+    dist_home = (tx * tx + ty * ty) ** 0.5
+    if dist_home < _GOAL_AT_FEET_M:
+        advice = (
+            f"　「{name}」的坐标 ({tx:.3f}, {ty:.3f}) 几乎就在地图原点，"
+            f"而起点 initial_point 也在原点附近 —— 多半是保存「{name}」时"
+            f"机器人并没有真的站在那个位置，或者当时的 AMCL 位姿是错的。\n"
+            f"　解决办法：把车开到真正的「{name}」，再说一次"
+            f"「这里是{name}」重新保存即可。"
+        )
+    else:
+        advice = (
+            f"　车现在已经在这个坐标上了，所以不需要再移动。\n"
+            f"　如果你其实希望车去别的地方，请先确认 AMCL 位姿准确"
+            f"（看网页顶部的定位状态条），或者换一个目标点。"
+        )
+
+    return (
+        f"⚠️ 「{name}」就在车旁边（相距 {dist * 100:.0f} 厘米），"
+        f"不用导航也已经站在目标点上了，所以没有启动导航。\n"
+        f"　目标坐标: ({tx:.3f}, {ty:.3f})\n"
+        f"　当前坐标: ({pos['x']:.3f}, {pos['y']:.3f})\n"
+        + advice
+    )
+
+
 def launch_navigate_with_return_async(index: int, name: str) -> str:
     """启动「导航到目标」的异步导航（非阻塞，**不自动返航**）。
 
@@ -749,6 +816,19 @@ def launch_navigate_with_return_async(index: int, name: str) -> str:
     Returns:
         启动确认字符串
     """
+    # 目标就在脚下时直接拒绝 —— 否则 nav2 会瞬间返回 success，
+    # 用户看到"已到达"却一步没走，比报错更让人困惑。
+    try:
+        from autopatrol_robot.location_store import get_location_store
+        _store = get_location_store()
+        _coords = _store.get_coords(name) or _store.get_predefined_coords(index)
+        if _coords:
+            _msg = _goal_at_feet_msg(name, _coords[0], _coords[1])
+            if _msg:
+                return _msg
+    except Exception:                                  # noqa: BLE001
+        pass
+
     # silent=True：本流程由 worker 统一上报阶段，monitor 再报一次会变成
     # 「completed: 导航完成：厕所」+「arrived: 已到达 厕所！」两条重复播报。
     result = launch_navigate_by_index(index, name, silent=True)

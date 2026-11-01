@@ -88,7 +88,23 @@ def save_current_location(name: str) -> str:
         return f"❌ 获取当前位置失败: {e}"
 
     store = get_location_store()
-    return store.save(name, x, y, yaw)
+    msg = store.save(name, x, y, yaw)
+
+    # ★ 2026-11-01 录点合理性检查
+    #   实测事故：用户把「厕所」录在了 (0.056, -0.002)，而起点是 (0, 0)
+    #   —— 两者相距 5.6 厘米。之后说"去厕所"，nav2 一收到目标就判定
+    #   "已到达"（xy_goal_tolerance=0.25m），车一步没动。
+    #   在录点的这一刻提醒，比等到导航时才发现有用得多。
+    dist_home = (x * x + y * y) ** 0.5
+    if dist_home < 0.30:
+        msg += (
+            f"\n⚠️ 注意：「{name}」的位置离地图原点只有 {dist_home * 100:.0f} 厘米"
+            f"（起点也在原点附近）。\n"
+            f"　如果这不是你想要的，请把车开到真正的「{name}」，"
+            f"再说一次「这里是{name}」覆盖掉。\n"
+            f"　否则以后让它去「{name}」时会原地不动、直接报「已到达」。"
+        )
+    return msg
 
 
 @tool(args_schema=NavigateToSavedInput)
