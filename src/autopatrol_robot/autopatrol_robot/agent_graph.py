@@ -358,11 +358,12 @@ SYSTEM_PROMPT = PERSONA_TEXT + """
 # ============================================================
 SYSTEM_PROMPT_COMPACT = PERSONA_TEXT + """
 
-工具映射：
-- 去X → navigate_to_saved_location
+工具映射（★ 先看动词，再看名词）：
+- 去X / 带我去X / 到X → navigate_to_saved_location
 - 先去A再去B/依次去 → navigate_sequence
-- 回起点/回去 → return_to_start
-- 这里是X/记成X → save_current_location
+- 回起点/回去/回家 → return_to_start
+- 只有出现「记住」「记成」「这里是」「记作」时才用 save_current_location
+  ★ 光说「去书房」**不是**保存！车已经在书房时也只能去，不能存
 - 在哪 → get_current_position
 - 电量 → get_battery_status
 - 天气 → get_weather
@@ -383,6 +384,11 @@ SYSTEM_PROMPT_COMPACT = PERSONA_TEXT + """
    系统会自动中断旧任务，**不需要**先调 cancel_navigation
 7. 假如工具返回里有"请先取消"之类的提示，**不要**照抄，
    也不要因此改成回起点；按用户说的目的地重新调导航即可
+8. 【去X ≠ 保存X】用户只说"去书房"时调 navigate_to_saved_location，
+   **绝对不要**调 save_current_location —— 那会把书房的位置改写成
+   车现在所在的位置，地点就废了
+9. save_current_location 只在一个句式下使用：「这里是X」「记住这是X」
+   「把这里记成X」。没听到"记住/记成/这里是"，就不要保存
 
 禁止用文字描述代替调用工具。"""
 
@@ -750,7 +756,12 @@ def agent_node(state: MessagesState):
         # 1) 用户说了能查到的目的地，模型却要回起点 → 强制纠正
         response = _guard_nav_target(response, last_user_text)
 
-        # 2) 再收敛多个互斥工具
+        # 2) 用户只是要去，模型却要"记住这里" → 强制纠正
+        #    （本轮事故：「去书房」被写成 save_current_location，
+        #      把真实坐标覆盖成了车所在的原点附近）
+        response = _guard_save_intent(response, last_user_text)
+
+        # 3) 再收敛多个互斥工具
         response = _dedupe_exclusive_tool_calls(response)
 
     # ---- 绝不让空 AIMessage 落进 checkpoint ----
@@ -852,9 +863,27 @@ def _extract_destination(text: str):
             if cut >= 0:
                 rest = rest[:cut]
         rest = rest.strip()
-        if rest:
+        # 中文地点名至少 2 个字（单字只剩「了」「吧」这类语气碎片，
+        # 且唯一有意义的单字「家」已由 _HOME_OBJECT_WORDS 排除）
+        if len(rest) >= 2:
             return rest
     return None
+
+
+def _known_location_names():
+    """所有可导航的地点名（预定义 + 自定义），做宽松匹配用。"""
+    names = []
+    try:
+        from autopatrol_robot.tools.nav_tools import LOCATION_MAP
+        names.extend(list(LOCATION_MAP.keys()))
+    except Exception:                    # noqa: BLE001
+        pass
+    try:
+        from autopatrol_robot.location_store import get_location_store
+        names.extend(list(get_location_store().list_all().keys()))
+    except Exception:                    # noqa: BLE001
+        pass
+    return names
 
 
 def _resolve_destination(name: str):
@@ -878,7 +907,17 @@ def _resolve_destination(name: str):
             return name
     except Exception:                    # noqa: BLE001
         pass
-    return None
+
+    # ★ 2026-11-01 宽松兜底：口语里目的地很少孤零零出现
+    #   「去书房看看」「去厕所一趟」「去厨房那边」—— 抠出来的词带着
+    #   尾巴，精确匹配必然失败。取「已知地点名是它前缀」里**最长**的那个。
+    #   优先精确匹配，所以「厕所」和「厕所门口」共存时不会串。
+    best = None
+    for loc in _known_location_names():
+        if len(loc) >= 2 and name.startswith(loc):
+            if best is None or len(loc) > len(best):
+                best = loc
+    return best
 
 
 def _make_nav_call(name: str, call_id: str = "guard_nav"):
@@ -955,6 +994,87 @@ def _guard_nav_target(response, user_text: str):
 
     print("[AgentNode] 🛡️ 用户说的是「去%s」，模型却选了 %s → "
           "已强制改为 navigate_to_saved_location" % (dest, names))
+    return _replace_response_calls(response, new_calls)
+
+
+# ============================================================
+# 「记住这里是X」vs「去X」的强制校正（2026-11-01）
+# ------------------------------------------------------------
+# 实机日志（agent_node 原始输出，用户提供的完整回合）：
+#   [0] Human : 记住这里是书房
+#   [1] AI    : save_current_location(name='书房')      ✓ 到了 (1.90, 0.35)
+#   [4] Human : 回起点
+#   [5] AI    : return_to_start                          ✓
+#   [8] Human : 去书房                                   ← 只是要去
+#   [9] AI    : save_current_location(name='书房')      ✗✗✗
+#   [10]Tool  : ✅ 已更新 书房 的位置
+#   [11]AI    : 请把车开到真正的"书房"…
+#
+# 第 9 步把「书房」从真实的 (1.90, 0.35) 改写成车此刻所在的
+# (0.00, -0.04) —— **一条纯粹的导航指令，把地点数据写坏了**。
+#
+# 为什么现有两层防线都没拦住：
+#   · _guard_nav_target 只盯 return_to_start；
+#   · _dedupe_exclusive_tool_calls 里虽有「同轮出现导航类就丢
+#     save_current_location」，但前提是**存在**导航类工具。本轮模型
+#     只吐了一个 save_current_location，`if not nav_calls: return`
+#     直接放行。
+#
+# 根因：3B 模型在 compact 提示词里同时看到
+#   「去X → navigate_to_saved_location」
+#   「这里是X/记成X → save_current_location」
+# 两行都在讲"地点名字"，它是按名词匹配而不是按动词匹配的，选错是
+# 必然。跟 initialize_pose 那次一样属于**确定性错误**：同一句话每次
+# 都错，调 prompt 只能降概率，必须在代码层拦。
+# ============================================================
+
+# 用户原话里出现这些词，才允许 save_current_location 执行。
+# 没见过这些词还去"保存位置"，一定是工具选错了 —— 因为「保存地点」
+# 这个动作在中文里不可能绕过这些动词单独表达。
+_SAVE_INTENT_WORDS = (
+    "记住", "记下", "记成", "记为", "记作", "记忆",
+    "保存", "存为", "存成", "存一下",
+    "设为", "设置成", "改成", "改名", "命名",
+    "这里是", "这儿是", "这是", "这地方", "这个地方",
+)
+
+
+def _guard_save_intent(response, user_text: str):
+    """用户说「去X」，模型却只调了 save_current_location → 改成导航。
+
+    只在模型**选错**时介入：
+      · 用户话里有保存类动词（记住/这里是/记成…）→ 原样放行；
+      · 本轮已经给了导航工具 → 交给 _dedupe_exclusive_tool_calls 丢 save；
+      · 抠不出可查到的目的地 → 保守放行（可能是模型判断对了的冷门说法）。
+    """
+    if not getattr(response, "tool_calls", None):
+        return response
+
+    names = [tc.get("name") for tc in response.tool_calls]
+    if "save_current_location" not in names:
+        return response
+
+    text = (user_text or "").strip()
+
+    # 用户真的在要求"记下来" —— 尊重模型的选择
+    if any(w in text for w in _SAVE_INTENT_WORDS):
+        return response
+
+    # 本轮还给了导航工具，交给后面的去重逻辑处理
+    if _already_heading_somewhere(response.tool_calls):
+        return response
+
+    dest = _resolve_destination(_extract_destination(text) or "")
+    if not dest:
+        return response
+
+    new_calls = [tc for tc in response.tool_calls
+                 if tc.get("name") != "save_current_location"]
+    new_calls.append(_make_nav_call(dest))
+
+    print("[AgentNode] 🛡️ 用户说的是「去%s」（话里没有保存类动词），模型却选了 "
+          "save_current_location → 已强制改为 navigate_to_saved_location"
+          % dest)
     return _replace_response_calls(response, new_calls)
 
 
