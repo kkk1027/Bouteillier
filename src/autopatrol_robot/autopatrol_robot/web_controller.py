@@ -1790,7 +1790,10 @@ def _setup_nav_callbacks():
 
     def _announce_via_ai(phase: str, message: str):
         """后台线程：调用 LLM 生成拟人化播报，以 AI 助手身份主动告知用户。"""
-        announce_phases = {'arrived', 'completed', 'failed', 'returning'}
+        # ★ 2026-11-01：删掉了 'returning' / 'completed' 两个阶段 ——
+        #   「导航完成后自动返回起点」的流程已按用户要求彻底删除，
+        #   nav_manager 不再发这两个 phase。
+        announce_phases = {'arrived', 'failed'}
         if phase not in announce_phases:
             return
 
@@ -1826,8 +1829,6 @@ def _generate_and_emit_announcement(phase: str, message: str):
 要求：
 - 像朋友一样自然地说出来，不要机械地重复系统消息
 - 为"arrived"（到达目标）时：可以问用户接下来做什么，或表达到达的喜悦
-- 为"returning"（返回起点）时：告知用户正在回家路上
-- 为"completed"（全部完成）时：告知任务完成，已回到起点
 - 为"failed"（失败）时：用温和的语气告知出了问题
 - 短小精悍，10-30字即可"""
 

@@ -47,11 +47,6 @@ class NavToPredefinedPointInput(BaseModel):
 class NavigateToLocationInput(BaseModel):
     """导航到命名地点"""
     location: str = Field(..., description="地点名称，例如：厨房、客厅、影音房、起点等")
-    return_home: bool = Field(
-        default=False,
-        description=("到达后是否自动返回起点。"
-                     "★ 只有当用户明确说『去X然后回来』或『去X再回起点』"
-                     "时才设 true；用户只说『去X』时必须留空（默认 false）。"))
 
 
 class NavigateSequenceInput(BaseModel):
@@ -66,23 +61,20 @@ class NavigateSequenceInput(BaseModel):
 # 公共 helper：导航到预定义点（默认**不**自动回起点）
 # ============================================================
 
-def _navigate_to(index: int, name: str, return_home: bool = False) -> str:
-    """导航到预定义点（异步非阻塞版）。
+def _navigate_to(index: int, name: str) -> str:
+    """导航到预定义点（异步非阻塞版，**不自动返航**）。
 
-    ★ 2026-11-01 改动：默认**不再自动返回起点**。
-      原来这里硬编码 return_to_start=True，用户只说“去厕所”
-      → 到了之后车又自己跑回去，完全不是他要的。
-      现在只有用户明说“去了再回来”才传 True。
+    ★ 2026-11-01 用户确认：**彻底删除「导航完成后自动返回起点」流程**。
+      原来这里硬编码 return_to_start=True，用户只说“去厕所”，
+      到了之后车又自己跑回去 —— 完全不是他要的。
+      现在车到了就停在那儿；要回起点请调 return_to_start 工具。
 
     回调阶段（由 web_controller 注册）：
       'started'   → "📍 正在前往 XXX..."
       'arrived'   → "✅ 已到达 XXX！"
-      'returning' → "📍 正在返回起点..."（仅 return_home=True）
-      'completed' → "✅ 已回到起点！"
       'failed'    → "❌ 导航失败：..."
     """
-    return launch_navigate_with_return_async(
-        index, name, return_to_start=bool(return_home))
+    return launch_navigate_with_return_async(index, name)
 
 
 # ============================================================
@@ -90,17 +82,16 @@ def _navigate_to(index: int, name: str, return_home: bool = False) -> str:
 # ============================================================
 
 @tool(args_schema=NavigateToLocationInput)
-def navigate_to_location(location: str, return_home: bool = False) -> str:
+def navigate_to_location(location: str) -> str:
     """导航到命名地点（预定义：起点/厨房/客厅/影音房）。
 
     当用户说"去厨房"、"去客厅"时使用此工具。
-    默认**只去，不自动回起点**；只有用户明说“去了再回来”才把
-    return_home 设为 true。
+    **只去，不自动回起点。**
     """
     index = LOCATION_MAP.get(location)
     if index is None:
         return f"❌ 未找到预定义地点: {location}。可用地点：{', '.join(LOCATION_MAP.keys())}"
-    return _navigate_to(index, location, return_home)
+    return _navigate_to(index, location)
 
 
 @tool(args_schema=NavToPredefinedPointInput)
@@ -147,17 +138,38 @@ def navigate_sequence(locations: list[str]) -> str:
         return "❌ 导航队列为空"
 
     # 构建索引列表
+    #
+    # ★ 2026-11-01：支持自定义地点。
+    #   原来只查 LOCATION_MAP（起点/厨房/客厅/影音房），而用户说
+    #   “先去书房再去客厅”时，“书房”通常是「这里是书房」存下来的
+    #   自定义地点，直接就会失败。
+    #   自定义地点在 patrol_config.yaml 的 target_points 里也有索引
+    #   （LocationStore.find_index 返回 i//3+1），patrol_node 完全
+    #   认得，缺的只是这里的名字解析。
+    from autopatrol_robot.location_store import get_location_store
+    store = get_location_store()
+
     indices = []
     for i, loc in enumerate(locations, 1):
         index = LOCATION_MAP.get(loc)
         if index is None:
-            return f"❌ 第{i}步失败：未找到预定义地点 '{loc}'。可用地点：{', '.join(LOCATION_MAP.keys())}"
+            try:
+                index = store.find_index(loc)
+            except Exception:          # noqa: BLE001
+                index = None
+        if index is None:
+            custom = store.list_all()
+            hint = "、".join(list(custom.keys())[:6]) if custom else "暂无"
+            return (f"❌ 第{i}步失败：未找到地点 '{loc}'。\n"
+                    f"预定义地点：{', '.join(LOCATION_MAP.keys())}\n"
+                    f"自定义地点：{hint}\n"
+                    f"请先用'这里是{loc}'来标记位置。")
         indices.append(index)
 
     names = " → ".join(locations)
-    # 序列导航默认也不自动返航（同 navigate_to_location 的改动）
-    return launch_navigate_sequence_async(indices, names,
-                                          return_to_start=False)
+    # 序列导航（patrol_node）内部会依次走完所有航点：
+    # 中间点到达后等按钮确认（期间位姿冻结），最后一点到达即结束。
+    return launch_navigate_sequence_async(indices, names)
 
 
 @tool

@@ -2,8 +2,10 @@
 #include <tf2_ros/transform_broadcaster.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <std_msgs/msg/bool.hpp>
 
 #include <cmath>
+#include <memory>
 #include <string>
 
 // 四元数→偏航角。
@@ -57,15 +59,28 @@ public:
     this->declare_parameter("reset_speed_thresh", 1.0);      // m/s
     this->declare_parameter("reset_yawrate_thresh", 3.15);   // rad/s
     this->declare_parameter("reset_jump_abs", 1.0);          // m，绝对兜底
+    // ★ 速度判据的**最小位移下限**（2026-11-01 补）
+    //
+    // 只靠「位移/dt > 1 m/s」会误伤：/odom 若以远高于预期的频率到达
+    // （实测 500Hz 时会），单帧 dt 只有 2ms，哪怕只走 5cm 算出来也是
+    // 25 m/s → 每一帧都判"重置" → 输出被钉死在原点，整条 TF 链失效。
+    //
+    // 一次机械行程的最大位移是有上限的（本车 0.3 m/s），所以单帧位移
+    // 小于一个栅格（5cm）时光凭速度不足以证明是重置。
+    this->declare_parameter("reset_min_dist", 0.05);         // m
     this->declare_parameter("use_wall_clock", true);
     this->declare_parameter("enable_reset_guard", true);
+    // 位姿冻结开关（配合 /odom_freeze 话题，见下面注释）
+    this->declare_parameter("enable_freeze", true);
 
     speed_thresh_ = this->get_parameter("reset_speed_thresh").as_double();
     yawrate_thresh_ =
         this->get_parameter("reset_yawrate_thresh").as_double();
     jump_abs_ = this->get_parameter("reset_jump_abs").as_double();
+    min_dist_ = this->get_parameter("reset_min_dist").as_double();
     use_wall_clock_ = this->get_parameter("use_wall_clock").as_bool();
     enable_guard_ = this->get_parameter("enable_reset_guard").as_bool();
+    enable_freeze_ = this->get_parameter("enable_freeze").as_bool();
 
     // 订阅 EKF 融合后的里程计（导航模式）或原始 /odom（建图模式）
     odom_subscribe_ = this->create_subscription<nav_msgs::msg::Odometry>(
@@ -74,20 +89,61 @@ public:
 
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(this);
 
+    // ============================================================
+    // 位姿冻结（2026-11-01）
+    // ------------------------------------------------------------
+    // 【为什么需要】
+    //   ESP32 的 esp32_command 服务在「等按钮」模式下会**阻塞
+    //   micro-ROS 任务最多 60 秒**，期间 /odom 和 /imu_raw 全部停发。
+    //   EKF 收不到任何观测，就按上一帧速度继续积分 —— 实测 55 秒把
+    //   odom→base_footprint 从 0.2m 推到 20.6m，方向固定在 53°，
+    //   典型的「匀速盲推」。AMCL 匹配率同期从 92% 掉到 16~37%。
+    //
+    // 【对策】
+    //   patrol_node 在调 esp32_command 之前发 /odom_freeze=true，
+    //   收到后本节点立刻锁住当前输出位姿，此后**忽略任何输入**，
+    //   只按固定频率重发那个冻结值（时间戳刷新，保证 TF 不过期）。
+    //   解冻时用补偿量把输出接回去，下游完全看不到跳变。
+    //
+    //   选择在 odom2tf 而不是 EKF 里冻结，是因为这里是 TF 链最下游：
+    //     ESP32 /odom → 协方差注入 → EKF → **odom2tf** → TF → nav2/AMCL
+    //   不管上游怎么漂，下游看到的位姿都停在快照上。
+    // ============================================================
+    freeze_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+        "/odom_freeze", 10,
+        std::bind(&OdomTopic2TF::freeze_callback_, this,
+                  std::placeholders::_1));
+    // 冻结期间靠定时器自己重发，不能指望输入（输入正好是断的）
+    freeze_timer_ = this->create_wall_timer(
+        std::chrono::milliseconds(50),   // 20Hz
+        std::bind(&OdomTopic2TF::freeze_tick_, this));
+
     RCLCPP_INFO(this->get_logger(),
-                "odom2tf 已启动：重置保护=%s，速度门限 %.2f m/s / %.2f rad/s",
-                enable_guard_ ? "开" : "关", speed_thresh_, yawrate_thresh_);
+                "odom2tf 已启动：重置保护=%s，速度门限 %.2f m/s / %.2f rad/s，"
+                "位姿冻结=%s",
+                enable_guard_ ? "开" : "关", speed_thresh_, yawrate_thresh_,
+                enable_freeze_ ? "就绪" : "禁用");
   }
 
 private:
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_subscribe_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr freeze_sub_;
+  rclcpp::TimerBase::SharedPtr freeze_timer_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 
   double speed_thresh_{1.0};
   double yawrate_thresh_{3.15};
   double jump_abs_{1.0};
+  double min_dist_{0.05};
   bool use_wall_clock_{true};
   bool enable_guard_{true};
+  bool enable_freeze_{true};
+
+  // ---- 冻结状态 ----
+  bool frozen_{false};
+  // 解冻后等下一帧输入再重算补偿量（详见 freeze_callback_ 的注释）
+  bool pending_rebase_{false};
+  double frozen_x_{0.0}, frozen_y_{0.0}, frozen_yaw_{0.0};
 
   // ---- 状态 ----
   bool has_last_{false};
@@ -97,6 +153,79 @@ private:
   uint64_t resets_{0};
   // 补偿量
   double offset_x_{0.0}, offset_y_{0.0}, offset_yaw_{0.0};
+
+  // ============================================================
+  // 冻结
+  // ============================================================
+  void freeze_callback_(const std_msgs::msg::Bool::SharedPtr msg) {
+    if (!enable_freeze_) return;
+
+    if (msg->data && !frozen_) {
+      // 进入冻结：把当前输出锁住
+      frozen_ = true;
+      frozen_x_ = has_last_ ? last_out_x_ : 0.0;
+      frozen_y_ = has_last_ ? last_out_y_ : 0.0;
+      frozen_yaw_ = has_last_ ? last_out_yaw_ : 0.0;
+      RCLCPP_INFO(this->get_logger(),
+                  "🧊 位姿冻结开始：锁在 (%.2f, %.2f, %.1f°)，"
+                  "此后忽略所有里程计输入",
+                  frozen_x_, frozen_y_, frozen_yaw_ * 180.0 / M_PI);
+      // 立刻发一帧，不等定时器
+      publish_tf_(frozen_x_, frozen_y_, frozen_yaw_, this->now());
+    } else if (!msg->data && frozen_) {
+      frozen_ = false;
+      // ★ 解冻时**不能**立刻算补偿量。
+      //
+      //   冻结期间上游（EKF）还在盲推，raw odom 可能已经漂了几十米。
+      //   而我们手里的 last_raw_* 是**冻结那一刻**的值 —— 用它算出来的
+      //   补偿量只对「那一帧的 raw」成立，下一帧新数据一来，输出就会
+      //   跟着跳到漂移后的位置（实测直接跳了 24m）。
+      //
+      //   正确做法：置一个待重定位标志，等**下一帧真实输入**到来时，
+      //   用它当前的 raw 值反解补偿量，让输出正好等于冻结值。
+      //   那一帧之后，输出就会按 raw 的相对变化正常跟随。
+      pending_rebase_ = true;
+      RCLCPP_INFO(this->get_logger(),
+                  "🔥 位姿解冻：等下一帧里程计数据到达后，从冻结值 "
+                  "(%.2f, %.2f) 无缝继续（上游漂移会被补偿掉）",
+                  frozen_x_, frozen_y_);
+    }
+  }
+
+  void freeze_tick_() {
+    if (!frozen_) return;
+    // 冻结期间必须自己重发：输入正好是断的，不能指望它。
+    // 时间戳用当前时刻，保证 TF 不过期（nav2 要求 200ms 内）。
+    publish_tf_(frozen_x_, frozen_y_, frozen_yaw_, this->now());
+  }
+
+  // ============================================================
+  // 发布
+  // ============================================================
+  void publish_tf_(double x, double y, double yaw, const rclcpp::Time &stamp) {
+    geometry_msgs::msg::TransformStamped transform;
+    transform.header.frame_id = "odom";
+    transform.child_frame_id = "base_footprint";
+    transform.header.stamp = stamp;
+
+    // 强制单调：倒退的 TF 时间戳会污染 tf2 buffer
+    if (stamp < last_stamp_) {
+      transform.header.stamp = last_stamp_;
+    }
+    last_stamp_ = transform.header.stamp;
+
+    transform.transform.translation.x = x;
+    transform.transform.translation.y = y;
+    transform.transform.translation.z = 0.0;
+
+    const double half = yaw * 0.5;
+    transform.transform.rotation.x = 0.0;
+    transform.transform.rotation.y = 0.0;
+    transform.transform.rotation.z = std::sin(half);
+    transform.transform.rotation.w = std::cos(half);
+
+    tf_broadcaster_->sendTransform(transform);
+  }
 
   static double wrap_pi(double a) {
     while (a > M_PI) a -= 2.0 * M_PI;
@@ -137,6 +266,27 @@ private:
 
     const rclcpp::Time now = this->now();
 
+    // ★ 冻结期间完全忽略输入：定时器在负责重发冻结值。
+    //   注意这里也**不更新 last_raw_***，否则解冻时会拿到冻结期间
+    //   积累的漂移量，补偿就失效了。
+    if (frozen_) {
+      return;
+    }
+
+    // ★ 刚解冻的第一帧：用**当前** raw 反解补偿量，使输出正好等于冻结值。
+    //   放在这里（而不是 freeze_callback_ 里）是因为那一刻还没有新数据，
+    //   用旧的 raw 算出来的补偿量到下一帧就失效了 —— 实测输出会直接
+    //   跳到漂移后的位置（24m 开外）。
+    if (pending_rebase_) {
+      pending_rebase_ = false;
+      set_offset_from_(raw_x, raw_y, raw_yaw,
+                       frozen_x_, frozen_y_, frozen_yaw_);
+      RCLCPP_INFO(this->get_logger(),
+                  "位姿重定位完成：上游 (%.2f, %.2f) → 输出接回冻结值 "
+                  "(%.2f, %.2f)",
+                  raw_x, raw_y, frozen_x_, frozen_y_);
+    }
+
     // ---- 1. 判断是否需要补偿 ----
     if (enable_guard_ && has_last_) {
       const double dx = raw_x - last_raw_x_;
@@ -149,8 +299,10 @@ private:
         dt = 0.033;   // 时间戳异常时按 30Hz 估
       }
 
-      const bool too_fast = (dist / dt) > speed_thresh_;
-      const bool spin_too_fast = (dyaw / dt) > yawrate_thresh_;
+      const bool too_fast =
+          (dist > min_dist_) && ((dist / dt) > speed_thresh_);
+      const bool spin_too_fast =
+          (dyaw > 0.05) && ((dyaw / dt) > yawrate_thresh_);
       const bool huge_jump = dist > jump_abs_;
 
       if (too_fast || spin_too_fast || huge_jump) {
@@ -169,7 +321,7 @@ private:
 
     // ---- 2. 应用补偿 ----
     double out_x = raw_x, out_y = raw_y, out_yaw = raw_yaw;
-    if (enable_guard_) {
+    if (enable_guard_ || has_last_) {
       apply_offset_(raw_x, raw_y, raw_yaw, out_x, out_y, out_yaw);
     }
 
@@ -183,36 +335,17 @@ private:
     has_last_ = true;
 
     // ---- 4. 发布 ----
-    geometry_msgs::msg::TransformStamped transform;
-    transform.header.frame_id = "odom";
-    transform.child_frame_id = "base_footprint";
+    // use_wall_clock_ 默认 true：ESP32 重启后它自己的时间基准可能倒退，
+    // 倒退的 TF 时间戳会污染 tf2 buffer。本车激光 6Hz、控制 20Hz，
+    // 这点时间精度损失完全可接受。
+    rclcpp::Time stamp;
     if (use_wall_clock_) {
-      // ★ 用当前时刻而不是 msg->header.stamp：ESP32 重启后它自己的时间
-      //   基准可能倒退，倒退的 TF 时间戳会污染 tf2 buffer。
-      //   本车激光 6Hz、控制 20Hz，这点时间精度损失完全可接受。
-      transform.header.stamp = now;
+      stamp = now;
     } else {
-      // msg->header.stamp 是 builtin_interfaces::msg::Time，
-      // 要和 rclcpp::Time 比较必须先转换（直接比对会找不到 operator<）。
-      const rclcpp::Time raw_stamp(msg->header.stamp, this->get_clock()->get_clock_type());
-      transform.header.stamp = (raw_stamp < last_stamp_)
-                                   ? last_stamp_
-                                   : raw_stamp;   // 强制单调
+      stamp = rclcpp::Time(msg->header.stamp,
+                           this->get_clock()->get_clock_type());
     }
-    last_stamp_ = transform.header.stamp;
-
-    transform.transform.translation.x = out_x;
-    transform.transform.translation.y = out_y;
-    transform.transform.translation.z = 0.0;
-
-    // 欧拉角 → 四元数（只绕 z）
-    const double half = out_yaw * 0.5;
-    transform.transform.rotation.x = 0.0;
-    transform.transform.rotation.y = 0.0;
-    transform.transform.rotation.z = std::sin(half);
-    transform.transform.rotation.w = std::cos(half);
-
-    tf_broadcaster_->sendTransform(transform);
+    publish_tf_(out_x, out_y, out_yaw, stamp);
   };
 };
 

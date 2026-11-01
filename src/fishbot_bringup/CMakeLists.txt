@@ -21,10 +21,11 @@ find_package(tf2_ros REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 
 add_executable(odom2tf src/odom2tf.cpp)
 ament_target_dependencies(odom2tf
-  rclcpp tf2  nav_msgs  geometry_msgs  tf2_ros
+  rclcpp tf2  nav_msgs  geometry_msgs  tf2_ros  std_msgs
 )
 
 add_executable(imu_bias_remover src/imu_bias_remover.cpp)

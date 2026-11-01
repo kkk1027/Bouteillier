@@ -117,18 +117,22 @@ print('二、事故 A 之二：舵机播报不再阻塞 60 秒')
 # ============================================================
 pat = read(PATROL)
 
-check('新增 enable_servo_announce 参数', 'enable_servo_announce' in pat)
-check('★ 默认关闭（避免 60 秒阻塞）',
-      re.search(r"declare_parameter\(\s*'enable_servo_announce'\s*,\s*False",
+# ★ 2026-11-01 需求定型：不再用「总开关」，改由「是否多点」决定。
+#   单点不等按钮；多点的中间点等按钮；最后一个点不等。
+#   详见 test_button_freeze.py。
+check('已删除 enable_servo_announce（改用 confirm_button）',
+      'enable_servo_announce' not in pat)
+check('nav_to_pose 有 confirm_button 参数',
+      'confirm_button: bool = False' in pat)
+check('新增 servo_timeout_sec 参数（默认 60s）',
+      re.search(r"declare_parameter\(\s*'servo_timeout_sec'\s*,\s*60",
                 pat) is not None)
-check('新增 servo_timeout_sec 参数（可调）',
-      'servo_timeout_sec' in pat)
 check('call_servo_and_wait 支持 heartbeat 回调',
       'heartbeat=None' in pat and 'heartbeat()' in pat)
 check('等待循环里每 0.5s 调一次心跳（而不是一次 spin 到底）',
       'timeout_sec=0.5' in pat)
-check('抽出了 _run_servo_announce，两处调用点统一',
-      '_run_servo_announce' in pat)
+check('抽出了 _wait_button_confirm（带位姿冻结）',
+      'def _wait_button_confirm(' in pat)
 check('注释里写清了事故根因（60s 阻塞 → odom 停发 → 盲推）',
       '盲推' in pat or '漂移' in pat)
 check('没有残留的 call_servo_and_wait() 无参直调',
@@ -141,20 +145,29 @@ print('三、事故 B：去X 不再自动回起点')
 nav = read(NAV_TOOLS)
 loc = read(LOC_TOOLS)
 
-check('nav_tools 的 NavigateToLocationInput 有 return_home',
-      'return_home' in nav)
-check('loc_tools 的 NavigateToSavedInput 有 return_home',
-      'return_home' in loc)
-check('★ navigate_to_saved_location 默认 return_home=False',
-      'def navigate_to_saved_location(name: str, return_home: bool = False)'
-      in loc)
-check('★ navigate_to_location 默认 return_home=False',
-      'def navigate_to_location(location: str, return_home: bool = False)'
-      in nav)
-check('不再有硬编码的 return_to_start=True（工具层）',
-      'return_to_start=True)' not in nav and 'return_to_start=True)' not in loc)
-check('序列导航也不自动返航',
-      'return_to_start=False' in nav)
+# ★ 2026-11-01 需求定型：**彻底删除**「导航后自动返回起点」流程。
+#   不再有 return_home 参数，也不再有 return_to_start 传参。
+check('工具层已删除 return_home 参数',
+      'return_home' not in nav and 'return_home' not in loc)
+check('★ navigate_to_saved_location 无返航参数',
+      'def navigate_to_saved_location(name: str) -> str:' in loc)
+check('★ navigate_to_location 无返航参数',
+      'def navigate_to_location(location: str) -> str:' in nav)
+def code_lines(src):
+    """只取真正的代码，剥掉 docstring 与 # 注释里的历史说明。
+
+    注释里会写「原来硬编码 return_to_start=True」，那是复盘记录，
+    不是实际传参，不能算违规。
+    """
+    no_doc = re.sub(r'""".*?"""', '', src, flags=re.S)
+    out = [ln for ln in no_doc.splitlines()
+           if not ln.strip().startswith('#')]
+    return '\n'.join(out)
+
+
+check('工具层代码里不再有 return_to_start= 传参',
+      'return_to_start=' not in code_lines(nav)
+      and 'return_to_start=' not in code_lines(loc))
 check('helper 改名后引用已同步（无 _navigate_to_and_return 残留）',
       '_navigate_to_and_return' not in nav)
 
@@ -184,10 +197,10 @@ agent = read(AGENT)
 
 check('prompt 不再说“内部已包含到达后自动回起点”',
       '内部已包含"到达后自动回起点"' not in agent)
-check('prompt 说明了默认不回起点',
-      '默认**只去、不回来**' in agent or '默认**不会**自动返回起点' in agent)
+check('prompt 说明「只去、不回来」',
+      '只去、不回来' in agent)
 check('_EXCLUSIVE_NAV_TOOLS 注释已更新',
-      '已**不再**默认自动回起点' in agent)
+      '已**不再**自动回起点' in agent)
 
 print()
 print('=' * 60)

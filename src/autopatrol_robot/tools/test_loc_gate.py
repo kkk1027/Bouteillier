@@ -161,8 +161,10 @@ check('_monitor_process 有 report 开关',
 check('带返航的流程把 monitor 静音',
       nav_code.count('silent=True') >= 3,
       '出现 %d 次' % nav_code.count('silent=True'))
-check('worker 内的 return_to_start 也静音',
-      'launch_return_to_start(silent=True)' in nav_code)
+# ★ 2026-11-01：『导航后自动返回起点』流程已彻底删除，
+#   所以 worker 里不再有 launch_return_to_start 调用。
+check('worker 里不再自动返航（流程已删除）',
+      'launch_return_to_start(silent=True)' not in nav_code)
 
 # ============================================================
 # 六、启动清理

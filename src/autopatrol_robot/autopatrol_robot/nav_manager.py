@@ -349,7 +349,7 @@ def _monitor_process(report: bool = True):
         [NavPhase] arrived:   ✅ 已到达 厕所！
     reason：launch_navigate_by_index 启动了 _monitor_process 盯这个
     subprocess，而 launch_navigate_with_return_async 又启动了
-    _async_navigate_and_return_worker 盯同一个 subprocess。
+    后台 worker 盯同一个 subprocess。
     进程一退出，两个线程都拿到 rc==0，于是各自 notify 一次。
 
     而且语义也不对：对「到达后自动回起点」这个流程，真正的
@@ -716,35 +716,39 @@ def wait_for_nav_completion(timeout: float = 600.0) -> tuple:
 
 
 # ============================================================
-# 异步导航+返回（非阻塞版本，供 AI 工具使用）
+# 异步导航（非阻塞版本，供 AI 工具使用）
+# ------------------------------------------------------------
+# ★ 2026-11-01：**彻底删除「导航完成后自动返回起点」流程**
+#   （用户确认：「每一次导航完成后调返回起点的流程可以去掉」）
+#
+#   原实现在这里挂了一条后台 worker，到达后
+#   自动 launch_return_to_start()。后果是用户只说「去厕所」，车到了
+#   之后又自己跑回起点。而错误消息里还会带出旧目标名（"回起点"），
+#   把 3B 模型也带偏 —— 详见 _preempt_active_nav 那段复盘。
+#
+#   现在只做一件事：启动导航 → 后台盯着进程 → 到达就通知完事。
+#   需要回起点时，用户说「回起点」调 return_to_start 工具即可。
 # ============================================================
 
-def launch_navigate_with_return_async(index: int, name: str,
-                                       return_to_start: bool = True) -> str:
-    """
-    启动"前往目标 + 自动返回起点"异步导航（非阻塞）。
+def launch_navigate_with_return_async(index: int, name: str) -> str:
+    """启动「导航到目标」的异步导航（非阻塞，**不自动返航**）。
 
-    与 _navigate_to_and_return 的阻塞版本不同，此函数：
       1. 立即启动导航 subprocess
       2. 返回启动确认字符串（如 "📍 正在前往厨房..."）
-      3. 后台线程监控导航完成 → 通知回调 → 启动返航 → 再通知
+      3. 后台线程监控导航完成 → 通知回调
 
-    阶段回调顺序：
+    阶段回调：
       'started'   → 导航已启动
-      'arrived'   → 到达目标（nav 完成）
-      'returning' → 正在返回起点
-      'completed' → 已回到起点
-      'failed'    → 任一阶段失败
+      'arrived'   → 到达目标
+      'failed'    → 失败
 
     Args:
         index: 航点索引（1-based）
         name: 目标名称
-        return_to_start: 是否到达后自动返回起点
 
     Returns:
         启动确认字符串
     """
-    # Step 1: Launch nav to target
     # silent=True：本流程由 worker 统一上报阶段，monitor 再报一次会变成
     # 「completed: 导航完成：厕所」+「arrived: 已到达 厕所！」两条重复播报。
     result = launch_navigate_by_index(index, name, silent=True)
@@ -753,36 +757,31 @@ def launch_navigate_with_return_async(index: int, name: str,
 
     _notify_callbacks("started", f"📍 正在前往 {name}...")
 
-    # Step 2: Start background thread for monitoring + return
     threading.Thread(
-        target=_async_navigate_and_return_worker,
-        args=(name, return_to_start),
+        target=_async_navigate_worker,
+        args=(name,),
         daemon=True,
     ).start()
 
     return f"📍 正在前往 {name}..."
 
 
-def launch_navigate_sequence_async(indices: list, names: str = "",
-                                    return_to_start: bool = True) -> str:
-    """
-    异步序列导航（非阻塞）+ 可选自动返航。
+def launch_navigate_sequence_async(indices: list, names: str = "") -> str:
+    """异步序列导航（非阻塞，**不自动返航**）。
 
-    patrol_node 内部按序执行所有目标，全部完成后：
-      - return_to_start=True  → 自动返航到起点
-      - return_to_start=False → 停在最后一个目标点
+    patrol_node 内部按序执行所有目标：
+      * 中间航点到达后**阻塞等按钮确认**（期间位姿被 /odom_freeze 冻住）
+      * 最后一个航点到达即结束
+      · 任一航点等按钮超时 → **取消整个任务**
 
     阶段回调：
       'started'   → 序列导航已启动
       'arrived'   → 序列中所有目标已完成
-      'returning' → 正在返回起点（仅 return_to_start=True）
-      'completed' → 已回到起点
       'failed'    → 任一阶段失败
 
     Args:
         indices: 航点索引列表（1-based）
         names: 目标名称描述
-        return_to_start: 序列完成后是否自动返回起点
 
     Returns:
         启动确认字符串
@@ -793,40 +792,54 @@ def launch_navigate_sequence_async(indices: list, names: str = "",
 
     _notify_callbacks("started", f"📍 序列导航开始：{names or indices}")
 
-    # 启动后台线程：等待序列完成 → 可选返航
     threading.Thread(
-        target=_async_sequence_and_return_worker,
-        args=(names or str(indices), return_to_start),
+        target=_async_sequence_worker,
+        args=(names or str(indices),),
         daemon=True,
     ).start()
 
     return f"📍 序列导航开始：{names or indices}"
 
 
-def _async_navigate_and_return_worker(target_name: str, return_to_start: bool):
-    """
-    后台工作线程：等待导航完成 → 可选返航 → 通知回调。
+# ============================================================
+# 异步 worker：只负责「盯着导航进程 + 上报结果」
+# ------------------------------------------------------------
+# ★ 2026-11-01：删掉了原来的「到达后自动返回起点」第二/第三阶段。
+#   用户确认这个流程要去掉 —— 只说「去厕所」，车到了就该停在那儿。
+# ============================================================
 
-    通过轮询 poll() 检测 subprocess 退出，与 _monitor_process 不冲突。
+def _async_navigate_worker(target_name: str):
+    """后台等待导航完成并上报结果（不返航）。"""
+    _async_wait_and_report(target_name, timeout=600, label='')
+
+
+def _async_sequence_worker(target_name: str):
+    """后台等待**序列**导航完成并上报结果（不返航）。
+
+    序列导航内部会依次走完所有航点（中间点等按钮确认），
+    所以这里的 timeout 给得更宽。
     """
+    _async_wait_and_report(target_name, timeout=1800, label='序列导航')
+
+
+def _async_wait_and_report(target_name: str, timeout: float,
+                           label: str = ''):
+    """等待当前活动导航进程结束并发出回调。"""
     global _active_nav_process, _active_nav_target
 
-    # --- 等待第一阶段完成（前往目标） ---
     with _global_nav_lock:
         proc = _active_nav_process
         cur_target = _active_nav_target
     if proc is None:
-        _notify_callbacks("failed", f"❌ 导航进程意外消失")
+        _notify_callbacks("failed", "❌ 导航进程意外消失")
         return
-    # 竞态保护：launch_* 返回后到这里之间若被新任务抢占，
-    # 我们拿到的已经是对手的进程，绝不能去 wait/清理它。
     if cur_target and target_name and cur_target != target_name:
-        print("[导航] worker 发现当前任务是「%s」而非「%s」，已退出"
-              % (cur_target, target_name))
+        print("[导航] %sworker 发现当前任务是「%s」而非「%s」，已退出"
+              % (label, cur_target, target_name))
         return
 
     try:
-        proc.wait(timeout=600)
+        proc.wait(timeout=timeout)
         rc = proc.returncode
     except subprocess.TimeoutExpired:
         try:
@@ -845,171 +858,15 @@ def _async_navigate_and_return_worker(target_name: str, return_to_start: bool):
         # 用户改主意导致的中断不是失败，静默退出（新任务的回调已在跑）
         if proc.pid in _preempted_pids:
             _preempted_pids.discard(proc.pid)
-            print("[导航] 「%s」被新指令抢占，跳过失败通知" % target_name)
+            print("[导航] %s「%s」被新指令抢占，跳过失败通知"
+                  % (label, target_name))
             return
         _notify_callbacks("failed",
-                          f"❌ 前往{target_name}失败（退出码 {rc}）")
+                          f"❌ {label}前往{target_name}失败（退出码 {rc}）")
         return
 
-    _notify_callbacks("arrived", f"✅ 已到达 {target_name}！")
-
-    # --- 第二阶段：返回起点（可选） ---
-    if not return_to_start:
-        _notify_callbacks("completed", f"✅ 到达{target_name}（不返回起点）")
-        return
-
-    time.sleep(0.5)  # 短暂间隙
-
-    # silent=True：返航完成后的「completed: 已回到起点」由本 worker 上报，
-    # monitor 再报一次会多出一条「✅ 导航完成：回起点」。
-    ret_result = launch_return_to_start(silent=True)
-    if "⚠️" in ret_result:
-        _notify_callbacks("failed",
-                          f"❌ 返航启动失败：{ret_result}")
-        return
-
-    _notify_callbacks("returning", "📍 正在返回起点...")
-
-    # 等待返航完成
-    with _global_nav_lock:
-        proc2 = _active_nav_process
-        cur_target2 = _active_nav_target
-    if proc2 is None:
-        _notify_callbacks("failed", "❌ 返航进程意外消失")
-        return
-    if cur_target2 and cur_target2 != "回起点":
-        print("[导航] 返航 worker 发现当前任务是「%s」，已退出" % cur_target2)
-        return
-
-    try:
-        proc2.wait(timeout=600)
-        rc2 = proc2.returncode
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(os.getpgid(proc2.pid), signal.SIGKILL)
-        except Exception:
-            pass
-        rc2 = -9
-
-    with _global_nav_lock:
-        if _active_nav_process is proc2:
-            _active_nav_process = None
-            _active_nav_target = ""
-    _cleanup_process(proc2)
-
-    if rc2 != 0 and proc2.pid in _preempted_pids:
-        _preempted_pids.discard(proc2.pid)
-        print("[导航] 返航被新指令抢占，跳过失败通知")
-        return
-
-    if rc2 == 0:
-        _notify_callbacks("completed",
-                          f"✅ 已回到起点！（{target_name}导航完成）")
-    else:
-        _notify_callbacks("failed",
-                          f"❌ 返航失败（退出码 {rc2}）")
-
-
-def _async_sequence_and_return_worker(target_name: str, return_to_start: bool):
-    """
-    后台工作线程：等待序列导航完成 → 可选返航 → 通知回调。
-
-    与 _async_navigate_and_return_worker 结构一致，
-    区别在于第一阶段等待的是序列导航子进程（target_indices=2,3,...）。
-    """
-    global _active_nav_process, _active_nav_target
-
-    # --- 第一阶段：等待序列完成 ---
-    with _global_nav_lock:
-        proc = _active_nav_process
-        cur_target = _active_nav_target
-    if proc is None:
-        _notify_callbacks("failed", "❌ 序列导航进程意外消失")
-        return
-    if cur_target and target_name and cur_target != target_name:
-        print("[导航] 序列 worker 发现当前任务是「%s」而非「%s」，已退出"
-              % (cur_target, target_name))
-        return
-
-    try:
-        proc.wait(timeout=900)  # 序列导航超时更长
-        rc = proc.returncode
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except Exception:
-            pass
-        rc = -9
-
-    with _global_nav_lock:
-        if _active_nav_process is proc:
-            _active_nav_process = None
-            _active_nav_target = ""
-    _cleanup_process(proc)
-
-    if rc != 0:
-        if proc.pid in _preempted_pids:
-            _preempted_pids.discard(proc.pid)
-            print("[导航] 序列「%s」被新指令抢占，跳过失败通知" % target_name)
-            return
-        _notify_callbacks("failed",
-                          f"❌ 序列导航{target_name}失败（退出码 {rc}）")
-        return
-
-    _notify_callbacks("arrived", f"✅ 序列导航{target_name}已完成！")
-
-    # --- 第二阶段：返回起点（可选） ---
-    if not return_to_start:
-        _notify_callbacks("completed", f"✅ 序列{target_name}完成（不返回起点）")
-        return
-
-    time.sleep(0.5)
-
-    ret_result = launch_return_to_start(silent=True)
-    if "⚠️" in ret_result:
-        _notify_callbacks("failed",
-                          f"❌ 返航启动失败：{ret_result}")
-        return
-
-    _notify_callbacks("returning", "📍 正在返回起点...")
-
-    with _global_nav_lock:
-        proc2 = _active_nav_process
-        cur_target2 = _active_nav_target
-    if proc2 is None:
-        _notify_callbacks("failed", "❌ 返航进程意外消失")
-        return
-    if cur_target2 and cur_target2 != "回起点":
-        print("[导航] 序列返航 worker 发现当前任务是「%s」，已退出" % cur_target2)
-        return
-
-    try:
-        proc2.wait(timeout=600)
-        rc2 = proc2.returncode
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(os.getpgid(proc2.pid), signal.SIGKILL)
-        except Exception:
-            pass
-        rc2 = -9
-
-    with _global_nav_lock:
-        if _active_nav_process is proc2:
-            _active_nav_process = None
-            _active_nav_target = ""
-    _cleanup_process(proc2)
-
-    if rc2 != 0 and proc2.pid in _preempted_pids:
-        _preempted_pids.discard(proc2.pid)
-        print("[导航] 序列返航被新指令抢占，跳过失败通知")
-        return
-
-    if rc2 == 0:
-        _notify_callbacks("completed",
-                          f"✅ 已回到起点！（序列{target_name}完成）")
-    else:
-        _notify_callbacks("failed",
-                          f"❌ 返航失败（退出码 {rc2}）")
+    _notify_callbacks("arrived",
+                      f"✅ {label}已到达 {target_name}！")
 
 
 def get_global_nav_lock() -> threading.Lock:

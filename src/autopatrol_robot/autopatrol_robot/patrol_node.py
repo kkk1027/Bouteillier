@@ -196,23 +196,20 @@ class PatrolNode(BasicNavigator):
         self.declare_parameter('initial_point', [0.0, 0.0, 0.0])
         self.declare_parameter('target_points', [0.0, 0.0, 0.0, -1.0, 4.7, 3.14,-1.0, -2.5, 0.0,-4.5, -0.55, -1.57])
         # ============================================================
-        # 舵机播报开关（2026-11-01 实机事故后改为默认关闭）
+        # 按钮确认的超时时间（2026-11-01 需求定型）
         # ------------------------------------------------------------
-        # 原因：这个播报会**阻塞 60 秒**等 ESP32 的按钮确认。期间
-        # patrol_node 不再发布 /nav_node_status，ESP32 也停发 /odom 和
-        # /imu_raw，EKF 只能按上一帧速度盲推 —— 实测 55 秒漂了 20.6m，
-        # AMCL 匹配率从 92% 掉到 16~37%，用户看到的就是「位姿缓慢漂移」。
+        # 语义已确定，不再是「总开关」：
+        #   单点导航            → 完全不等按钮
+        #   多点导航的中间点    → 等按钮（本超时），超时则取消整个任务
+        #   多点导航的最后一个点 → 不等
         #
-        # 而且它完美解释了「只在去厕所后出现、回起点不出现」：
-        #   去厕所 → patrol_node（有播报）
-        #   回起点 → nav_to_pose（没有播报）
+        # 等待期间 ESP32 会阻塞 micro-ROS 任务、停发 /odom 和 /imu_raw，
+        # 所以必须先 /odom_freeze 冻住位姿（见 _wait_button_confirm）。
         #
-        # 需要原来的巡逻播报功能时，把参数设成 true 即可（届时会带心跳）。
+        # 超时时间保持 60 秒（与 ESP32 固件内部 timeout 一致）。
+        # 比它小会提前解冻，但 ESP32 那边还在等 —— 状态不一致。
         # ============================================================
-        self.declare_parameter('enable_servo_announce', False)
-        self.declare_parameter('servo_timeout_sec', 15.0)
-        self.enable_servo_announce_ = bool(
-            self.get_parameter('enable_servo_announce').value)
+        self.declare_parameter('servo_timeout_sec', 60.0)
         self.servo_timeout_sec_ = float(
             self.get_parameter('servo_timeout_sec').value)
         self.initial_point_ = self.get_parameter('initial_point').value
@@ -242,6 +239,8 @@ class PatrolNode(BasicNavigator):
                 f'订阅 /amcl_pose 失败，位置查询将回退到 TF: {exc}')
         # 状态机status发布者 
         self.nav_status_pub = self.create_publisher(Bool, '/nav_node_status', 10)
+        # 位姿冻结开关（见 set_odom_freeze 的注释）
+        self._freeze_pub = self.create_publisher(Bool, '/odom_freeze', 10)
         self._nav_canceled = False  # SIGINT 取消标志，供看门狗循环检查
         # 当前状态缓存（心跳用）。None 表示尚未初始化，心跳不发送。
         self._nav_status_current = None
@@ -336,9 +335,36 @@ class PatrolNode(BasicNavigator):
             points.append([x, y, yaw])
             self.get_logger().info(f'获取到目标点: {index}->({x},{y},{yaw})')
         return points
-    def nav_to_pose(self, target_pose):
-        """
-        导航到指定位姿。
+    # ============================================================
+    # 位姿冻结（2026-11-01）
+    # ------------------------------------------------------------
+    # ESP32 的 esp32_command 在「等按钮」模式下会**阻塞 micro-ROS 任务
+    # 最多 60 秒**，期间 /odom 和 /imu_raw 全部停发。EKF 收不到观测
+    # 就按上一帧速度继续积分 —— 实测 55 秒把 odom→base_footprint 从
+    # 0.2m 推到 20.6m（方向固定 53°，速度恒定 0.37m/s），AMCL 匹配率
+    # 从 92% 掉到 16~37%。用户看到的就是「位姿缓慢漂移」。
+    #
+    # 现在：进按钮等待前先发 /odom_freeze=true，让 odom2tf 锁住位姿；
+    # 等完再发 false 解冻。odom/imu 可以照常停发，但 TF 不再动。
+    # ============================================================
+    def set_odom_freeze(self, freeze: bool) -> None:
+        """请求 odom2tf 冻结/解冻 odom→base_footprint。"""
+        try:
+            if self._freeze_pub is None:
+                return
+            msg = Bool()
+            msg.data = bool(freeze)
+            # 连发 3 次：这个切换很关键，丢一帧就会白等 60 秒。
+            # ROS 的 QoS 只在队列满时丢，连发成本极低。
+            for _ in range(3):
+                self._freeze_pub.publish(msg)
+            self.get_logger().info(
+                '🧊 %s位姿冻结' % ('开始' if freeze else '结束'))
+        except Exception as exc:            # noqa: BLE001
+            self.get_logger().warn('位姿冻结请求失败（不影响流程）: %s' % exc)
+
+    def nav_to_pose(self, target_pose, confirm_button: bool = False) -> bool:
+        """导航到指定位姿。
 
         BasicNavigator 没有后台 spin 线程，所有回调依赖各方法内部的
         spin_until_future_complete 驱动。isTaskComplete() 每次调用
@@ -348,6 +374,16 @@ class PatrolNode(BasicNavigator):
 
         循环中每隔 ~1s 重发 nav_status=True，防止 micro-ROS/WiFi 的
         UDP 丢包导致 ESP32 端 nav_node_running 误判为 false、触发闲时降噪。
+
+        Args:
+            target_pose: 目标位姿
+            confirm_button: 到达后是否**阻塞等待按钮确认**。
+                ★ 2026-11-01 需求：只有「多点导航的中间点」才需要确认；
+                  单点导航和最后一个点都不等（用户明确要求）。
+
+        Returns:
+            True  — 到达（需要确认时，按钮已按下）
+            False — 导航失败 / 被取消 / 按钮等待超时
         """
         self.goToPose(target_pose)
         last_status_time = time.time()
@@ -370,7 +406,7 @@ class PatrolNode(BasicNavigator):
             if self._nav_canceled:
                 self.get_logger().info('导航已被取消')
                 self.cancelTask()
-                return
+                return False
             # 每 ~1s 刷新 nav_status，确保 ESP32 在进入舵机等待前收到 True
             now = time.time()
             if now - last_status_time > 1.0:
@@ -396,13 +432,13 @@ class PatrolNode(BasicNavigator):
                     f'⚠️ 反馈已 {NAV_STALL_TIMEOUT_SEC:.0f}s 无变化，'
                     f'判定与 Nav2 失联，主动退出（避免僵尸进程）')
                 self.cancelTask()
-                return
+                return False
             # 保险 2：墙钟总超时
             if now - wall_start > NAV_MAX_WALL_SEC:
                 self.get_logger().error(
                     f'⚠️ 导航已运行 {NAV_MAX_WALL_SEC:.0f}s 仍无结果，主动退出')
                 self.cancelTask()
-                return
+                return False
             # 降频到 ~5Hz，避免 isTaskComplete 的 spin_until_future_complete
             # 无间隔重复调用导致 executor 竞态
             time.sleep(0.1)
@@ -413,72 +449,75 @@ class PatrolNode(BasicNavigator):
             self.get_logger().info('导航结果：成功')
         elif result == TaskResult.CANCELED:
             self.get_logger().info('导航结果：已取消')
-            return
+            return False
         else:
             self.get_logger().warn(f'导航结果异常: {result}')
-            return
+            return False
 
-        self._run_servo_announce('目标点')
+        if not confirm_button:
+            # 单点 / 最后一个点：直接结束，不播报、不等按钮
+            return True
 
-    def _run_servo_announce(self, label: str = '') -> str:
-        """到达目的地后的舵机播报（**默认关闭**）。
+        return self._wait_button_confirm('目标点')
+
+    def _wait_button_confirm(self, label: str = '') -> bool:
+        """到达中间航点后，阻塞等待按钮确认（**期间冻结位姿**）。
 
         ============================================================
-        ★ 2026-11-01 实机事故：这个播报是「去厕所后位姿乱飘」的元凶
+        适用场景（用户 2026-11-01 明确的需求）
         ============================================================
-        实测日志（patrol_node）：
-            12:08:47  导航结果：成功
-            12:08:48  已发送停止指令 + 零角速度IMU
-            12:08:48  执行舵机动作
-            12:08:48  📢 发送舵机播报指令，等待 ESP32 按钮确认...
-            12:09:48  ⏰ 等待 ESP32 按钮按下超时      ← 阻塞了整整 60 秒！
-            12:09:48  舵机动作失败: timeout
+            单点导航          → 不等按钮
+            「先去A再去B」    → 到 A 等按钮；到 B（最后一个）不等
+            等按钮超时        → **取消整个任务**
 
-        在这 60 秒里：
-          1. `patrol_node` 主线程**完全阻塞**在 spin_until_future_complete
-             上，不再发布 /nav_node_status、不再处理任何导航回调；
-          2. ESP32 同时也在阻塞态等按钮，**/odom 和 /imu_raw 都停发**；
-          3. EKF（robot_localization）拿不到观测，就按**上一帧的速度**
-             继续推算 —— 位姿沿固定方向匀速漂移。
-        实测 trace：odom→base_footprint 在 55 秒里从 0.15m 均匀长到
-        20.6m（≈0.37 m/s），方向固定在 53°，同时 AMCL 匹配率
-        从 92% 跌到 16~37%，可见就是“匀速盲推”。
+        ============================================================
+        为什么必须先冻结
+        ============================================================
+        ESP32 在这个服务里会阻塞 micro-ROS 任务最多 60 秒，期间
+        /odom 和 /imu_raw 全部停发。EKF 收不到观测就按上一帧速度
+        继续积分 —— 实测 55 秒漂了 20.6 米。
 
-        ★ 为什么“只有去厕所会飘、回起点不飘”：
-            去厕所  → patrol_node（本函数）→ 有舵机播报
-            回起点  → nav_to_pose         → **没有舵机播报**
-          完全对应用户的现场观察。
+        所以顺序必须是：
+            1. 先发 /odom_freeze=true（锁住 TF）
+            2. 再调 esp32_command
+            3. 无论成功/超时/异常，finally 里一定解冻
+        顺序反了或者漏了解冻，都会留下一个冻住的 TF，整台车“失联”。
 
-        所以：默认**不播报**。需要时把参数 enable_servo_announce 设 true，
-        但即使打开，也会在等待期间**持续发心跳**，不让 ESP32 停发 odom。
+        Returns:
+            True  — 按钮已按下
+            False — 超时/异常（调用方应当取消整个任务）
         """
-        if not self.enable_servo_announce_:
-            self.get_logger().info(
-                '已到达%s（舵机播报已关闭，直接结束；'
-                '打开参数 enable_servo_announce:=true 可恢复）'
-                % (label or ''))
-            return 'skipped'
+        self.get_logger().info('⏸️ 已到达%s，等待按钮确认后才能继续' % (label or ''))
+        self.set_odom_freeze(True)
+        try:
+            servo = ServoClient(node=self)
+            servo.stop_robot()
+            time.sleep(0.3)
+            result = servo.call_servo_and_wait(
+                timeout=self.servo_timeout_sec_,
+                heartbeat=self._heartbeat_during_servo)
+        finally:
+            # ★ finally：哪怕中间抛异常也必须解冻，否则 TF 永远卡住
+            self.set_odom_freeze(False)
 
-        self.get_logger().info('执行舵机动作（%s）' % (label or '到达'))
-        servo = ServoClient(node=self)
-        servo.stop_robot()
-        time.sleep(0.3)
-        servo_result = servo.call_servo_and_wait(
-            timeout=self.servo_timeout_sec_,
-            heartbeat=lambda: self._heartbeat_during_servo())
-        if servo_result == 'success':
-            self.get_logger().info('✅ 舵机播报完成')
+        if result == 'success':
+            self.get_logger().info('✅ 按钮已按下，继续前往下一航点')
+            return True
+        if result == 'timeout':
+            self.get_logger().error(
+                '❌ 等待按钮超时（%.0fs），按需求取消整个导航任务'
+                % self.servo_timeout_sec_)
         else:
-            self.get_logger().warn(f'导航到达但播报未完成: {servo_result}')
-        return servo_result
+            self.get_logger().error(
+                '❌ 按钮确认失败（%s），取消整个导航任务' % result)
+        return False
 
     def _heartbeat_during_servo(self) -> None:
-        """舵机播报阻塞期间的心跳。
+        """按钮等待期间的心跳。
 
-        不做任何运动控制，只维持两件事：
-          1. /nav_node_status = True —— 告诉 ESP32“导航节点还在”，
-             避免它 3 秒后进闲时降噪；
-          2. /cmd_vel 零速 —— 确保底盘真的静止（此时本应已经停了）。
+        位姿已经靠 /odom_freeze 冻住了，这里只维持
+        /nav_node_status = True，告诉 ESP32“导航节点还在”，
+        避免它 3 秒后进闲时降噪。
         """
         try:
             self.publish_nav_status(True)
@@ -550,14 +589,10 @@ class PatrolNode(BasicNavigator):
             return 'servo_failed'
 
         self.get_logger().info('导航到达目标点')
-        # 舵机播报默认关闭（详见 _run_servo_announce 的注释：
-        # 它会阻塞 60 秒，期间 ESP32 停发 /odom，EKF 盲推导致位姿漂移）
-        servo_result = self._run_servo_announce('目标点')
-        if servo_result in ('success', 'skipped'):
-            self.get_logger().info('✅ 导航完成')
-            return 'success'
-        self.get_logger().warn(f'导航到达但播报未完成: {servo_result}')
-        return 'servo_failed'
+        # 这里是「单点导航」的原子接口，按需求**不等按钮**（用户 2026-11-01）。
+        # 多点序列的中间点确认由 main() → nav_to_pose(confirm_button=True) 负责。
+        self.get_logger().info('✅ 导航完成')
+        return 'success'
 
     
     def get_current_pose(self, timeout_sec=3.0):
@@ -615,13 +650,53 @@ def main(args=None):
     try:
         patrol.waitUntilNav2Active()
 
-        for point in patrol.get_target_points():
+        # ============================================================
+        # 多点导航：中间点等按钮确认，最后一个点不等（2026-11-01 需求）
+        # ------------------------------------------------------------
+        # 用户原话：
+        #   「单点导航完成后无需强制阻塞等待按按钮确认，只有两个点或
+        #     以上的需要按按钮确认。比如我向 ai 助手下达：先去书房、
+        #     再去客厅。此时小车到达书房后需阻塞等待按钮被按下而后
+        #     前往下一航点，若等待超时则直接取消整个任务，但全程小车
+        #     位姿要保持稳定。」
+        #
+        # 所以：points[0..n-2] → confirm_button=True
+        #       points[n-1]     → confirm_button=False（任务结束）
+        #   单点（n==1）自然全部不等。
+        #
+        # 按钮等待期间位姿由 /odom_freeze 冻住，odom/imu 可以停发，
+        # TF 停在到达时的快照上，不会漂。
+        # ============================================================
+        points = patrol.get_target_points()
+        n = len(points)
+        if n <= 1:
+            patrol.get_logger().info(
+                '单点导航：到达即结束，不等待按钮确认')
+        else:
+            patrol.get_logger().info(
+                '多点导航：共 %d 个航点，前 %d 个到达后需按钮确认，'
+                '最后一个直接结束' % (n, n - 1))
+
+        for idx, point in enumerate(points):
             if patrol._nav_canceled:
                 break
             x, y, yaw = point[0], point[1], point[2]
-            # 导航到目标点
+            is_last = (idx == n - 1)
+            needs_confirm = (not is_last)          # 单点时 n-1==0，永远 False
+            patrol.get_logger().info(
+                '▶️ 第 %d/%d 个航点 (%.2f, %.2f, %.2f)%s'
+                % (idx + 1, n, x, y, yaw,
+                   '' if is_last else '，到达后需按钮确认'))
+
             target_pose = patrol.get_pose_by_xyyaw(x, y, yaw)
-            patrol.nav_to_pose(target_pose)
+            ok = patrol.nav_to_pose(target_pose,
+                                    confirm_button=needs_confirm)
+            if not ok:
+                # 导航失败 / 被取消 / 按钮超时 → 取消整个任务
+                patrol.get_logger().error(
+                    '❌ 第 %d/%d 个航点未完成，取消整个导航任务'
+                    % (idx + 1, n))
+                break
             # patrol.record_image()
     finally: 
         patrol.publish_nav_status(False)
