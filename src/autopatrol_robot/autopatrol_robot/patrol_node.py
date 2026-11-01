@@ -23,6 +23,162 @@ NAV_STALL_TIMEOUT_SEC = 20.0    # 反馈连续不变化多久判失联
 NAV_MAX_WALL_SEC = 900.0        # 单次导航墙钟硬上限
 
 
+# ============================================================
+# 等待 nav2 就绪（**带超时**，替代 BasicNavigator.waitUntilNav2Active）
+# ------------------------------------------------------------
+# 【为什么不能用原生的 waitUntilNav2Active —— 2026-11-01 实机事故】
+#
+# 现场表现：用户说「去书房」，工具返回「📍 正在前往 书房...」，
+#   patrol_node 进程确实起来了（target_indices:=5），
+#   但 nav2 日志里**一条 Begin navigating 都没有**，车一步不动。
+#   patrol_node 的日志只有「发布导航节点状态: True」这一行，
+#   之后再无任何输出，直到用户手动 Ctrl-C。
+#
+# 根因在 nav2_simple_commander/robot_navigator.py:542 附近：
+#
+#     future = state_client.call_async(req)
+#     rclpy.spin_until_future_complete(self, future)   # ★ 没有 timeout
+#     if future.result() is not None:
+#         state = future.result().current_state.label
+#     time.sleep(2)
+#
+# 这不是重试循环 —— 只有一个 spin，而且没有超时。
+# AMCL 在全局定位 / 持续 nomotion 更新期间很忙，服务的响应会
+# 因为服务端处理过慢被 RMW 丢弃，服务端日志可见：
+#
+#     [amcl.rclcpp]: failed to send response to /amcl/get_state (timeout)
+#
+# 响应一丢，future 永不完成，spin_until_future_complete 就**永久阻塞**。
+# 实测时间线完全吻合：
+#     16:47:31  patrol_node 启动
+#     16:47:32  amcl: failed to send response to /amcl/get_state
+#     ……        patrol_node 再无输出
+#
+# 所以这里自己实现：轮询 + 每次都有超时 + 失败重试，总时长也有上限。
+# ============================================================
+NAV2_WAIT_PER_TRY_SEC = 4.0     # 单次 get_state 的超时
+NAV2_WAIT_TOTAL_SEC = 90.0      # 总共愿意等多久
+NAV2_WAIT_RETRY_SEC = 1.0       # 两次尝试之间的间隔
+
+
+def _get_service_state(node: Node, client, service_name: str,
+                       per_try: float = NAV2_WAIT_PER_TRY_SEC):
+    """调用一次 lifecycle get_state，返回状态标签串。
+
+    ★ 关键点：等待 future 必须**带 deadline**，不能用
+      rclpy.spin_until_future_complete(node, future) —— 那正是这次事故的
+      元凶（响应一丢就永久阻塞）。这里改成手动循环 + spin_once(有超时)。
+
+    Returns:
+        'active' / 'unconfigured' / ... 查询成功时的状态标签；
+        'unavailable' 表示服务不存在或本次查询超时/失败。
+    """
+    from lifecycle_msgs.srv import GetState
+    try:
+        if not client.service_is_ready():
+            # 只等一小会儿，避免每次重试都卡满 per_try
+            deadline = time.time() + min(per_try, 2.0)
+            while not client.service_is_ready():
+                if time.time() > deadline:
+                    return 'unavailable'
+                time.sleep(0.1)
+                rclpy.spin_once(node, timeout_sec=0.05)
+
+        future = client.call_async(GetState.Request())
+        deadline = time.time() + per_try
+        while not future.done() and time.time() < deadline:
+            if not rclpy.ok():
+                return 'unavailable'
+            rclpy.spin_once(node, timeout_sec=0.05)
+
+        if not future.done():
+            # 落在这里就是本次事故的现场：服务端响应被丢弃。
+            # 一定要打日志，否则看起来跟「卡死」一模一样。
+            node.get_logger().warn(
+                '%s 无响应（%.1fs 超时）—— 服务端可能忙，重试'
+                % (service_name, per_try))
+            return 'unavailable'
+
+        res = future.result()
+        if res is None or res.current_state is None:
+            return 'unavailable'
+        return res.current_state.label
+    except Exception as exc:                            # noqa: BLE001
+        try:
+            node.get_logger().warn('查询 %s 失败: %s' % (service_name, exc))
+        except Exception:                               # noqa: BLE001
+            pass
+        return 'unavailable'
+
+
+def wait_nav2_ready(patrol: "PatrolNode",
+                    total_timeout: float = NAV2_WAIT_TOTAL_SEC) -> bool:
+    """等待 AMCL + BT Navigator 就绪，返回是否成功。
+
+    与原生 waitUntilNav2Active 的差异：
+      1. 每次服务调用都有超时，失败重试（原生会永久阻塞）；
+      2. **不再发布默认初始位姿**。原生 `_waitForInitialPose` 在没收到
+         amcl_pose 时会发布 self.initial_pose，而 patrol_node 从不设置
+         它 —— 那就是一个全 0 的位姿，相当于把 AMCL 重置到地图原点。
+         本项目的全局定位由 auto_localizer 负责，这里只等结果。
+
+    客户端在这里**创建一次、复用到底**：每次重试都新建 DDS 客户端会
+    增加发现流量，而 AMCL 忙正是导致响应丢失的原因之一，不该雪上加霜。
+    """
+    from lifecycle_msgs.srv import GetState
+    start = time.time()
+    clients = {}
+
+    def _mk(name):
+        if name not in clients:
+            clients[name] = patrol.create_client(GetState, name)
+        return clients[name]
+
+    try:
+        # ---- ① AMCL ----
+        patrol.get_logger().info('等待 AMCL 就绪...')
+        cli = _mk('amcl/get_state')
+        while _get_service_state(patrol, cli, 'amcl/get_state') != 'active':
+            if time.time() - start > total_timeout:
+                patrol.get_logger().error(
+                    '❌ 等待 AMCL 就绪超时（%.0fs）' % total_timeout)
+                return False
+            time.sleep(NAV2_WAIT_RETRY_SEC)
+        patrol.get_logger().info('✅ AMCL 已 active')
+
+        # ---- ② 等 amcl_pose（不主动发初始位姿，见函数注释）----
+        patrol.get_logger().info('等待 amcl_pose...')
+        while not getattr(patrol, 'initial_pose_received', False):
+            if time.time() - start > total_timeout:
+                patrol.get_logger().error(
+                    '❌ 等待 amcl_pose 超时（%.0fs），AMCL 可能没有在发布位姿'
+                    % total_timeout)
+                return False
+            rclpy.spin_once(patrol, timeout_sec=0.2)
+        patrol.get_logger().info('✅ 已收到 amcl_pose')
+
+        # ---- ③ BT Navigator ----
+        patrol.get_logger().info('等待 BT Navigator 就绪...')
+        cli = _mk('bt_navigator/get_state')
+        while _get_service_state(patrol, cli, 'bt_navigator/get_state') != 'active':
+            if time.time() - start > total_timeout:
+                patrol.get_logger().error(
+                    '❌ 等待 BT Navigator 就绪超时（%.0fs）' % total_timeout)
+                return False
+            time.sleep(NAV2_WAIT_RETRY_SEC)
+        patrol.get_logger().info('✅ BT Navigator 已 active')
+
+        patrol.get_logger().info('Nav2 已就绪')
+        return True
+    finally:
+        for c in clients.values():
+            try:
+                patrol.destroy_client(c)
+            except Exception:                           # noqa: BLE001
+                pass
+
+
+
 class ServoClient:
     """舵机控制（语音播报）客户端 — 复用已有 Node，避免 ROS2 实体泄漏"""
     def __init__(self, node: Node = None):
@@ -648,7 +804,13 @@ def main(args=None):
     sig_module.signal(sig_module.SIGINT, _sigint_handler)
     
     try:
-        patrol.waitUntilNav2Active()
+        # ★ 不用 patrol.waitUntilNav2Active()：它内部的 get_state 服务调用
+        #   没有超时，AMCL 忙时响应一丢就永久阻塞（2026-11-01 实机事故，
+        #   详见 wait_nav2_ready 的注释）。
+        if not wait_nav2_ready(patrol):
+            patrol.get_logger().error(
+                '❌ nav2 未就绪，放弃本次导航（不会发出任何目标）')
+            return
 
         # ============================================================
         # 多点导航：中间点等按钮确认，最后一个点不等（2026-11-01 需求）
