@@ -6174,21 +6174,21 @@
             { id: 'window', kind: 'window', layer: 1, soft: true,
               x0: -0.70, y0: 2.90, w: 2.45, d: 0.10, h: 1.45, z0: 0.62,
               c: '#fff5dc', name: '窗户' },
-            // 沙发：后沿 1.75+0.93 = 2.68，墙 3.00，距 0.32
+            // 沙发：后沿 1.96+0.72 = 2.68，墙 3.00，距 0.32
+            // 小双人沙发：宽 1.26（2.35 → 1.70 → 1.38 → 1.26 逐轮收窄）
+            // 后沿 1.96+0.70 = 2.66，距后墙 0.34 —— 仍然贴着墙
             { id: 'sofa', kind: 'sofa', layer: 1,
-              x0: -3.35, y0: 1.75, w: 2.35, d: 0.93, h: 0.80,
-              c: '#ffcf9f', name: '沙发' },
+              x0: -3.30, y0: 1.96, w: 1.26, d: 0.70, h: 0.64,
+              c: '#f7bc8c', name: '沙发' },
+            // 茶几往后挪到 y≥1.55：前方空地加深到 0.83 米，
+            // 机器人才有地方来回走
             { id: 'table', kind: 'table', layer: 1,
-              x0: 0.20, y0: 1.30, w: 1.30, d: 0.72, h: 0.46,
+              x0: 0.20, y0: 1.60, w: 1.15, d: 0.66, h: 0.42,
               c: '#f0d3a8', name: '茶几' },
             // 盆栽：右后角
             { id: 'plant', kind: 'plant', layer: 1,
               x0: 2.90, y0: 2.02, w: 0.58, d: 0.58, h: 0.98,
               c: '#d99566', name: '盆栽' },
-            // 落地灯：细高物件，把中景的竖向空间填起来
-            { id: 'lamp', kind: 'floorlamp', layer: 1,
-              x0: 2.96, y0: 1.05, w: 0.40, d: 0.40, h: 1.86,
-              c: '#ffd9a0', name: '落地灯' },
         ];
 
         // 竖屏专用布局（2026-11-01）
@@ -6220,30 +6220,45 @@
         //   · 盆栽塞右后角，落地灯靠右侧
         // 机器人活动区收缩到"茶几之前"那段起居空地上 —— 真实家庭里
         // 人也不会走到沙发后面去，这样既合理又天然避开了家具。
+        // ★ 竖屏布局（2026-11-01 第四次：家具后退，前面留空地）
+        // ------------------------------------------------------------
+        // 【为什么必须这样排 —— 这是算出来的，不是拍脑袋】
+        //   斜二轴测里，屏幕上能装的行走宽度是：
+        //         vw/k − Δy·cos45°
+        //   Δy 是可行走区的进深。手机 vw/k 只有约 2.9 世界单位，
+        //   而 Δy 越大，这一项扣掉的就越多。
+        //
+        //   上一版边界取 y ∈ [0.42, 2.40]（Δy = 1.98），
+        //   扣掉 1.40 之后只剩 1.5 —— 而家具又铺满了整间房，
+        //   最终可见的可走区域只有 1.29×0.4 米的一条缝，
+        //   机器人一步都迈不开（实测 45 秒零位移）。
+        //
+        //   这一版把家具全部推到 y ≥ 1.55 之后，
+        //   可行走区缩成"客厅前方那片空地" y ∈ [0.42, 1.55]，
+        //   Δy = 1.13 → 扣掉 0.80，可走宽度回到约 2.1 世界单位。
+        //   在 414px 宽的手机上，这就是 300px 的横向活动范围。
         const TALL_ITEMS = [
             { id: 'rug', kind: 'rug', layer: 0, soft: true,
-              x0: -2.00, y0: 1.00, w: 1.95, d: 1.35, h: 0.02,
+              x0: -2.00, y0: 1.40, w: 2.40, d: 0.95, h: 0.02,
               c: '#ffd6a6', name: '地毯' },
-            // 窗户：挂在沙发正上方（房间里唯一的自然光源，必须留在画面里）
+            // 窗户：挂沙发正上方（唯一的自然光源，必须留在画面里）
             { id: 'window', kind: 'window', layer: 1, soft: true,
-              x0: -1.55, y0: 2.90, w: 1.45, d: 0.10, h: 1.55, z0: 1.05,
+              x0: -1.30, y0: 2.90, w: 1.20, d: 0.10, h: 1.45, z0: 0.95,
               c: '#fff5dc', name: '窗户' },
-            // 沙发：后沿 1.75+0.93 = 2.68，墙 3.00，距 0.32（与横屏一致）
+            // 沙发：后沿 2.16+0.72 = 2.88，正好贴后墙
+            // 小双人沙发：宽 1.10、进深 0.70、高 0.64
+            // 后沿 2.18+0.70 = 2.88，距后墙 0.12 —— 仍然贴着墙
             { id: 'sofa', kind: 'sofa', layer: 1,
-              x0: -1.95, y0: 1.75, w: 1.80, d: 0.93, h: 0.80,
-              c: '#ffcf9f', name: '沙发' },
-            // 茶几：沙发正前方，落在地毯上
+              x0: -1.80, y0: 2.18, w: 1.10, d: 0.70, h: 0.64,
+              c: '#f7bc8c', name: '沙发' },
+            // 茶几：沙发正前方，落在毯子上（y ≥ 1.75，不进可行走区）
             { id: 'table', kind: 'table', layer: 1,
-              x0: -1.75, y0: 1.05, w: 0.90, d: 0.60, h: 0.44,
+              x0: -1.40, y0: 1.80, w: 0.88, d: 0.58, h: 0.40,
               c: '#f0d3a8', name: '茶几' },
-            // 盆栽：沙发右侧
+            // 盆栽：沙发右端，靠后
             { id: 'plant', kind: 'plant', layer: 1,
-              x0: 0.55, y0: 2.05, w: 0.55, d: 0.55, h: 0.98,
+              x0: 0.30, y0: 2.10, w: 0.55, d: 0.55, h: 0.98,
               c: '#d99566', name: '盆栽' },
-            // 落地灯：右侧
-            { id: 'lamp', kind: 'floorlamp', layer: 1,
-              x0: 1.10, y0: 1.10, w: 0.38, d: 0.38, h: 1.85,
-              c: '#ffd9a0', name: '落地灯' },
         ];
 
         // ============================================================
@@ -6269,7 +6284,8 @@
             { kind: 'shelf', xf: 0.10, zf: 0.56, wf: 0.30 },
             { kind: 'frame', xf: -0.62, zf: 0.62, wf: 0.21, hf: 0.16,
               c: '#ffeacd', art: '#e8b98c' },
-            { kind: 'pendant', xf: 0.50, zf: 0.52 },
+            // 吊灯：zf 对吊灯来说 = 灯罩底部落在屏幕高度的百分比
+            { kind: 'pendant', xf: 0.50, zf: 0.20 },
         ];
 
         // 竖屏的墙特别高（房间只占下半屏），所以装饰铺得更密，
@@ -6285,7 +6301,8 @@
               c: '#ffeacd', art: '#f0c79a' },
             { kind: 'sconce', xf: 0.66, zf: 0.68 },
             { kind: 'shelf', xf: 0.24, zf: 0.78, wf: 0.20 },
-            { kind: 'pendant', xf: 0.52, zf: 0.46 },
+            // 吊灯：zf 对吊灯来说 = 灯罩底部落在屏幕高度的百分比
+            { kind: 'pendant', xf: 0.50, zf: 0.20 },
         ];
 
         // 当前生效的预设（由 layout() 覆盖）
@@ -6298,7 +6315,7 @@
         const WIDE_BOUNDS = { x0: -3.10, x1: 3.10, y0: 0.42, y1: 2.40 };
         // 活动区 = 茶几之前那段起居空地（y 上限 3.05，
         // 再往上就会被茶几挡住 —— 这正是想要的效果）
-        const TALL_BOUNDS = { x0: -1.30, x1: 1.10, y0: 0.42, y1: 2.40 };
+        const TALL_BOUNDS = { x0: -1.65, x1: 1.65, y0: 0.42, y1: 1.55 };
 
         let k = 100;          // 每个世界单位多少像素
         let viewW = 390, viewH = 844;   // 最近一次取景的视口尺寸
@@ -6495,40 +6512,104 @@
                         it.c, 'ogFloor', rad * 0.8);
         }
 
+        // ============================================================
+        // 沙发（2026-11-01 第四次重做：把扶手加回来）
+        // ------------------------------------------------------------
+        // 【前几版为什么都不像沙发】
+        //   第 1 版 9 个方块 → 27 个面，线条糊成一团；而且靠背两端嵌进
+        //     左右扶手的深度是 0.135 与 0.030，差了 4.5 倍 ——
+        //     几何左右不对称，这是"透视关系差"的真正原因。
+        //   第 2/3 版为了"简化"把扶手整个删掉 → 只剩一个台面加一块板，
+        //     结果就是一张**床**。用户两次反馈"像床不像沙发"。
+        //
+        // 【关键结论】判断"这是不是沙发"，人第一眼看的不是颜色也不是
+        //   造型细节，而是**两侧有没有扶手**。床没有扶手，长凳没有扶手，
+        //   沙发一定有。所以扶手不能省，能省的是坐垫分块、靠枕、花纹。
+        //
+        // 【几何：所有部件只在 x 或 y 方向相邻，完全不重叠】
+        //     左扶手  x ∈ [x0, x0+armW]       y ∈ [y0, y1]     高 armH
+        //     右扶手  x ∈ [x1-armW, x1]       y ∈ [y0, y1]     高 armH
+        //     靠背    x ∈ [x0+armW, x1-armW]  y ∈ [y1-backD, y1]  高 backH
+        //     坐垫    x ∈ [x0+armW, x1-armW]  y ∈ [y0, y1-backD]
+        //   四条边首尾相接，没有任何互相穿插 —— 投影出来是干净的
+        //   "凹"字形侧影，一眼就能读成沙发。
+        //
+        // 【高度关系】（决定辨识度）
+        //     坐面 0.40 < 扶手 0.50 < 靠背 0.72
+        //   三级台阶越清晰，越像沙发；如果靠背只比坐面高一点点，
+        //   就会退化成"一张带挡板的床"。
+        //
+        // 【朝向】靠背在后沿（y1，靠墙一侧），开口朝前（y0），
+        //   正对着镜头和茶几 —— 这是客厅里最自然的摆法，
+        //   也和斜二轴测的进深方向一致，不会出现"背对镜头"的别扭感。
+        // ============================================================
         function drawSofa(it) {
             const x0 = it.x0, y0 = it.y0, w = it.w, d = it.d;
             const x1 = x0 + w, y1 = y0 + d;
-            const armW = 0.30, backD = 0.33;
-            const base = 0.13;          // 底座高度（相当于"腿被藏起来了"）
+
+            // ★ 尺寸整体缩一档（2026-11-01）
+            //   原来扶手 0.22 宽、跨整个 0.80 进深，投影出来扶手特别厚，
+            //   整张沙发显得又宽又重。现在扶手收窄到 0.17，
+            //   整体高度压到 0.66，进深用 item 的 0.72。
+            const legH  = 0.09;   // 细腿高度（底面透光）
+            // 沙发变窄后扶手若仍是 0.17，两侧就吃掉 0.34 ——
+            // 宽 1.20 的沙发坐垫只剩 0.86，视觉上"全是大扶手"。
+            // 收到 0.13，坐垫保留 0.94，比例更匀称。
+            const armW  = 0.13;   // 扶手宽（随整体收窄）
+            const armH  = 0.44;   // 扶手顶面离地
+            const backD = 0.20;   // 靠背进深（薄板，不臃肿）
+            const backH = 0.64;   // 靠背顶离地（与 item.h 一致）
+            const seatH = 0.36;   // 坐面离地
+
+            const inX0 = x0 + armW, inX1 = x1 - armW;  // 扶手内侧
+            const inY1 = y1 - backD;                   // 坐垫后沿
+
+            // ★ 暖色分层（2026-11-01 用户要"配色偏暖"）
+            //   原来几个面都从同一个 it.c 派生，色相几乎一样，靠明度区分，
+            //   看起来偏"粉橘"。现在每个面单独给色值，
+            //   色相统一压在橙—琥珀这一段（R > G > B 且 B 显著低），
+            //   明度仍是"顶亮底暗"，暖调更统一：
+            //     坐垫  #f8c79b   扶手  #f6b783（略深，读作"包边"）
+            //     靠背  #fbd2ae（最亮，因为背板上沿吃光最多）
+            //     底座  #e0a877（压暗，制造台阶）
+            //     木腿  #c08b5c（暖棕，与地板同族）
+            const cSeat = '#f8c79b';
+            const cArm  = '#f6b783';
+            const cBack = '#fbd2ae';
+            const cBase = '#e0a877';
+            const cLeg  = '#c08b5c';
+
             let o = '';
 
-            // 1) 底座：四周内收，制造一圈缝隙阴影 → 显得整张沙发"架"起来
-            o += box(x0 + 0.10, y0 + 0.10, w - 0.20, d - 0.20, 0, base,
-                     '#d7a87c', { r: 0.06 });
+            // ① 四条细腿（内收 0.09，四条都落在轮廓内可见）
+            const leg = 0.06, inset = 0.09;
+            const lxs = [x0 + inset, x1 - inset - leg];
+            const lys = [y0 + inset, y1 - inset - leg];
+            for (let i = 0; i < 2; i++) {
+                for (let j = 0; j < 2; j++) {
+                    o += box(lxs[i], lys[j], leg, leg, 0, legH, cLeg,
+                             { r: 0.02, edge: false });
+                }
+            }
 
-            // 2) 座体
-            o += box(x0, y0, w, d, base, 0.34, it.c, { r: 0.14 });
+            // ② 底座：垫在扶手和坐垫下面（四周内收，露出一圈台阶）
+            o += box(x0 + 0.02, y0 + 0.02, w - 0.04, d - 0.04,
+                     legH, seatH - legH, cBase,
+                     { r: 0.05, edge: false });
 
-            // 3) 靠背（贴后沿，比扶手高）
-            o += box(x0 + armW * 0.45, y1 - backD, w - armW * 0.9, backD,
-                     base, 0.67, shade(it.c, 1.02), { r: 0.14 });
+            // ③ 靠背（最远，先画）
+            o += box(inX0, inY1, inX1 - inX0, backD, legH, backH - legH,
+                     cBack, { r: 0.07 });
 
-            // 4) 左右扶手
-            o += box(x0, y0, armW, d, base, 0.54, shade(it.c, 1.07), { r: 0.15 });
-            o += box(x1 - armW, y0, armW, d, base, 0.54, shade(it.c, 1.07), { r: 0.15 });
+            // ④ 左右扶手（跨整个进深，是"这是沙发"最关键的一笔）
+            o += box(x0, y0, armW, d, legH, armH - legH, cArm, { r: 0.08 });
+            o += box(x1 - armW, y0, armW, d, legH, armH - legH, cArm, { r: 0.08 });
 
-            // 5) 两块坐垫（比座面高一点点）
-            const cw = (w - armW * 2) / 2 - 0.05;
-            o += box(x0 + armW + 0.05, y0 + 0.07, cw, d - backD - 0.12,
-                     base + 0.34, 0.10, '#ffe7cb', { r: 0.13 });
-            o += box(x0 + armW + cw + 0.10, y0 + 0.07, cw, d - backD - 0.12,
-                     base + 0.34, 0.10, '#ffe7cb', { r: 0.13 });
+            // ⑤ 坐垫（夹在扶手之间、靠背之前；比底座略高一点点，做出层次）
+            o += box(inX0 + 0.02, y0 + 0.02,
+                     inX1 - inX0 - 0.04, inY1 - y0 - 0.04,
+                     seatH - 0.05, 0.05, cSeat, { r: 0.05 });
 
-            // 6) 两个靠枕，斜靠在背板上
-            o += box(x0 + armW + 0.13, y1 - backD - 0.22, 0.40, 0.20,
-                     base + 0.44, 0.26, '#fff2e0', { r: 0.12 });
-            o += box(x1 - armW - 0.53, y1 - backD - 0.22, 0.40, 0.20,
-                     base + 0.44, 0.26, '#fff2e0', { r: 0.12 });
             return o;
         }
 
@@ -6574,41 +6655,6 @@
             o += leaf( 0.14, 0.08, it.h * 0.54, 0.13, 0.23,  34, '#8ec078');
             o += leaf( 0.01, -0.09, it.h * 0.78, 0.12, 0.21,  -5, '#a2cd8c');
             o += leaf(-0.06, 0.01, it.h * 0.92, 0.10, 0.17,  -9, '#b9dca5');
-            return o;
-        }
-
-        // ============================================================
-        // 落地灯（2026-11-01）
-        // ------------------------------------------------------------
-        // 加它的目的是填竖向空间：竖屏时房间只占下半屏，上半屏全靠墙，
-        // 有一盏 1.8m 高的细高物件，视线会被带上去，画面不至于"空"。
-        // ============================================================
-        function drawFloorLamp(it) {
-            const cx = it.x0 + it.w / 2, cy = it.y0 + it.d / 2, h = it.h;
-            const sw = it.w * 0.66;
-            let o = '';
-
-            // 灯罩散出的暖光（先画，让它成为背景光晕）
-            const gp = proj(cx, cy, h - 0.22);
-            o += '<circle cx="' + gp.x.toFixed(1) + '" cy="' + gp.y.toFixed(1) +
-                 '" r="' + (k * 0.72).toFixed(1) + '" fill="url(#winGlow)" opacity=".85"/>';
-
-            // 底盘
-            const bp = proj(cx, cy, 0.01);
-            o += '<ellipse cx="' + bp.x.toFixed(1) + '" cy="' + bp.y.toFixed(1) +
-                 '" rx="' + (it.w * 0.44 * k).toFixed(1) +
-                 '" ry="' + (it.w * 0.44 * k * C45).toFixed(1) +
-                 '" fill="#e0bb90"/>';
-
-            // 灯杆
-            o += box(cx - 0.035, cy - 0.035, 0.07, 0.07, 0.02, h - 0.36,
-                     '#cfa47c', { r: 0.03, edge: false });
-
-            // 灯罩：下宽上窄，用两层箱体叠出锥度
-            o += box(cx - sw / 2, cy - sw / 2, sw, sw, h - 0.36, 0.18,
-                     it.c, { r: 0.06 });
-            o += box(cx - sw * 0.36, cy - sw * 0.36, sw * 0.72, sw * 0.72,
-                     h - 0.21, 0.13, shade(it.c, 1.06), { r: 0.05 });
             return o;
         }
 
@@ -6845,32 +6891,62 @@
                          (iy + ih * 0.26).toFixed(1) + '" r="' + (iw * 0.06).toFixed(1) +
                          '" fill="#ffcf7a"/>';
                 } else if (d.kind === 'pendant') {
-                    // 吊灯：从很高的地方垂下来，填屏幕上半部的大片空墙，
-                    // 同时给房间一个明确的"光源"，光感立刻合理。
-                    const py = D * 0.46;
-                    const top = proj(d.x, py, ROOM.wallH);
-                    const bot = proj(d.x, py, d.z);
+                    // ============================================================
+                    // 吊灯（2026-11-01 重做）
+                    // ------------------------------------------------------------
+                    // 【问题】用户反馈"手机端的吊灯太矮了"。
+                    //   原来 zf 表示「占可见墙高的比例」，0.46 就往墙的中部挂，
+                    //   灯罩悬在半空 —— 但吊灯本来就该从天花板垂下来。
+                    //   而且墙高 wallH 是随视口变的，用比例算出来的绝对高度
+                    //   在手机上只有 1.4 米，站在地上都够得着。
+                    //
+                    // 【改法】对吊灯来说 zf 的含义改为「灯罩底部落在屏幕高度的
+                    //   百分之几」（0 = 屏幕顶，1 = 屏幕底）。这是唯一与墙高
+                    //   无关、在任意视口下都成立的定位方式：吊灯永远从画面顶部
+                    //   垂下来，视觉上就是"挂在很高的天花板上"。
+                    //
+                    // 【尺寸】灯罩用真实物理尺寸（直径 0.52m / 高 0.30m），
+                    //   不再跟着 wallVisible 比例放大缩小，否则手机会得到一个
+                    //   一米多高的巨型灯罩。
+                    // ============================================================
+                    const py = D * 0.46;                       // 挂点在房间进深上
+                    const shY = viewH * (raw.zf === undefined ? 0.22 : raw.zf);
+                    // 由「想让它出现在屏幕 shY 处」反解出世界高度
+                    const zShade = Math.max(
+                        1.2, (oy - shY) / k - py * C45);
+
+                    const wBot = 0.52, wTop = 0.16, hh = 0.30;
+                    const top = proj(d.x, py, ROOM.wallH);      // 吊线起点（屏幕外）
+                    const bot = proj(d.x, py, zShade);          // 灯罩底口
+
                     // 吊线
                     o += '<line x1="' + top.x.toFixed(1) + '" y1="' + top.y.toFixed(1) +
                          '" x2="' + bot.x.toFixed(1) + '" y2="' + bot.y.toFixed(1) +
                          '" stroke="#d9b48f" stroke-width="' +
-                         Math.max(1, k * 0.012).toFixed(1) + '"/>';
-                    // 灯罩下方的光晕
-                    o += '<ellipse cx="' + bot.x.toFixed(1) + '" cy="' + (bot.y + k * 0.10).toFixed(1) +
-                         '" rx="' + (k * 0.62).toFixed(1) +
-                         '" ry="' + (k * 0.62 * C45).toFixed(1) +
-                         '" fill="url(#winGlow)" opacity=".8"/>';
+                         Math.max(1, k * 0.010).toFixed(1) + '"/>';
+
+                    // 灯罩下方的光晕（房间里主要的暖光源之一）
+                    o += '<ellipse cx="' + bot.x.toFixed(1) +
+                         '" cy="' + (bot.y + k * 0.16).toFixed(1) +
+                         '" rx="' + (k * 0.72).toFixed(1) +
+                         '" ry="' + (k * 0.72 * C45).toFixed(1) +
+                         '" fill="url(#winGlow)" opacity=".85"/>';
+
                     // 灯罩：上窄下宽的梯形
-                    const wTop = d.w * 0.28, wBot = d.w * 1.0,
-                          hh = Math.max(0.18, d.h * 2.2);
-                    const p1 = proj(d.x - wBot / 2, py, d.z);
-                    const p2 = proj(d.x + wBot / 2, py, d.z);
-                    const p3 = proj(d.x + wTop / 2, py, d.z + hh);
-                    const p4 = proj(d.x - wTop / 2, py, d.z + hh);
-                    o += '<path d="' + roundedPath([p1, p2, p3, p4], k * 0.03) +
-                         '" fill="#ffe0b0" filter="url(#softShadow)"/>';
-                    o += '<path d="' + roundedPath([p1, p2, p3, p4], k * 0.03) +
-                         '" fill="url(#ogTop)"/>';
+                    const q1 = proj(d.x - wBot / 2, py, zShade);
+                    const q2 = proj(d.x + wBot / 2, py, zShade);
+                    const q3 = proj(d.x + wTop / 2, py, zShade + hh);
+                    const q4 = proj(d.x - wTop / 2, py, zShade + hh);
+                    const shade = roundedPath([q1, q2, q3, q4], Math.max(2, k * 0.022));
+                    o += '<path d="' + shade + '" fill="#ffe0b0" ' +
+                         'filter="url(#softShadow)"/>';
+                    o += '<path d="' + shade + '" fill="url(#ogTop)"/>';
+                    // 底口一圈亮边，把"发光"这件事画实
+                    o += '<path d="M' + q1.x.toFixed(1) + ',' + q1.y.toFixed(1) +
+                         'L' + q2.x.toFixed(1) + ',' + q2.y.toFixed(1) +
+                         '" fill="none" stroke="#fff3d0" stroke-width="' +
+                         Math.max(1.2, k * 0.016).toFixed(1) +
+                         '" stroke-linecap="round"/>';
                 } else if (d.kind === 'shelf') {
                     // 墙上的搁板 + 几件小物，用来填中段以上的空墙
                     // ★ 尺寸跟随 d.w / d.h，不再写死 —— 换视口时比例才对
@@ -6955,7 +7031,6 @@
                 else if (it.kind === 'table') art = drawTable(it);
                 else if (it.kind === 'plant') art = drawPlant(it);
                 else if (it.kind === 'window') art = drawWindow(it);
-                else if (it.kind === 'floorlamp') art = drawFloorLamp(it);
                 if (!art) continue;
 
                 // 地毯贴在地板上、窗户嵌在墙里 —— 这两样不加投影，
@@ -7098,7 +7173,26 @@
             const dy = BOUNDS.y1 - BOUNDS.y0;
             const kMaxWalk = vw / (MIN_WALK + dy * C45);
 
-            k = Math.max(26, Math.min(kFloor, kMaxWalk, 340));
+            // ---- 3b. 内容自适应：家具不要被裁得太狠 ----
+            // 上面两个约束只管"地板占比"和"走得动"，都没管**家具总宽度**。
+            // 竖屏放大到 k=159 时，家具横向跨度 4.23 世界单位 →
+            // 屏幕上要 674px，而屏幕只有 414px：盆栽只剩 13% 可见，
+            // 等于白摆。所以再加一道上限：
+            //     k ≤ vw / (内容跨度 × 0.80)
+            // 0.80 表示允许两侧合计约 20% 的溢出（用户明确允许裁减），
+            // 但保证每件家具至少能看到大半。
+            let uSpanMin = Infinity, uSpanMax = -Infinity;
+            for (let i = 0; i < ITEMS.length; i++) {
+                const it = ITEMS[i];
+                const a0 = it.x0 + it.y0 * C45;
+                const a1 = (it.x0 + it.w) + (it.y0 + it.d) * C45;
+                if (a0 < uSpanMin) uSpanMin = a0;
+                if (a1 > uSpanMax) uSpanMax = a1;
+            }
+            const uSpan = Math.max(1, uSpanMax - uSpanMin);
+            const kFitContent = vw / (uSpan * 0.80);
+
+            k = Math.max(26, Math.min(kFloor, kMaxWalk, kFitContent, 340));
             // 兜底：房间总宽至少要铺满屏幕（墙会延伸，不会露边，
             // 但太窄会让整个房间缩在中间）
             if (spanW * k < vw * 1.02) k = Math.max(k, (vw * 1.02) / spanW);
@@ -7217,7 +7311,13 @@
         let busyUntil = 0;
 
         // ---- 世界状态 ----
-        let bx = 0.0, by = 1.15;      // 当前世界坐标（正面空地上，不在任何家具里）
+        // ★ 出生点不再写死坐标（2026-11-01 已被打回两次）
+        //   写死 (0, 1.15) 时，只要家具一挪位置，这个点就可能落进
+        //   某件家具的碰撞盒 —— 机器人一出生就卡住，表现为"完全不动"。
+        //   （实际发生过：茶几挪到 y0=1.30 后，其碰撞范围扩到 y≥1.00，
+        //     正好把 (0,1.15) 圈了进去。）
+        //   现在改成：在可行走范围里从前往后扫，取第一个空位。
+        let bx = null, by = null;
         let tgtX = bx, tgtY = by;     // 目标世界坐标
         let walking = false;
         let rafId = null, lastTs = 0;
@@ -7286,6 +7386,13 @@
 
         function render() {
             if (!stage) return;
+            // 首次渲染 / 换户型后还没有合法坐标 → 先安置到一个空位
+            if (bx === null || by === null) {
+                const sp = findFreeSpot();
+                bx = sp.x; by = sp.y;
+                tgtX = bx; tgtY = by;
+                walking = false;
+            }
             // ★ 取景变化（旋转屏幕 / 改窗口大小）时会重算可行走范围，
             //   机器人可能正好落在新范围之外。此时 firstHit 会把四周
             //   都判成"墙"，它一步也走不动 —— 表现为卡死在原地。
@@ -7317,7 +7424,11 @@
                         }
                     }
                 }
-                if (!moved) { bx = 0; by = 1.15; walking = false; }
+                if (!moved) {
+                    const sp = findFreeSpot();
+                    bx = sp.x; by = sp.y; walking = false;
+                    tgtX = bx; tgtY = by;
+                }
             }
             const sc = World.botScale();
             const feet = World.proj(bx, by, 0);
@@ -7459,6 +7570,20 @@
         }
 
         // ---------------- 走动 ----------------
+
+        // 找一个确定的空位当出生点：先从最靠前的一条带子里找，
+        // 找不到再逐层往后推。比随机搜索更可靠（随机搜可能返回 null）。
+        function findFreeSpot() {
+            const B = World.bounds;
+            // 从前往后（y 从小到大）、从左往右扫一遍
+            for (let yy = B.y0 + 0.05; yy <= B.y1; yy += 0.12) {
+                for (let xx = B.x0 + 0.05; xx <= B.x1; xx += 0.12) {
+                    if (!firstHit(xx, yy)) return { x: xx, y: yy };
+                }
+            }
+            // 理论上到不了这里；退一步给个中点，由 render() 的自愈兜底
+            return { x: (B.x0 + B.x1) / 2, y: (B.y0 + B.y1) / 2 };
+        }
 
         // 在可达范围里随机找一个不撞家具的点
         // ------------------------------------------------------------
@@ -7664,6 +7789,9 @@
         function start() {
             if (!ready) return;
             stop();
+            // 上一轮可能留下一个很远的"忙"时间戳（比如散架时设了 1 小时），
+            // 不清掉的话 start() 之后所有待机动作都会被压掉。
+            if (!broken) busyUntil = 0;
             render();
             scheduleIdle();
             setTimeout(function () {
