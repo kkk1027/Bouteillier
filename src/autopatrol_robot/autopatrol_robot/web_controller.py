@@ -1607,6 +1607,10 @@ class CarController(Node):
             10
         )
         self.current_battery = 0.0
+        # ★ 区分「真的是 0%」和「还没收到任何一帧」。
+        #   仅靠 current_battery=0.0 无法区分，页面会误显示 0% 红闪，
+        #   看起来像电池报废了。REST /battery_status 靠这个标志判断。
+        self.battery_received = False
         # 订阅机器人位姿
         self.pose_subscription = self.create_subscription(
             PoseWithCovarianceStamped,
@@ -1647,10 +1651,23 @@ class CarController(Node):
             self.get_logger().debug(f'定位状态转发失败: {exc}')
 
     def battery_callback(self, msg):
-        """电池电量回调"""
-        self.current_battery = msg.data
-        self.socketio.emit('battery_status', {'percent': self.current_battery})
-        self.get_logger().debug(f'电池电量: {self.current_battery}%')
+        """电池电量回调 → 推送到网页右上角的电量胶囊。
+
+        ★ 2026-11-01：原来这里只写 self.current_battery，前端完全没有消费方，
+          等于白订阅。现在右上角的实时时钟已换成电池百分比（用户要求），
+          这个回调才真正有了用处。
+        """
+        try:
+            value = float(msg.data)
+        except Exception:                  # noqa: BLE001
+            return
+        # 越界数据一律夹紧，别让 1234% 之类的脏值冲到页面上
+        value = max(0.0, min(100.0, value))
+        self.current_battery = value
+        self.battery_received = True
+        self.socketio.emit('battery_status', {'percent': round(value, 1)})
+        self.get_logger().debug(f'电池电量: {value:.1f}%')
+
     def map_callback(self, msg):
         """地图回调函数 - 保持原始分辨率"""
         # ★ 先置就绪信号：_wait_map_ready 在等它。
@@ -2127,6 +2144,31 @@ def connection_status():
         'status': 'success',
         'connected': is_connected
     })
+
+
+@app.route('/battery_status', methods=['GET'])
+def battery_status():
+    """获取当前电池电量（供页面刷新时立即取值）。
+
+    ★ 为什么需要这个接口：
+      socketio 的 'battery_status' 是**事件推送** —— 只在
+      /battery_percent 有新消息时发一次。如果页面在两次上报之间打开
+      （或者上报周期很长），右上角的电量会一直停在 "--%"，看起来像坏了。
+      页面加载时先 GET 一次，能立刻拿到最近一次的缓存值。
+
+    返回 percent=None 表示还没收到过 /battery_percent。
+    """
+    percent = None
+    node = car_controller
+    if node is not None and getattr(node, 'battery_received', False):
+        try:
+            v = float(node.current_battery)
+            percent = max(0.0, min(100.0, round(v, 1)))
+        except Exception:                  # noqa: BLE001
+            percent = None
+    return jsonify({'status': 'success', 'percent': percent})
+
+
 @app.route('/')
 def index():
     """主页面"""

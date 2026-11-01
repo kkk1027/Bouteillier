@@ -2202,6 +2202,92 @@
 
         .status-float .status-dot { width: 8px; height: 8px; }
 
+        /* 分隔符：比正文更淡，只是视觉停顿，不抢注意力 */
+        .status-float .status-sep {
+            color: #e2cfb6;
+            font-weight: 300;
+        }
+
+        /* ============================================================
+           电池电量（2026-11-01）
+           ------------------------------------------------------------
+           画一个真正的电池形状而不是贴 emoji：
+             · emoji 在不同系统渲染差异大（🔋 在部分字体里是彩色的，
+               改不了颜色，低电量想变红都做不到）
+             · CSS 画的形状可以直接继承 currentColor，
+               改一个字就能整块换色，还能按电量填充电量条
+           分级配色与全站语义一致：
+             ≥50%  抹茶绿 --w-ok     正常
+             20-49% 琥珀   --warn     注意
+             <20%  珊瑚红 --w-err     低电量（呼吸闪烁提醒）
+             未知   灰               还没收到 /battery_percent
+           ============================================================ */
+        .battery {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            line-height: 1;
+            transition: color .3s ease;
+        }
+
+        /* 电池外壳（电池身 + 右侧正极点） */
+        .battery-shell {
+            position: relative;
+            display: inline-block;
+            width: 21px;
+            height: 11px;
+            padding: 1.5px;
+            box-sizing: border-box;
+            border: 1.3px solid currentColor;
+            border-radius: 3px;
+        }
+
+        .battery-shell::after {
+            content: '';
+            position: absolute;
+            right: -3.4px;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 2px;
+            height: 4.5px;
+            border-radius: 0 1.5px 1.5px 0;
+            background: currentColor;
+        }
+
+        /* 电量填充条：宽度由 JS 按百分比设置 */
+        .battery-fill {
+            display: block;
+            width: 0;
+            height: 100%;
+            border-radius: 1px;
+            background: currentColor;
+            /* 电量跳变时平滑过渡，避免数字和图形不同步的割裂感 */
+            transition: width .45s ease;
+        }
+
+        .battery-text {
+            font-variant-numeric: tabular-nums;  /* 数字等宽，百分比变化时不抖 */
+            font-weight: 600;
+            letter-spacing: .2px;
+        }
+
+        .battery.is-ok      { color: var(--w-ok); }
+        .battery.is-mid     { color: var(--w-warn); }
+        .battery.is-low     { color: var(--w-err); animation: battery-pulse 1.6s ease-in-out infinite; }
+        .battery.is-unknown { color: var(--w-sub); opacity: .7; }
+
+        @keyframes battery-pulse {
+            0%, 100% { opacity: 1; }
+            50%      { opacity: .4; }
+        }
+
+        /* 尊重系统的「减少动态效果」设置：低电量不再呼吸闪烁，
+           改为只保留红色，避免干扰对动效敏感的用户。 */
+        @media (prefers-reduced-motion: reduce) {
+            .battery.is-low { animation: none; }
+            .battery-fill   { transition: none; }
+        }
+
         /* ============================================================
            定位状态条（2026-11-01）
            ------------------------------------------------------------
@@ -3481,8 +3567,20 @@
     <div class="status-float">
         <span class="status-dot" id="conn-status-dot"></span>
         <span id="conn-status-text">未连接</span>
-        <span style="color:#e2cfb6;">|</span>
-        <span id="time-label">--:--:--</span>
+        <span class="status-sep">|</span>
+        <!-- ============================================================
+             电池电量（2026-11-01）
+             ------------------------------------------------------------
+             原本这里是个实时时钟，没人看；用户要求换成电池百分比。
+             数据源 /battery_percent (std_msgs/Float32) →
+             web_controller.battery_callback → socketio 'battery_status'。
+             页面打开时先 GET /battery_status 取一次缓存，避免等到
+             下一次上报才有数字。
+             ============================================================ -->
+        <span class="battery is-unknown" id="battery" title="电池电量">
+            <span class="battery-shell"><span class="battery-fill" id="battery-fill"></span></span>
+            <span class="battery-text" id="battery-text">--%</span>
+        </span>
     </div>
 
     <!-- ============================================================
@@ -4319,6 +4417,78 @@
             if (bar) bar.classList.add('is-hidden');
         }, 5000);
     });
+
+    // ============================================================
+    // 电池电量（2026-11-01）
+    // ------------------------------------------------------------
+    // 数据链路：
+    //   ESP32 → /battery_percent (std_msgs/Float32)
+    //        → web_controller.battery_callback
+    //        → socketio 'battery_status'
+    //        → 这里
+    //
+    // 为什么要单独做成函数 + 先 fetch 一次：
+    //   socketio 是事件推送，只在有新的 /battery_percent 时触发。
+    //   页面刚打开、两次上报之间的空窗期里不会有任何事件 ——
+    //   如果只依赖 socket.on，电量会一直显示 "--%"，看起来像坏了。
+    //   所以 init 阶段先 GET /battery_status 拿最近一次的缓存值。
+    //
+    // 分级阈值统一放在这里，改一处即可，不要在 HTML/CSS 里硬编码。
+    // ============================================================
+    const BATTERY_LEVELS = { low: 20, mid: 50 };
+
+    function renderBattery(percent) {
+        const box  = document.getElementById('battery');
+        const fill = document.getElementById('battery-fill');
+        const text = document.getElementById('battery-text');
+        if (!box || !fill || !text) return;
+
+        const p = Number(percent);
+        // null / undefined / '' / NaN 都会在这里被判为无效 →
+        // 显示 "--%" 而不是 0%，避免把"没数据"误报成"电池没了"
+        const valid = percent !== null && percent !== undefined &&
+                      Number.isFinite(p) && p >= 0 && p <= 100;
+
+        box.classList.remove('is-ok', 'is-mid', 'is-low', 'is-unknown');
+
+        if (!valid) {
+            box.classList.add('is-unknown');
+            fill.style.width = '0%';
+            text.textContent = '--%';
+            box.title = '电池电量未知（尚未收到 /battery_percent）';
+            return;
+        }
+
+        const pct = Math.max(0, Math.min(100, Math.round(p)));
+        fill.style.width = pct + '%';
+        text.textContent = pct + '%';
+
+        let cls = 'is-ok';
+        let hint = '电量充足';
+        if (pct < BATTERY_LEVELS.low) {
+            cls = 'is-low';
+            hint = '电量极低，请尽快充电';
+        } else if (pct < BATTERY_LEVELS.mid) {
+            cls = 'is-mid';
+            hint = '电量中等';
+        }
+        box.classList.add(cls);
+        box.title = hint + '（' + pct + '%）';
+    }
+
+    socket.on('battery_status', (data) => {
+        if (!data) return;
+        renderBattery(data.percent);
+    });
+
+    // 首屏先取一次缓存值，不必等下一次 3 秒/10 秒上报
+    (function initBattery() {
+        renderBattery(null);           // 先画成未知态，避免闪现空白
+        fetch('/battery_status')
+            .then((r) => r.json())
+            .then((d) => { if (d && d.status === 'success') renderBattery(d.percent); })
+            .catch(() => { /* 服务端没起好时静默失败，socket 会补上 */ });
+    })();
     
     // ==================== Socket.IO 事件 ====================
     socket.on('map_data', (data) => {
@@ -5869,11 +6039,13 @@
         initSettingsDock();
         initGestureLock();
         Butler.init();
-        
-        setInterval(() => {
-            document.getElementById('time-label').textContent = new Date().toLocaleTimeString();
-        }, 1000);
-        
+
+        // ★ 2026-11-01：原来这里有一个每秒刷新右上角实时时钟的 setInterval。
+        //   用户要求把时钟换成电池百分比 —— 时钟对巡检场景没有信息量，
+        //   电量才是"现在还能不能干活"的关键指标。电池的渲染由
+        //   renderBattery() 负责（socket 事件 + 首屏一次 fetch），
+        //   纯推送式，不需要任何轮询，所以这个定时器整个删掉了。
+
         // 地图拖动
         canvas.addEventListener('mousedown', (e) => { isDragging = true; dragStartX = e.clientX - offsetX; dragStartY = e.clientY - offsetY; });
         window.addEventListener('mousemove', (e) => { if (isDragging) { offsetX = e.clientX - dragStartX; offsetY = e.clientY - dragStartY; drawMap(); } });
