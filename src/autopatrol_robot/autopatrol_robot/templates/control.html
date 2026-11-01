@@ -1477,10 +1477,12 @@
 
         .room-svg {
             position: absolute;
-            inset: -3.5%;           /* 留出位移余量，避免视差时露边 */
-            width: 107%;
-            height: 107%;
+            inset: 0;
+            width: 100%;
+            height: 100%;
             display: block;
+            /* 轴测是平行投影，没有灭点，画面不随视角抖动，
+               所以不需要再留视差余量（原来是 -3.5% / 107%） */
         }
 
         /* 每个景深层是一张独立的 <svg>。
@@ -2318,6 +2320,26 @@
         .loc-bar.is-ready  { border-color: #b7d9a8; }
         .loc-bar.is-bad    { border-color: #e0a99b; }
 
+        /* ============================================================
+           就绪后收缩成药丸（2026-11-01）
+           ------------------------------------------------------------
+           原来定位成功后 5 秒就把整条淡出消失了，导致两个问题：
+             1) 用户想确认「现在定位到底准不准」时它已经不在了；
+             2) 定位若随后偷偷跑偏，也没有任何提示。
+           现在改为**常驻**：未就绪时展开大卡片（进度 + 原因 + 建议），
+           就绪后收成一颗小药丸（圆点 + 就绪 + 匹配率），不占地方但一直在。
+           药丸本身仍然可以读，只是不再需要那么大一块。
+           ============================================================ */
+        .loc-bar.is-pill {
+            width: auto;
+            padding: 6px 14px;
+            border-radius: 999px;
+        }
+        .loc-bar.is-pill .loc-track,
+        .loc-bar.is-pill .loc-reason { display: none; }
+        .loc-bar.is-pill .loc-head { gap: 6px; }
+        .loc-bar.is-pill .loc-meta { margin-left: 10px; }
+
         .loc-head {
             display: flex;
             align-items: center;
@@ -2405,14 +2427,15 @@
            ============================================================ */
         .butler-stage {
             position: fixed;
+            /* 定位完全交给 JS：每帧把「世界坐标 → 斜二轴测屏幕坐标」算出来，
+               写到 transform 上。所以这里固定贴左上角，不再用 bottom 定位。
+               也正因为逐帧驱动，**不能**给 transform 加 transition
+               （会和 rAF 打架，表现为机器人抽搐、速度忽快忽慢）。 */
             left: 0;
-            /* 站在地板上：地板带带大约从 70% 高度开始，这里取 13vh
-               再加最小/最大夹逼，兼顾竖屏手机和桌面 */
-            bottom: clamp(92px, 13vh, 138px);
+            top: 0;
             z-index: 20;               /* 浮在对话之上，才能被点到 */
             pointer-events: none;      /* 只有机器人本体可点，空白处穿透 */
             will-change: transform;
-            transition: transform 4.2s cubic-bezier(0.42, 0, 0.58, 1);
         }
 
         /* 缩放包装层：媒体查询在此层改 scale，不影响内部动画 */
@@ -2889,6 +2912,343 @@
         }
 
         /* ============================================================
+           动作：撞到家具 → 摔倒（2026-11-01）
+           ------------------------------------------------------------
+           触发时机由 Butler 控制：撞到桌子/沙发/盆栽累计 3~5 次才摔 1 次，
+           否则一直在房间里走、一直在摔，会变成噪音。
+
+           为什么用 transform-origin: 50% 100%（脚底）：
+             绕脚底旋转才像「整个人朝一边倒下去」；
+             绕中心转会看起来像在原地打转。
+           关键帧里先「被撞飞」再「倒下 → 弹一下 → 再倒下 → 爬起来」，
+           和被打（is-hit）的节奏区分开：摔倒更慢、幅度更大。
+           ============================================================ */
+        .butler-unit.is-fall {
+            animation: btFall 2.1s cubic-bezier(0.34, 0.02, 0.36, 1) both;
+        }
+
+        @keyframes btFall {
+            0%   { transform: rotate(0deg)   translate(0, 0); }
+            10%  { transform: rotate(-18deg) translate(-8px, -20px); }
+            24%  { transform: rotate(58deg)  translate(-4px, 2px); }
+            34%  { transform: rotate(76deg)  translate(0, 10px); }
+            42%  { transform: rotate(64deg)  translate(0, 3px); }
+            52%  { transform: rotate(79deg)  translate(0, 11px); }
+            66%  { transform: rotate(72deg)  translate(0, 8px); }
+            78%  { transform: rotate(4deg)   translate(0, -14px); }
+            88%  { transform: rotate(-7deg)  translate(0, 0); }
+            100% { transform: rotate(0deg)   translate(0, 0); }
+        }
+
+        /* 摔倒时影子被拉长并偏移，强化"躺下"的感觉 */
+        .butler-unit.is-fall .bt-shadow {
+            animation: btFallShadow 2.1s ease-in-out both;
+        }
+
+        @keyframes btFallShadow {
+            0%, 100% { transform: translateX(0) scaleX(1); opacity: 1; }
+            34%, 52% { transform: translateX(-16px) scaleX(1.5); opacity: .62; }
+            66%      { transform: translateX(-14px) scaleX(1.4); opacity: .7; }
+        }
+
+        /* 摔倒时眼睛变叉、嘴巴张大 —— 夸张一点才有喜剧感 */
+        .butler-unit.is-fall .bt-eye {
+            height: 3px;
+            border-radius: 2px;
+            transform: rotate(24deg);
+        }
+
+        .butler-unit.is-fall .bt-eye.r { transform: rotate(-24deg); }
+        .butler-unit.is-fall .bt-eye::after { opacity: 0; }
+
+        .butler-unit.is-fall .bt-mouth {
+            width: 10px;
+            height: 12px;
+            margin-left: -5px;
+            border-radius: 50%;
+            bottom: 1px;
+        }
+
+        .butler-unit.is-fall .bt-arm.l { transform: rotate(46deg); }
+        .butler-unit.is-fall .bt-arm.r { transform: rotate(-52deg); }
+
+        /* 摔倒时星星转得更疯 */
+        .butler-unit.is-fall .bt-stars {
+            opacity: 1;
+            animation: btStarsSpin 0.55s linear infinite;
+        }
+
+        /* 轻轻撞一下：只晃，不摔 */
+        .butler-unit.is-bump {
+            animation: btBump 0.62s ease-in-out both;
+        }
+
+        @keyframes btBump {
+            0%, 100% { transform: translate(0, 0) rotate(0); }
+            22%      { transform: translate(-6px, 1px) rotate(-5deg); }
+            48%      { transform: translate(4px, 0) rotate(3.4deg); }
+            72%      { transform: translate(-2px, 0) rotate(-1.6deg); }
+        }
+
+        /* ============================================================
+           动作：倒红酒（2026-11-01）—— 待机动作
+           ------------------------------------------------------------
+           四拍：从背后取出 → 倾倒（酒液涨起来）→ 轻轻摇晃 → 放回背后。
+           杯子挂在右手边（.bt-arm.r 的位置），整体绕杯脚旋转模拟倾倒。
+           ============================================================ */
+        .bt-wine {
+            position: absolute;
+            right: 4px;
+            bottom: 66px;
+            width: 22px;
+            height: 40px;
+            opacity: 0;
+            transform-origin: 50% 100%;
+            pointer-events: none;
+            z-index: 7;
+        }
+
+        .bt-wine-bowl {
+            position: absolute;
+            left: 50%;
+            top: 0;
+            width: 20px;
+            height: 16px;
+            margin-left: -10px;
+            border-radius: 3px 3px 10px 10px;
+            background: linear-gradient(180deg,
+                rgba(255, 255, 255, .92) 0%,
+                rgba(255, 245, 232, .78) 100%);
+            border: 1.2px solid #e9d6bd;
+            overflow: hidden;
+        }
+
+        /* 酒液：高度由 keyframes 撑起来，模拟"越倒越满" */
+        .bt-wine-liquid {
+            position: absolute;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            height: 0;
+            background: linear-gradient(180deg, #c0392b 0%, #8e1f14 100%);
+        }
+
+        .bt-wine-stem {
+            position: absolute;
+            left: 50%;
+            top: 16px;
+            width: 2.4px;
+            height: 16px;
+            margin-left: -1.2px;
+            background: #e9d6bd;
+        }
+
+        .bt-wine-foot {
+            position: absolute;
+            left: 50%;
+            bottom: 4px;
+            width: 14px;
+            height: 3.4px;
+            margin-left: -7px;
+            border-radius: 50%;
+            background: #e9d6bd;
+        }
+
+        .butler-unit.is-wine .bt-wine {
+            animation: btWineFull 4.6s ease-in-out both;
+        }
+
+        .butler-unit.is-wine .bt-wine-liquid {
+            animation: btWinePour 4.6s ease-in-out both;
+        }
+
+        /* 右手抬起来扶着杯子 */
+        .butler-unit.is-wine .bt-arm.r {
+            transform: rotate(-58deg) translateY(-14px);
+        }
+
+        .butler-unit.is-wine .bt-eye {
+            height: 6px;
+            border-radius: 9px 9px 0 0;    /* 眯眼享受 */
+        }
+
+        .butler-unit.is-wine .bt-eye::after { opacity: 0; }
+
+        @keyframes btWineFull {
+            /* 1. 从背后取出（从身体后面往右前方滑出来） */
+            0%   { opacity: 0; transform: translate(-26px, 16px) rotate(-24deg) scale(.7); }
+            14%  { opacity: 1; transform: translate(0, 0) rotate(0deg) scale(1); }
+            /* 2. 倾倒：绕杯脚转到近乎水平 */
+            28%  { opacity: 1; transform: rotate(0deg); }
+            40%  { opacity: 1; transform: rotate(-78deg); }
+            52%  { opacity: 1; transform: rotate(-70deg); }
+            /* 3. 轻轻摇晃 */
+            62%  { opacity: 1; transform: rotate(-18deg); }
+            68%  { opacity: 1; transform: rotate(-30deg); }
+            74%  { opacity: 1; transform: rotate(-14deg); }
+            80%  { opacity: 1; transform: rotate(-26deg); }
+            /* 4. 放回背后 */
+            92%  { opacity: 1; transform: rotate(0deg) translate(0, 0); }
+            100% { opacity: 0; transform: translate(-26px, 16px) rotate(-20deg) scale(.7); }
+        }
+
+        @keyframes btWinePour {
+            0%, 28%  { height: 0; }
+            44%      { height: 62%; }
+            80%      { height: 62%; }
+            92%,100% { height: 0; }
+        }
+
+        /* ============================================================
+           低电量散架（2026-11-01）
+           ------------------------------------------------------------
+           电量 < 10% 时触发：整个人炸开、零件掉一地，之后**不再有任何
+           待机动作**（不再走动、不再换姿势），直到电量回升到 10% 以上。
+           为什么必须停掉待机：散架了还能走路、还能挥手，会显得很假，
+           而且会让人以为机器人"还活着、还能干活"。
+           ============================================================ */
+        .butler-unit.is-collapse {
+            animation: btCollapse 1.15s cubic-bezier(0.3, 0.05, 0.4, 1) both;
+        }
+
+        @keyframes btCollapse {
+            0%   { transform: translate(0, 0) rotate(0); }
+            12%  { transform: translate(-3px, -12px) rotate(-5deg); }
+            30%  { transform: translate(2px, 2px) rotate(7deg) scaleY(.82); }
+            46%  { transform: translate(-1px, 4px) rotate(9deg) scaleY(.72); }
+            100% { transform: translate(0, 6px) rotate(11deg) scaleY(.66); }
+        }
+
+        /* 各部位脱落后留在原地 */
+        .butler-unit.is-broken .bt-head {
+            transform: translate(30px, 52px) rotate(74deg);
+            transition: transform .5s cubic-bezier(.4, 0, .6, 1) .1s;
+        }
+        .butler-unit.is-broken .bt-visor { opacity: .55; }
+        .butler-unit.is-broken .bt-eye   { background: #7d6a58; }
+
+        .butler-unit.is-broken .bt-arm.l {
+            transform: translate(-26px, 46px) rotate(-84deg);
+            transition: transform .5s cubic-bezier(.4, 0, .6, 1) .16s;
+        }
+        .butler-unit.is-broken .bt-arm.r {
+            transform: translate(34px, 40px) rotate(92deg);
+            transition: transform .5s cubic-bezier(.4, 0, .6, 1) .16s;
+        }
+        .butler-unit.is-broken .bt-antenna {
+            transform: translate(-14px, 62px) rotate(-62deg);
+            transition: transform .5s cubic-bezier(.4, 0, .6, 1) .22s;
+        }
+        .butler-unit.is-broken .bt-bowtie,
+        .butler-unit.is-broken .bt-bowtie-knot {
+            transform: translate(26px, 58px) rotate(46deg);
+            transition: transform .5s cubic-bezier(.4, 0, .6, 1) .26s;
+        }
+        .butler-unit.is-broken .bt-wheel.l {
+            transform: translate(-30px, 24px) rotate(-40deg);
+            transition: transform .5s cubic-bezier(.4, 0, .6, 1) .2s;
+        }
+        .butler-unit.is-broken .bt-wheel.r {
+            transform: translate(28px, 26px) rotate(38deg);
+            transition: transform .5s cubic-bezier(.4, 0, .6, 1) .2s;
+        }
+        /* 身体瘫掉 */
+        .butler-unit.is-broken .bt-body {
+            transform: scaleY(.45) translateY(30px);
+            transition: transform .55s cubic-bezier(.4, 0, .6, 1) .08s;
+        }
+        .butler-unit.is-broken .bt-neck { opacity: 0; }
+
+        /* 散架后不再呼吸、不再眨眼（呼吸动画本身就在动，必须停） */
+        .butler-unit.is-broken {
+            animation: none !important;
+        }
+        .butler-unit.is-broken .bt-eye::after { animation: none !important; opacity: 0; }
+        .butler-unit.is-broken .bt-antenna::after { animation: none !important; }
+
+        /* 零件：散架那一刻炸出来，之后静止躺在地上 */
+        .bt-debris {
+            position: absolute;
+            inset: 0;
+            opacity: 0;
+            pointer-events: none;
+            z-index: 8;
+        }
+
+        .butler-unit.is-collapse .bt-debris,
+        .butler-unit.is-broken .bt-debris { opacity: 1; }
+
+        .bt-debris .db {
+            position: absolute;
+            display: block;
+            width: 9px;
+            height: 9px;
+            border-radius: 3px;
+            background: #8a6349;
+            opacity: 0;
+        }
+
+        .bt-debris .db-1 { left: 44px; bottom: 40px; background: #fffaf3; border: 1px solid #eeddc6; }
+        .bt-debris .db-2 { left: 24px; bottom: 26px; background: #9a7154; }
+        .bt-debris .db-3 { left: 74px; bottom: 34px; background: #e8705f; width: 12px; height: 7px; }
+        .bt-debris .db-4 { left: 58px; bottom: 14px; background: #6d4c36; border-radius: 50%; }
+        .bt-debris .db-5 { left: 12px; bottom: 52px; background: #f0a75c; width: 6px; height: 6px; border-radius: 50%; }
+        .bt-debris .db-6 { left: 92px; bottom: 20px; background: #7b5638; }
+        .bt-debris .db-7 { left: 36px; bottom: 68px; background: #dcc6ab; width: 7px; height: 12px; }
+        .bt-debris .db-8 { left: 84px; bottom: 54px; background: #cdb497; width: 5px; height: 5px; border-radius: 50%; }
+
+        /* 每一块飞出的方向和落点都不一样，避免像复制粘贴 */
+        .butler-unit.is-collapse .db { animation: btDebris 0.95s cubic-bezier(.2, .6, .4, 1) both; }
+        .butler-unit.is-collapse .db-1 { animation-delay: .04s; --dx: -34px; --dy: -46px; --rot: -160deg; }
+        .butler-unit.is-collapse .db-2 { animation-delay: .09s; --dx: -52px; --dy: -18px; --rot: 220deg; }
+        .butler-unit.is-collapse .db-3 { animation-delay: .02s; --dx: 40px;  --dy: -52px; --rot: 300deg; }
+        .butler-unit.is-collapse .db-4 { animation-delay: .12s; --dx: -20px; --dy: -8px;  --rot: -300deg; }
+        .butler-unit.is-collapse .db-5 { animation-delay: .07s; --dx: -44px; --dy: -60px; --rot: 180deg; }
+        .butler-unit.is-collapse .db-6 { animation-delay: .11s; --dx: 52px;  --dy: -14px; --rot: -220deg; }
+        .butler-unit.is-collapse .db-7 { animation-delay: .05s; --dx: 18px;  --dy: -64px; --rot: 260deg; }
+        .butler-unit.is-collapse .db-8 { animation-delay: .14s; --dx: 46px;  --dy: -40px; --rot: -180deg; }
+
+        @keyframes btDebris {
+            0%   { opacity: 0; transform: translate(0, 0) rotate(0) scale(.5); }
+            18%  { opacity: 1; }
+            100% { opacity: 1;
+                   transform: translate(var(--dx, 0), var(--dy, 0))
+                              rotate(var(--rot, 0)) scale(1); }
+        }
+
+        /* 散架后整体轻微沉下去，像真的塌了 */
+        .butler-unit.is-broken .bt-shadow { opacity: .45; transform: scaleX(1.25); }
+
+        /* ============================================================
+           遮挡保护（2026-11-01）
+           ------------------------------------------------------------
+           机器人的 z-index 必须高于对话（否则点不到它），但这样它走动时
+           会盖住聊天气泡。用户的要求是「不能遮挡，若遮挡可以略微模糊化」。
+
+           做法：Butler 每帧检查自己的包围盒和所有 .msg-bubble 的重叠，
+           一旦重叠就给 .butler-stage 加 is-ghost —— 整体降到 34% 不透明度
+           并轻微模糊。这样气泡内容仍然清晰可读，机器人只是"退到背景里"。
+           同时关掉 pointer-events，避免用户想点气泡时误打到机器人。
+           ============================================================ */
+        .butler-stage {
+            transition: opacity .35s ease, filter .35s ease;
+        }
+
+        .butler-stage.is-ghost {
+            opacity: .34;
+            filter: blur(1.4px) saturate(.85);
+        }
+
+        .butler-stage.is-ghost .butler-unit {
+            pointer-events: none;
+        }
+
+        /* 用户明确开启了「减少动态效果」时，别让机器人一直动 */
+        @media (prefers-reduced-motion: reduce) {
+            .butler-unit { animation: none !important; }
+        }
+
+        /* ============================================================
            对话气泡
            ============================================================ */
         /* 气泡位置按 172px 基准高度推（旧值 158 是按 152 算的） */
@@ -3343,129 +3703,14 @@
 </head>
 <body class="app-shell">
 
-<!-- ==================== 3D 家庭场景（分层视差） ==================== -->
+<!-- ==================== 斜二轴测家庭场景 ====================
+     整个世界由 JS 按「世界坐标 → 斜二轴测投影」实时生成（见 World 模块）。
+     之所以不再用一张画好的背景图：
+       1) 画出来的家具程序不知道它在哪，没法做碰撞 —— 机器人会从沙发上碾过去；
+       2) 只有横向有意义，前后纵深（y 轴）根本用不上。
+     ============================================================ -->
 <div class="room-scene" id="roomScene" aria-hidden="true">
-
-    <!-- ---------- 底座：后墙 + 地板 ----------
-         也带一点景深（0.22）：之前是 0（完全固定），看起来就像家具在动、
-         房间不动，很假。真实镜头平移时远处的墙也会动，只是比近处少，
-         所以这里给一个小系数。 -->
-    <svg class="room-layer" data-depth="0.22" viewBox="0 0 1600 900"
-         preserveAspectRatio="xMidYMid slice">
-        <defs>
-            <radialGradient id="wallGlow" cx="50%" cy="6%" r="86%">
-                <stop offset="0%" stop-color="#fff9ef"/>
-                <stop offset="100%" stop-color="#f5e3c9"/>
-            </radialGradient>
-            <clipPath id="floorClip">
-                <rect x="0" y="628" width="1600" height="272"/>
-            </clipPath>
-        </defs>
-        <rect x="0" y="0" width="1600" height="630" fill="url(#wallGlow)"/>
-        <rect x="0" y="600" width="1600" height="32" fill="#f0dbba"/>
-        <g clip-path="url(#floorClip)">
-            <rect x="0" y="628" width="1600" height="272" fill="#f4e2c6"/>
-            <!-- 地板缝：从消失点发散，做出透视 -->
-            <g stroke="#e8cfa9" stroke-width="2.5" opacity="0.65">
-                <line x1="800" y1="330" x2="90" y2="900"/>
-                <line x1="800" y1="330" x2="380" y2="900"/>
-                <line x1="800" y1="330" x2="640" y2="900"/>
-                <line x1="800" y1="330" x2="960" y2="900"/>
-                <line x1="800" y1="330" x2="1220" y2="900"/>
-                <line x1="800" y1="330" x2="1510" y2="900"/>
-            </g>
-            <g stroke="#e8cfa9" stroke-width="2" opacity="0.42">
-                <line x1="0" y1="662" x2="1600" y2="662"/>
-                <line x1="0" y1="712" x2="1600" y2="712"/>
-                <line x1="0" y1="778" x2="1600" y2="778"/>
-                <line x1="0" y1="862" x2="1600" y2="862"/>
-            </g>
-        </g>
-    </svg>
-
-    <!-- ---------- 远景：窗户 / 挂画 / 壁灯 ---------- -->
-    <svg class="room-layer" data-depth="0.45" viewBox="0 0 1600 900"
-         preserveAspectRatio="xMidYMid slice">
-        <defs>
-            <radialGradient id="lampGlowA" cx="50%" cy="50%" r="50%">
-                <stop offset="0%" stop-color="#ffe9b0" stop-opacity="0.95"/>
-                <stop offset="100%" stop-color="#ffe9b0" stop-opacity="0"/>
-            </radialGradient>
-        </defs>
-        <!-- 窗户 -->
-        <rect x="1012" y="118" width="332" height="302" rx="20"
-              fill="#fff5dc" stroke="#e6c9a0" stroke-width="9"/>
-        <circle cx="1236" cy="200" r="44" fill="#ffdf85" opacity="0.9"/>
-        <g fill="#fffaf1" opacity="0.95">
-            <ellipse cx="1088" cy="212" rx="44" ry="23"/>
-            <ellipse cx="1124" cy="198" rx="31" ry="19"/>
-            <ellipse cx="1284" cy="330" rx="38" ry="20"/>
-        </g>
-        <line x1="1178" y1="126" x2="1178" y2="412" stroke="#e6c9a0" stroke-width="8"/>
-        <line x1="1016" y1="269" x2="1340" y2="269" stroke="#e6c9a0" stroke-width="8"/>
-
-        <!-- 挂画 -->
-        <rect x="212" y="148" width="198" height="154" rx="12"
-              fill="#ffeacd" stroke="#e3c69d" stroke-width="8"/>
-        <path d="M226 280 L288 202 L332 250 L376 192 L396 280 Z" fill="#f0c79a"/>
-        <circle cx="362" cy="196" r="15" fill="#ffcf7a"/>
-
-        <!-- 壁灯 + 光晕 -->
-        <circle cx="820" cy="126" r="128" fill="url(#lampGlowA)"/>
-        <rect x="806" y="152" width="28" height="46" rx="11" fill="#f0d3a8"/>
-    </svg>
-
-    <!-- ---------- 中景：家具 ---------- -->
-    <svg class="room-layer" data-depth="1" viewBox="0 0 1600 900"
-         preserveAspectRatio="xMidYMid slice">
-        <defs>
-            <radialGradient id="lampGlowB" cx="50%" cy="50%" r="50%">
-                <stop offset="0%" stop-color="#ffe9b0" stop-opacity="0.95"/>
-                <stop offset="100%" stop-color="#ffe9b0" stop-opacity="0"/>
-            </radialGradient>
-        </defs>
-        <!-- 地毯 -->
-        <ellipse cx="700" cy="764" rx="332" ry="76" fill="#ffe3bf" opacity="0.96"/>
-        <ellipse cx="700" cy="764" rx="268" ry="57" fill="#ffd6a6" opacity="0.92"/>
-
-        <!-- 沙发 -->
-        <rect x="380" y="404" width="430" height="114" rx="30" fill="#f1bb8a"/>
-        <rect x="360" y="492" width="470" height="92" rx="28" fill="#ffcf9f"/>
-        <rect x="350" y="484" width="54" height="88" rx="25" fill="#f7c48f"/>
-        <rect x="786" y="484" width="54" height="88" rx="25" fill="#f7c48f"/>
-        <rect x="430" y="436" width="86" height="70" rx="18" fill="#ffd9b0"/>
-        <rect x="672" y="440" width="86" height="66" rx="18" fill="#ffd9b0"/>
-        <rect x="392" y="572" width="20" height="32" rx="7" fill="#d9ab7e"/>
-        <rect x="778" y="572" width="20" height="32" rx="7" fill="#d9ab7e"/>
-
-        <!-- 茶几 -->
-        <ellipse cx="702" cy="694" rx="116" ry="29" fill="#e4c298"/>
-        <ellipse cx="702" cy="686" rx="116" ry="29" fill="#f4d8b0"/>
-        <rect x="686" y="652" width="27" height="25" rx="8" fill="#fff7e8"/>
-
-        <!-- 落地灯 -->
-        <circle cx="201" cy="342" r="92" fill="url(#lampGlowB)" opacity="0.6"/>
-        <rect x="196" y="330" width="10" height="288" rx="5" fill="#d9ab7e"/>
-        <path d="M156 332 L246 332 L232 266 L170 266 Z" fill="#ffd9a0"/>
-        <ellipse cx="201" cy="622" rx="46" ry="12" fill="#e0bb90"/>
-
-        <!-- 盆栽 -->
-        <path d="M1270 642 L1308 704 L1232 704 Z" fill="#e8a97a"/>
-        <rect x="1256" y="702" width="48" height="42" rx="10" fill="#d99566"/>
-        <g fill="#9cc98b">
-            <ellipse cx="1282" cy="620" rx="27" ry="41" transform="rotate(-16 1282 620)"/>
-            <ellipse cx="1254" cy="638" rx="21" ry="33" transform="rotate(-42 1254 638)"/>
-            <ellipse cx="1310" cy="636" rx="21" ry="33" transform="rotate(26 1310 636)"/>
-        </g>
-    </svg>
-
-    <!-- ---------- 前景：柔光 ---------- -->
-    <svg class="room-layer" data-depth="1.7" viewBox="0 0 1600 900"
-         preserveAspectRatio="xMidYMid slice">
-        <ellipse cx="300" cy="890" rx="390" ry="120" fill="#fff5e2" opacity="0.48"/>
-        <ellipse cx="1400" cy="830" rx="230" ry="90" fill="#fff1da" opacity="0.34"/>
-    </svg>
-
+    <svg class="room-svg" id="roomSvg" xmlns="http://www.w3.org/2000/svg"></svg>
     <div class="room-vignette"></div>
 </div>
 
@@ -3540,6 +3785,33 @@
                 <!-- 被打时头顶转圈的小星星 -->
                 <div class="bt-stars"><span>⭐</span><span>✨</span><span>⭐</span></div>
 
+                <!-- ============================================================
+                     红酒杯（2026-11-01）
+                     ------------------------------------------------------------
+                     「从背后拿出红酒杯 → 倒酒 → 轻轻摇晃 → 放回背后」
+                     平时 display:none，只有 .is-wine 期间才登场，
+                     所以不占布局、也不影响其它动作。
+                     ============================================================ -->
+                <div class="bt-wine">
+                    <div class="bt-wine-bowl"><i class="bt-wine-liquid"></i></div>
+                    <div class="bt-wine-stem"></div>
+                    <div class="bt-wine-foot"></div>
+                </div>
+
+                <!-- ============================================================
+                     低电量散架（2026-11-01）
+                     ------------------------------------------------------------
+                     电量 < 10% 时整个人散开，零件掉一地。
+                     .bt-debris 里的每一块都对应机器人的一个部位，
+                     用不同的位移/旋转飞出，看起来像真散架。
+                     ============================================================ -->
+                <div class="bt-debris">
+                    <i class="db db-1"></i><i class="db db-2"></i>
+                    <i class="db db-3"></i><i class="db db-4"></i>
+                    <i class="db db-5"></i><i class="db db-6"></i>
+                    <i class="db db-7"></i><i class="db db-8"></i>
+                </div>
+
                 <div class="bt-shadow"></div>
                 <div class="bt-wheel l"></div>
                 <div class="bt-wheel r"></div>
@@ -3590,7 +3862,7 @@
            激光-地图匹配率（物理证据）+ σ（参考）+ 位姿稳定性
          用户不用再问"好了没"，也不用猜"看起来收敛了到底算不算"。
          ============================================================ -->
-    <div class="loc-bar is-hidden" id="locBar">
+    <div class="loc-bar" id="locBar">
         <div class="loc-head">
             <span class="loc-dot" id="locDot"></span>
             <span class="loc-title" id="locTitle">定位状态</span>
@@ -4346,15 +4618,30 @@
         const reason = document.getElementById('locReason');
         if (!bar) return;
 
-        // 没数据就隐藏（地图没载入 / auto_localizer 没跑）
-        if (!s || !s.state) { bar.classList.add('is-hidden'); return; }
+        // ★ 2026-11-01：没数据时不再隐藏，而是显示「定位未启动」。
+        //   原来的 is-hidden 让用户在还没载入地图时完全看不到这根条子，
+        //   以为功能丢了 —— 实际上是「还没开始」，应该明确说出来。
+        bar.classList.remove('is-hidden');
+
+        if (!s || !s.state) {
+            bar.classList.remove('is-ready', 'is-bad', 'is-pill');
+            dot.classList.remove('is-ready', 'is-bad', 'is-busy');
+            title.textContent = '定位未启动';
+            meta.textContent = '';
+            fill.style.width = '0%';
+            reason.textContent = '先在下方点「载入地图」，系统会自动开始定位';
+            reason.classList.add('is-on');
+            return;
+        }
 
         const ready = !!s.ready;
         const bad   = !!s.veto;
         const pct   = Math.round((s.progress || 0) * 100);
 
-        bar.classList.remove('is-hidden', 'is-ready', 'is-bad');
+        bar.classList.remove('is-ready', 'is-bad');
         dot.classList.remove('is-ready', 'is-bad', 'is-busy');
+        // 就绪 → 收缩成药丸；未就绪 → 展开显示进度和原因
+        bar.classList.toggle('is-pill', ready);
         if (ready) {
             bar.classList.add('is-ready');
             dot.classList.add('is-ready');
@@ -4410,12 +4697,13 @@
             return;
         }
         renderLocStatus(s);
-        // 5 秒没新数据就自动隐藏（auto_localizer 已退出）
+        // ★ 2026-11-01：原来是「5 秒没新数据就整条淡出」。现在改为常驻，
+        //   数据断了也不消失，而是退回「定位未启动」——用户随时能看到
+        //   定位到底在不在跑，不用猜。
         clearTimeout(locStatusTimer);
         locStatusTimer = setTimeout(() => {
-            const bar = document.getElementById('locBar');
-            if (bar) bar.classList.add('is-hidden');
-        }, 5000);
+            renderLocStatus(null);
+        }, 6000);
     });
 
     // ============================================================
@@ -4435,6 +4723,21 @@
     //
     // 分级阈值统一放在这里，改一处即可，不要在 HTML/CSS 里硬编码。
     // ============================================================
+    // Butler 与电量模块之间的解耦总线。
+    // ------------------------------------------------------------
+    // 为什么不直接调 Butler.setBattery()：
+    //   renderBattery() 在首屏会立即执行一次，而 `const Butler` 在那之后
+    //   才被求值 —— 直接引用会踩到 TDZ（ReferenceError）。
+    //   用一个提前声明的总线，双方都只依赖它，谁也不依赖谁的初始化顺序。
+    const BatteryBus = { pct: null, subs: [] };
+
+    function publishBattery(pct) {
+        BatteryBus.pct = pct;
+        for (let i = 0; i < BatteryBus.subs.length; i++) {
+            try { BatteryBus.subs[i](pct); } catch (e) { /* 单个订阅者出错不影响别人 */ }
+        }
+    }
+
     const BATTERY_LEVELS = { low: 20, mid: 50 };
 
     function renderBattery(percent) {
@@ -4456,6 +4759,7 @@
             fill.style.width = '0%';
             text.textContent = '--%';
             box.title = '电池电量未知（尚未收到 /battery_percent）';
+            publishBattery(null);
             return;
         }
 
@@ -4474,6 +4778,10 @@
         }
         box.classList.add(cls);
         box.title = hint + '（' + pct + '%）';
+
+        // 把电量同时也广播给管家机器人 —— 低于 10% 它会当场散架。
+        // 用总线而不是直接调 Butler，避免首屏 fetch 时 Butler 还在 TDZ 里。
+        publishBattery(pct);
     }
 
     socket.on('battery_status', (data) => {
@@ -5694,47 +6002,669 @@
     //   * 用户发消息 → 认可 → 思考；收到回复 → 开心
     //   * 后端 AI 主动调 butler_action 工具（socket 推送）→ 覆盖执行
     // ============================================================
+    // ============================================================
+    // 斜二轴测世界（2026-11-01）
+    // ------------------------------------------------------------
+    // 【为什么把背景换成「算出来的」而不是「画出来的」】
+    //   原来的背景是一张手绘透视 SVG + 4 层视差。问题是：
+    //     1) 家具位置只有画面上的像素，程序不知道桌子在哪，
+    //        所以做不了碰撞 —— 机器人可以直接从沙发上碾过去；
+    //     2) 只有横向位移有意义，前后纵深完全用不上。
+    //
+    // 【斜二轴测（cabinet / oblique axonometric）投影】
+    //   世界坐标 (x, y, z)：
+    //       x → 屏幕水平向右
+    //       y → 屏幕右上 45°（进深），这是关键：x 与 y 的夹角是 45°，
+    //           不是互相垂直
+    //       z → 屏幕垂直向上
+    //   投影公式（平行投影，无灭点，远近等大）：
+    //       sx = ox + (x + y·cos45°)·k
+    //       sy = oy − (y·cos45° + z)·k
+    //
+    //   好处：
+    //     · 沿 x 走 = 画面水平平移；沿 y 走 = 沿 45° 斜线平移；
+    //       两者叠加 = 任意方向的复合运动，且与背景家具的斜面同构，
+    //       永远不会出现「透视对不上」的穿帮。
+    //     · 家具用世界坐标 AABB 描述，碰撞检测也在世界坐标里做，
+    //       视觉和物理天然一致。
+    //
+    // 【为什么箱子只画三个面】
+    //   进深轴朝右上，所以一个立方体可见的正好是「正面 + 顶面 + 右侧面」，
+    //   三个面的投影恰好铺满整个轮廓，不会重叠。
+    //   正面用基础色、顶面提亮、右侧面压暗，就有了体积感。
+    // ============================================================
+    const World = (function () {
+        const C45 = Math.SQRT1_2;                  // cos45° = sin45° ≈ .7071
+
+        // 房间：x ∈ [-w/2, w/2]，y ∈ [0, d]，墙高 wallH
+        const ROOM = { w: 7.2, d: 4.4, wallH: 2.75 };
+
+        // 家具清单
+        //   x0 / y0 = 底面「前左角」    w = x 方向宽    d = y 方向进深
+        //   h = 高度      z0 = 离地高度（窗户挂在墙上）
+        //   layer：0 = 地板贴花（必须先画，否则会盖住站在上面的家具）
+        //   soft ：能挡住机器人，但撞上去不触发摔倒（地毯、窗户）
+        // ★ 布局原则（被实机验证打回过一次）：
+        //   地毯最初放在房间正中央、尺寸 2.64x1.48，加上 0.30 的碰撞半径后
+        //   几乎封死了整个中场 —— 机器人出生点就在地毯里，走一步就被挡住，
+        //   表现为「完全不动的假死」。
+        //   现在把地毯挪到沙发脚下（和沙发共用同一块区域，不额外占地方），
+        //   茶几往右后方挪，正面留出一条贯穿左右的空地当"跑道"。
+        const ITEMS = [
+            { id: 'rug', kind: 'rug', layer: 0, soft: true,
+              x0: -3.30, y0: 2.70, w: 2.45, d: 1.50, h: 0.02,
+              c: '#ffd6a6', name: '地毯' },
+            { id: 'window', kind: 'window', layer: 1, soft: true,
+              x0: -0.60, y0: 4.26, w: 2.45, d: 0.14, h: 1.45, z0: 0.62,
+              c: '#fff5dc', name: '窗户' },
+            { id: 'sofa', kind: 'sofa', layer: 1,
+              x0: -3.35, y0: 3.05, w: 2.35, d: 1.05, h: 0.80,
+              c: '#ffcf9f', name: '沙发' },
+            { id: 'plant', kind: 'plant', layer: 1,
+              x0: 2.88, y0: 3.18, w: 0.58, d: 0.58, h: 0.98,
+              c: '#d99566', name: '盆栽' },
+            { id: 'table', kind: 'table', layer: 1,
+              x0: 0.15, y0: 2.35, w: 1.30, d: 0.78, h: 0.46,
+              c: '#f0d3a8', name: '茶几' },
+        ];
+
+        // 机器人可达范围（世界坐标）。留 0.45 的边距，
+        // 免得它跑到墙里或者一半身子伸出地板外。
+        const BOUNDS = { x0: -3.10, x1: 3.10, y0: 0.45, y1: 3.95 };
+
+        let k = 100;          // 每个世界单位多少像素
+        let ox = 0, oy = 0;   // 世界原点 (0,0,0) 的屏幕位置
+        let svgEl = null;
+        const obstacles = [];
+
+        // ---------------- 投影与工具 ----------------
+
+        function proj(wx, wy, wz) {
+            return {
+                x: ox + (wx + wy * C45) * k,
+                y: oy - (wy * C45 + (wz || 0)) * k
+            };
+        }
+
+        // 按比例调亮/调暗一个 #rrggbb 颜色
+        function shade(hex, f) {
+            const n = parseInt(hex.slice(1), 16);
+            const r = Math.min(255, Math.round(((n >> 16) & 255) * f));
+            const g = Math.min(255, Math.round(((n >> 8) & 255) * f));
+            const b = Math.min(255, Math.round((n & 255) * f));
+            return 'rgb(' + r + ',' + g + ',' + b + ')';
+        }
+
+        function pts(list) {
+            let s = '';
+            for (let i = 0; i < list.length; i++) {
+                s += list[i].x.toFixed(1) + ',' + list[i].y.toFixed(1) + ' ';
+            }
+            return s.trim();
+        }
+
+        function poly(list, fill, extra) {
+            return '<polygon points="' + pts(list) + '" fill="' + fill + '"' +
+                   (extra || '') + '/>';
+        }
+
+        // ============================================================
+        // 圆角多边形（2026-11-01 重做）
+        // ------------------------------------------------------------
+        // 【为什么第一版那么丑 —— 根因是"全是硬角"】
+        //   第一版每个面都是 <polygon> + 1px 深色描边，所有棱线一根根
+        //   全露在外面，看起来像"用积木搭的纸盒"。沙发尤其惨：一张沙发
+        //   由 7 个方块拼成，7 个方块 × 3 个面 × 4 个直角 = 84 个尖角。
+        //   现实中的家具没有一个是纯直角的，圆角是把"廉价感"去掉的
+        //   最关键一步，比换配色、加贴图都有效。
+        //
+        // 【做法】把每个顶点沿两条邻边各退 r，再用二次贝塞尔连起来。
+        //   r 会被夹到「邻边长度的 1/2」，避免小面被圆角整个吃掉。
+        // ============================================================
+        function roundedPath(P, r) {
+            const n = P.length;
+            if (n < 3) return '';
+            if (!(r > 0.2)) {
+                let s = 'M';
+                for (let i = 0; i < n; i++) {
+                    s += (i ? 'L' : '') + P[i].x.toFixed(1) + ',' + P[i].y.toFixed(1);
+                }
+                return s + 'Z';
+            }
+            let d = '';
+            for (let i = 0; i < n; i++) {
+                const p0 = P[(i - 1 + n) % n], p1 = P[i], p2 = P[(i + 1) % n];
+                const v1x = p0.x - p1.x, v1y = p0.y - p1.y;
+                const v2x = p2.x - p1.x, v2y = p2.y - p1.y;
+                const l1 = Math.sqrt(v1x * v1x + v1y * v1y) || 1;
+                const l2 = Math.sqrt(v2x * v2x + v2y * v2y) || 1;
+                const rr = Math.min(r, l1 * 0.5, l2 * 0.5);
+                const ax = p1.x + (v1x / l1) * rr, ay = p1.y + (v1y / l1) * rr;
+                const bx = p1.x + (v2x / l2) * rr, by = p1.y + (v2y / l2) * rr;
+                d += (i === 0 ? 'M' : 'L') + ax.toFixed(1) + ',' + ay.toFixed(1) +
+                     'Q' + p1.x.toFixed(1) + ',' + p1.y.toFixed(1) +
+                     ' ' + bx.toFixed(1) + ',' + by.toFixed(1);
+            }
+            return d + 'Z';
+        }
+
+        // ============================================================
+        // 一个"面" = 底色 + 光影覆盖层
+        // ------------------------------------------------------------
+        // 【为什么要盖一层渐变】
+        //   纯平涂色块在轴测图里完全没有体积信息 —— 三个面只要颜色
+        //   稍有差别就能看出形状，但看不出一块面内部的明暗过渡，
+        //   于是整张图会显得"塑料片"。
+        //   覆盖层用 objectBoundingBox 坐标的白/黑半透明渐变，
+        //   与底色**无关**，所以同一批渐变可以被所有物体复用，
+        //   不必为每个家具单独生成 defs（否则 defs 会爆炸）。
+        // ============================================================
+        function face(list, color, overlay, r) {
+            const rad = (r === undefined) ? k * 0.05 : r;
+            const d = roundedPath(list, rad);
+            return '<path d="' + d + '" fill="' + color + '"/>' +
+                   (overlay ? '<path d="' + d + '" fill="url(#' + overlay + ')"/>' : '');
+        }
+
+        // ============================================================
+        // 圆角箱体：只画三个面
+        // ------------------------------------------------------------
+        // 进深轴朝右上，所以一个立方体可见的永远是
+        // 「正面 + 右侧面 + 顶面」，三者投影后正好铺满轮廓、互不重叠。
+        // 亮度约定（模拟天光自上而下）：
+        //   顶面最亮 1.14 → 正面 0.96 → 右侧面 0.78
+        // 再沿「顶面-正面」这条棱加一条细高光，物体轮廓立刻"立"起来。
+        // ============================================================
+        function box(x0, y0, w, d, z0, h, c, opt) {
+            if (!(w > 0) || !(d > 0) || !(h > 0)) return '';
+            opt = opt || {};
+            const rad = (opt.r === undefined ? 0.055 : opt.r) * k;
+            const x1 = x0 + w, y1 = y0 + d, z1 = z0 + h;
+            const A  = proj(x0, y0, z1), B = proj(x1, y0, z1);
+            const C  = proj(x1, y1, z1), D = proj(x0, y1, z1);
+            const A2 = proj(x0, y0, z0), B2 = proj(x1, y0, z0);
+            const C2 = proj(x1, y1, z0);
+
+            let o = '';
+            o += face([A2, B2, B, A], shade(c, 0.96), 'ogFront', rad);   // 正面
+            o += face([B2, C2, C, B], shade(c, 0.78), 'ogSide',  rad);   // 右侧面
+            o += face([A, B, C, D],   shade(c, 1.14), 'ogTop',   rad);   // 顶面
+
+            // 顶面与正面交界的细高光（opt.edge === false 可关掉）
+            if (opt.edge !== false) {
+                const ew = Math.max(0.9, k * 0.011);
+                o += '<path d="M' + A.x.toFixed(1) + ',' + A.y.toFixed(1) +
+                     'L' + B.x.toFixed(1) + ',' + B.y.toFixed(1) +
+                     '" fill="none" stroke="rgba(255,255,255,' +
+                     (opt.edgeA === undefined ? 0.5 : opt.edgeA) + ')" ' +
+                     'stroke-width="' + ew.toFixed(2) + '" stroke-linecap="round"/>';
+            }
+            return o;
+        }
+
+        // ============================================================
+        // 落地接触阴影
+        // ------------------------------------------------------------
+        // 家具和地板之间如果直接"切"在一起，会像贴纸一样浮着。
+        // 在物体脚下垫一个比它略大的径向渐变椭圆，物体自身会盖住中间，
+        // 只有边缘那一圈透出来 —— 看起来就是环境光遮蔽（AO）。
+        // 这是纯 SVG 下模拟"东西真的压在地上"最有效的一招。
+        // ============================================================
+        function contactShadow(it, strength) {
+            const cx = it.x0 + it.w / 2, cy = it.y0 + it.d / 2;
+            const p = proj(cx, cy, 0.002);
+            const rx = it.w * 0.64 * k;
+            const ry = Math.max(3, it.d * 0.64 * k * C45);
+            return '<ellipse cx="' + p.x.toFixed(1) + '" cy="' + p.y.toFixed(1) +
+                   '" rx="' + rx.toFixed(1) + '" ry="' + ry.toFixed(1) +
+                   '" fill="url(#softContact)" opacity="' +
+                   (strength === undefined ? 1 : strength) + '"/>';
+        }
+
+        // ---------------- 各类家具 ----------------
+
+        function drawRug(it) {
+            const x0 = it.x0, y0 = it.y0, x1 = x0 + it.w, y1 = y0 + it.d;
+            const m = 0.15;
+            const rad = k * 0.11;
+            return face([proj(x0, y0, 0.010), proj(x1, y0, 0.010),
+                         proj(x1, y1, 0.010), proj(x0, y1, 0.010)],
+                        '#f3c49d', 'ogFloor', rad) +
+                   face([proj(x0 + m, y0 + m, 0.015), proj(x1 - m, y0 + m, 0.015),
+                         proj(x1 - m, y1 - m, 0.015), proj(x0 + m, y1 - m, 0.015)],
+                        it.c, 'ogFloor', rad * 0.8);
+        }
+
+        function drawSofa(it) {
+            const x0 = it.x0, y0 = it.y0, w = it.w, d = it.d;
+            const x1 = x0 + w, y1 = y0 + d;
+            const armW = 0.30, backD = 0.33;
+            const base = 0.13;          // 底座高度（相当于"腿被藏起来了"）
+            let o = '';
+
+            // 1) 底座：四周内收，制造一圈缝隙阴影 → 显得整张沙发"架"起来
+            o += box(x0 + 0.10, y0 + 0.10, w - 0.20, d - 0.20, 0, base,
+                     '#d7a87c', { r: 0.06 });
+
+            // 2) 座体
+            o += box(x0, y0, w, d, base, 0.34, it.c, { r: 0.14 });
+
+            // 3) 靠背（贴后沿，比扶手高）
+            o += box(x0 + armW * 0.45, y1 - backD, w - armW * 0.9, backD,
+                     base, 0.67, shade(it.c, 1.02), { r: 0.14 });
+
+            // 4) 左右扶手
+            o += box(x0, y0, armW, d, base, 0.54, shade(it.c, 1.07), { r: 0.15 });
+            o += box(x1 - armW, y0, armW, d, base, 0.54, shade(it.c, 1.07), { r: 0.15 });
+
+            // 5) 两块坐垫（比座面高一点点）
+            const cw = (w - armW * 2) / 2 - 0.05;
+            o += box(x0 + armW + 0.05, y0 + 0.07, cw, d - backD - 0.12,
+                     base + 0.34, 0.10, '#ffe7cb', { r: 0.13 });
+            o += box(x0 + armW + cw + 0.10, y0 + 0.07, cw, d - backD - 0.12,
+                     base + 0.34, 0.10, '#ffe7cb', { r: 0.13 });
+
+            // 6) 两个靠枕，斜靠在背板上
+            o += box(x0 + armW + 0.13, y1 - backD - 0.22, 0.40, 0.20,
+                     base + 0.44, 0.26, '#fff2e0', { r: 0.12 });
+            o += box(x1 - armW - 0.53, y1 - backD - 0.22, 0.40, 0.20,
+                     base + 0.44, 0.26, '#fff2e0', { r: 0.12 });
+            return o;
+        }
+
+        function drawTable(it) {
+            const x0 = it.x0, y0 = it.y0, w = it.w, d = it.d, h = it.h;
+            const topH = 0.09, t = 0.085;
+            let o = '';
+            // 四条细腿
+            const lx = [x0 + 0.11, x0 + w - 0.11 - t];
+            const ly = [y0 + 0.11, y0 + d - 0.11 - t];
+            for (let i = 0; i < 2; i++) {
+                for (let j = 0; j < 2; j++) {
+                    o += box(lx[i], ly[j], t, t, 0, h - topH, '#dcb086',
+                             { r: 0.032, edge: false });
+                }
+            }
+            // 桌面
+            o += box(x0, y0, w, d, h - topH, topH, it.c, { r: 0.09 });
+            // 桌上的小杯子，让"这是桌子"一眼可辨
+            o += box(x0 + w * 0.28, y0 + d * 0.32, 0.15, 0.15, h, 0.13,
+                     '#fff8ec', { r: 0.05 });
+            return o;
+        }
+
+        function drawPlant(it) {
+            const cx = it.x0 + it.w / 2, cy = it.y0 + it.d / 2;
+            const potH = it.h * 0.33;
+            let o = '';
+            // 花盆（下窄上宽用两层叠出来）
+            o += box(it.x0 + 0.06, it.y0 + 0.06, it.w - 0.12, it.d - 0.12,
+                     0, potH * 0.92, shade(it.c, 0.94), { r: 0.07 });
+            o += box(it.x0 + 0.03, it.y0 + 0.03, it.w - 0.06, it.d - 0.06,
+                     potH * 0.86, potH * 0.16, it.c, { r: 0.07 });
+            // 叶子：由深到浅、由后到前
+            function leaf(dx, dy, zz, rx, ry, rot, col) {
+                const p = proj(cx + dx, cy + dy, zz);
+                return '<ellipse cx="' + p.x.toFixed(1) + '" cy="' + p.y.toFixed(1) +
+                       '" rx="' + (rx * k).toFixed(1) + '" ry="' + (ry * k).toFixed(1) +
+                       '" fill="' + col + '" transform="rotate(' + rot + ' ' +
+                       p.x.toFixed(1) + ' ' + p.y.toFixed(1) + ')"/>';
+            }
+            o += leaf(-0.12, 0.04, it.h * 0.58, 0.16, 0.28, -26, '#7cb066');
+            o += leaf( 0.14, 0.08, it.h * 0.54, 0.13, 0.23,  34, '#8ec078');
+            o += leaf( 0.01, -0.09, it.h * 0.78, 0.12, 0.21,  -5, '#a2cd8c');
+            o += leaf(-0.06, 0.01, it.h * 0.92, 0.10, 0.17,  -9, '#b9dca5');
+            return o;
+        }
+
+        function drawWindow(it) {
+            const x0 = it.x0, x1 = x0 + it.w;
+            const yy = it.y0 + it.d;                 // 贴在最后面的墙面上
+            const z0 = it.z0 || 0.6, z1 = z0 + it.h;
+            // ★ 后墙是「y = 常数」的平面，在这上面 x 映射到水平、z 映射到垂直，
+            //   所以矩形投影后仍然是矩形（不会被剪切）—— 直接算两个对角点即可。
+            const tl = proj(x0, yy, z1);
+            const br = proj(x1, yy, z0);
+            const wpx = br.x - tl.x, hpx = br.y - tl.y;
+            const mid = proj((x0 + x1) / 2, yy, (z0 + z1) / 2);
+            const rad = Math.max(3, wpx * 0.07);
+
+            let o = '';
+            // 窗外透进来的光（房间变亮的主要来源）
+            o += '<ellipse cx="' + mid.x.toFixed(1) + '" cy="' + mid.y.toFixed(1) +
+                 '" rx="' + (it.w * k * 0.78).toFixed(1) +
+                 '" ry="' + (it.h * k * 0.72).toFixed(1) +
+                 '" fill="url(#winGlow)"/>';
+
+            // 玻璃（圆角）
+            const gd = roundedPath([
+                { x: tl.x, y: tl.y },
+                { x: tl.x + wpx, y: tl.y },
+                { x: tl.x + wpx, y: tl.y + hpx },
+                { x: tl.x, y: tl.y + hpx }
+            ], rad);
+            o += '<path d="' + gd + '" fill="' + it.c + '"/>';
+            o += '<path d="' + gd + '" fill="url(#ogTop)"/>';
+
+            // 窗外：太阳 + 云
+            o += '<circle cx="' + (tl.x + wpx * 0.63).toFixed(1) +
+                 '" cy="' + (tl.y + hpx * 0.29).toFixed(1) +
+                 '" r="' + (wpx * 0.085).toFixed(1) + '" fill="#ffdf85" opacity=".9"/>';
+            o += '<g fill="#fffaf1" opacity=".9">' +
+                 '<ellipse cx="' + (tl.x + wpx * 0.27).toFixed(1) + '" cy="' + (tl.y + hpx * 0.35).toFixed(1) + '" rx="' + (wpx * 0.105).toFixed(1) + '" ry="' + (hpx * 0.05).toFixed(1) + '"/>' +
+                 '<ellipse cx="' + (tl.x + wpx * 0.36).toFixed(1) + '" cy="' + (tl.y + hpx * 0.29).toFixed(1) + '" rx="' + (wpx * 0.07).toFixed(1) + '" ry="' + (hpx * 0.042).toFixed(1) + '"/>' +
+                 '</g>';
+
+            // 窗棂
+            const mw = Math.max(2, k * 0.026);
+            o += '<path d="M' + (tl.x + wpx / 2).toFixed(1) + ',' + tl.y.toFixed(1) +
+                 'L' + (tl.x + wpx / 2).toFixed(1) + ',' + (tl.y + hpx).toFixed(1) +
+                 'M' + tl.x.toFixed(1) + ',' + (tl.y + hpx / 2).toFixed(1) +
+                 'L' + (tl.x + wpx).toFixed(1) + ',' + (tl.y + hpx / 2).toFixed(1) +
+                 '" fill="none" stroke="#eedcc2" stroke-width="' + mw.toFixed(1) + '"/>';
+
+            // 窗框（圆角，比玻璃略大一圈）
+            const fw = Math.max(2.5, k * 0.032);
+            o += '<path d="' + gd + '" fill="none" stroke="#efdcc0" ' +
+                 'stroke-width="' + (fw * 2).toFixed(1) + '"/>';
+
+            // 窗台
+            o += '<rect x="' + (tl.x - wpx * 0.04).toFixed(1) +
+                 '" y="' + (tl.y + hpx).toFixed(1) +
+                 '" width="' + (wpx * 1.08).toFixed(1) +
+                 '" height="' + Math.max(4, k * 0.045).toFixed(1) +
+                 '" rx="' + (Math.max(2, k * 0.02)).toFixed(1) + '" fill="#f0dcbd"/>';
+            return o;
+        }
+
+        // ---------------- 房间本体 ----------------
+
+        function drawRoom() {
+            const HW = ROOM.w / 2, D = ROOM.d, WH = ROOM.wallH;
+
+            let o = '';
+            // 背景（后墙以外的区域统一刷成墙面色）
+            o += '<rect x="0" y="0" width="100%" height="100%" fill="url(#wallGrad)"/>';
+
+            // 左墙：x = -HW 的平面。它在这条斜边的"上方"，
+            // 因为进深轴朝右上，左边这面墙的远端被拉到右边，
+            // 所以墙面朝向观察者，是可见的那一面。
+            // ★ 墙面用平涂但叠一层光影渐变：三面墙都不再用描边，
+            //   改成靠"面与面之间的明度差"分界 —— 描边会让整个房间
+            //   像线稿，而明度差看起来才是光打出来的。
+            o += face([proj(-HW, 0, 0), proj(-HW, D, 0),
+                       proj(-HW, D, WH), proj(-HW, 0, WH)],
+                      '#f2e0c6', 'ogSide', 0);
+
+            // 后墙：y = D 的平面
+            o += face([proj(-HW, D, 0), proj(HW, D, 0),
+                       proj(HW, D, WH), proj(-HW, D, WH)],
+                      '#fbf2e6', 'ogFront', 0);
+
+            // 地板（比墙略暖、略暗，才不会让房间"发白"）
+            o += face([proj(-HW, 0, 0), proj(HW, 0, 0),
+                       proj(HW, D, 0), proj(-HW, D, 0)],
+                      '#f7e6cb', 'ogTop', 0);
+
+            // 地板缝：等 y 的线（平行于 x 轴）+ 等 x 的线（沿 45° 进深轴）
+            // ★ 透明度从 0.55 降到 0.3，越靠后的线越淡（模拟远处的雾化），
+            //   这样地板看起来是"延伸出去"的，而不是一张网格纸。
+            let g = '<g stroke="#e3c8a2" stroke-width="1" fill="none">';
+            for (let y = 0.8; y < D; y += 0.8) {
+                const a = (0.34 * (1 - (y / D) * 0.7)).toFixed(2);
+                g += '<line opacity="' + a + '" x1="' + proj(-HW, y, 0).x.toFixed(1) +
+                     '" y1="' + proj(-HW, y, 0).y.toFixed(1) +
+                     '" x2="' + proj(HW, y, 0).x.toFixed(1) +
+                     '" y2="' + proj(HW, y, 0).y.toFixed(1) + '"/>';
+            }
+            for (let x = -HW + 0.9; x < HW; x += 0.9) {
+                const a = (0.30 * (1 - (Math.abs(x) / HW) * 0.45)).toFixed(2);
+                g += '<line opacity="' + a + '" x1="' + proj(x, 0, 0).x.toFixed(1) +
+                     '" y1="' + proj(x, 0, 0).y.toFixed(1) +
+                     '" x2="' + proj(x, D, 0).x.toFixed(1) +
+                     '" y2="' + proj(x, D, 0).y.toFixed(1) + '"/>';
+            }
+            g += '</g>';
+            o += g;
+
+            // ============================================================
+            // 窗户投在地板上的光斑（2026-11-01）
+            // ------------------------------------------------------------
+            // 【为什么这一块能顶一大截效果】
+            //   上一版的问题不只是"棱角多"，更是"房间不像有光源"——
+            //   一整面墙都是同一个亮度，谁也不信这屋里开了盏灯。
+            //   从窗户往房间里投一块梯形光斑（越远越淡），
+            //   观众立刻就能读出"光从这个窗口进来"，立体感立刻就有了。
+            //   成本只是一条渐变多边形，比加任何贴图都便宜。
+            // ============================================================
+            const win = ITEMS.filter(function (x) { return x.kind === 'window'; })[0];
+            if (win) {
+                const wx0 = win.x0 - 0.35, wx1 = win.x0 + win.w + 0.35;
+                const yBack = win.y0, yFront = 1.05;
+                o += face([proj(wx0, yFront, 0.004), proj(wx1, yFront, 0.004),
+                           proj(wx1 - 0.25, yBack, 0.004),
+                           proj(wx0 + 0.25, yBack, 0.004)],
+                          '#fff3cd', 'ogSun', 0);
+            }
+
+            // 后墙 + 左墙的踢脚线（用圆角矩形而不是硬多边形）
+            o += face([proj(-HW, D, 0), proj(HW, D, 0),
+                       proj(HW, D, 0.13), proj(-HW, D, 0.13)], '#ecdcc0', 'ogFront', 0);
+            o += face([proj(-HW, 0, 0), proj(-HW, D, 0),
+                       proj(-HW, D, 0.13), proj(-HW, 0, 0.13)], '#e6d3b4', 'ogSide', 0);
+            return o;
+        }
+
+        // ---------------- 组装 ----------------
+
+        function rebuild() {
+            if (!svgEl) svgEl = document.getElementById('roomSvg');
+            if (!svgEl) return;
+
+            // 碰撞盒（世界坐标）：直接由家具的世界 AABB 得来，
+            // 和画面完全一致，不会出现「看着没碰到却撞了」。
+            obstacles.length = 0;
+            for (let i = 0; i < ITEMS.length; i++) {
+                const it = ITEMS[i];
+                obstacles.push({
+                    x0: it.x0, x1: it.x0 + it.w,
+                    y0: it.y0, y1: it.y0 + it.d,
+                    soft: !!it.soft, name: it.name
+                });
+            }
+
+            // 绘制顺序 = 画家算法：地板贴花最先，其余按进深 y 从大到小
+            // （y 越大越远，先画才不会被近处物体盖住）
+            const order = ITEMS.slice().sort(function (a, b) {
+                const la = (a.layer === undefined ? 1 : a.layer);
+                const lb = (b.layer === undefined ? 1 : b.layer);
+                if (la !== lb) return la - lb;
+                return b.y0 - a.y0;
+            });
+
+            let body = '';
+            for (let i = 0; i < order.length; i++) {
+                const it = order[i];
+                let art = '';
+                if (it.kind === 'rug') art = drawRug(it);
+                else if (it.kind === 'sofa') art = drawSofa(it);
+                else if (it.kind === 'table') art = drawTable(it);
+                else if (it.kind === 'plant') art = drawPlant(it);
+                else if (it.kind === 'window') art = drawWindow(it);
+                if (!art) continue;
+
+                // 地毯贴在地板上、窗户嵌在墙里 —— 这两样不加投影，
+                // 加了会显得“飘在房间外面”。
+                if (it.kind !== 'rug' && it.kind !== 'window') {
+                    body += contactShadow(it, it.kind === 'plant' ? 0.85 : 1);
+                    body += '<g filter="url(#softShadow)">' + art + '</g>';
+                } else {
+                    body += art;
+                }
+            }
+
+            const defs =
+                '<defs>' +
+                  /* 墙面环境光：整体从顶部亮到底部略暖 */
+                  '<radialGradient id="wallGrad" cx="50%" cy="8%" r="96%">' +
+                    '<stop offset="0%" stop-color="#fffcf7"/>' +
+                    '<stop offset="100%" stop-color="#f2e0c8"/>' +
+                  '</radialGradient>' +
+                  /* 窗户漏进来的光（椭圆光晕） */
+                  '<radialGradient id="winGlow" cx="50%" cy="50%" r="50%">' +
+                    '<stop offset="0%" stop-color="#ffe9b0" stop-opacity=".8"/>' +
+                    '<stop offset="55%" stop-color="#ffe9b0" stop-opacity=".28"/>' +
+                    '<stop offset="100%" stop-color="#ffe9b0" stop-opacity="0"/>' +
+                  '</radialGradient>' +
+                  /* 接触阴影：物体脚下的 AO，中间深、边缘渐隐 */
+                  '<radialGradient id="softContact" cx="50%" cy="50%" r="50%">' +
+                    '<stop offset="0%" stop-color="#8a5f39" stop-opacity=".30"/>' +
+                    '<stop offset="58%" stop-color="#8a5f39" stop-opacity=".13"/>' +
+                    '<stop offset="100%" stop-color="#8a5f39" stop-opacity="0"/>' +
+                  '</radialGradient>' +
+                  /* ---- 面光影：用 objectBoundingBox，与底色无关，可全局复用 ---- */
+                  '<linearGradient id="ogTop" x1="0" y1="0" x2=".55" y2="1">' +
+                    '<stop offset="0%" stop-color="#fff" stop-opacity=".52"/>' +
+                    '<stop offset="100%" stop-color="#fff" stop-opacity="0"/>' +
+                  '</linearGradient>' +
+                  '<linearGradient id="ogFront" x1="0" y1="0" x2="0" y2="1">' +
+                    '<stop offset="0%" stop-color="#fff" stop-opacity=".26"/>' +
+                    '<stop offset="42%" stop-color="#fff" stop-opacity="0"/>' +
+                    '<stop offset="100%" stop-color="#000" stop-opacity=".10"/>' +
+                  '</linearGradient>' +
+                  '<linearGradient id="ogSide" x1="0" y1="0" x2="1" y2=".35">' +
+                    '<stop offset="0%" stop-color="#000" stop-opacity=".17"/>' +
+                    '<stop offset="100%" stop-color="#000" stop-opacity="0"/>' +
+                  '</linearGradient>' +
+                  '<linearGradient id="ogFloor" x1="0" y1="0" x2=".4" y2="1">' +
+                    '<stop offset="0%" stop-color="#fff" stop-opacity=".20"/>' +
+                    '<stop offset="100%" stop-color="#fff" stop-opacity="0"/>' +
+                  '</linearGradient>' +
+                  /* 窗户投在地板上的光斑：从窗口往房间内渐隐 */
+                  '<linearGradient id="ogSun" x1="0" y1="0" x2=".12" y2="1">' +
+                    '<stop offset="0%" stop-color="#fff3cd" stop-opacity=".62"/>' +
+                    '<stop offset="45%" stop-color="#fff3cd" stop-opacity=".28"/>' +
+                    '<stop offset="100%" stop-color="#fff3cd" stop-opacity="0"/>' +
+                  '</linearGradient>' +
+                  /* 整件家具的软投影（比逐个面画阴影便宜得多，且不会互相叠加变脏） */
+                  '<filter id="softShadow" x="-45%" y="-45%" width="190%" height="190%">' +
+                    '<feDropShadow dx="0" dy="' + (k * 0.045).toFixed(1) + '" ' +
+                                   'stdDeviation="' + (k * 0.05).toFixed(1) + '" ' +
+                                   'flood-color="#8a5f39" flood-opacity="0.15"/>' +
+                  '</filter>' +
+                '</defs>';
+
+            svgEl.innerHTML = defs + drawRoom() + body;
+        }
+
+        function layout() {
+            const vw = window.innerWidth || 390;
+            const vh = window.innerHeight || 844;
+            const spanW = ROOM.w + ROOM.d * C45;
+            const spanH = ROOM.d * C45;
+
+            // k 同时受「地板宽度别超屏太多」和「地板高度别占满屏」约束
+            let kk = Math.min(vw * 1.36 / spanW, vh * 0.50 / spanH);
+            k = Math.max(24, Math.min(kk, 190));
+
+            // 让地板在水平方向居中：地板中心在世界 (0, d/2)
+            ox = vw * 0.5 - (ROOM.d * C45 * 0.5) * k;
+            // 地板前沿（y = 0）落在屏幕 86% 高度处
+            oy = vh * 0.86;
+
+            rebuild();
+        }
+
+        // 机器人基准图 120x172，折成世界高度约 1.45 单位
+        function botScale() {
+            const s = (1.45 * k) / 172;
+            return Math.max(0.40, Math.min(s, 1.0));
+        }
+
+        return {
+            proj: proj,
+            layout: layout,
+            botScale: botScale,
+            obstacles: obstacles,
+            bounds: BOUNDS,
+            room: ROOM,
+            items: ITEMS
+        };
+    })();
+
+    // ============================================================
+    // 管家机器人（纯 CSS 部件 + 动作系统）
+    // ------------------------------------------------------------
+    // 职责分三层：
+    //   1) 移动层  —— 世界坐标 (x, y) + 每帧投影到屏幕
+    //   2) 动作层  —— play(name) 给 .butler-unit 加 is-xxx 类
+    //   3) 说话层  —— say(text) 头顶气泡
+    //
+    // 谁来驱动：
+    //   * 本地待机轮换（默认，0 成本，不调 LLM）
+    //   * 用户发消息 → 认可 → 思考；收到回复 → 开心
+    //   * 后端 AI 主动调 butler_action 工具（socket 推送）→ 覆盖执行
+    //   * 撞到家具 → 偶尔摔倒；电量 < 10% → 散架
+    // ============================================================
     const Butler = (function () {
         const ACTIONS = [
             'idle', 'happy', 'approve', 'deny', 'think', 'scratch',
-            'wave', 'listen',
+            'wave', 'listen', 'fall', 'bump', 'wine',
         ];
         // 待机时可以随机抽到的动作（idle 除外）
-        const IDLE_POOL = ['happy', 'think', 'scratch', 'deny', 'wave', 'listen'];
+        const IDLE_POOL = ['happy', 'think', 'scratch', 'deny', 'wave', 'listen', 'wine'];
 
-        let stage = null;
-        let unit = null;
-        let bubble = null;
-        let ouch = null;
+        const BOT_W = 120;        // 基准图宽
+        const BOT_H = 172;        // 基准图高
+        const SPEED = 0.95;       // 每秒走多少世界单位
+        const RADIUS = 0.30;      // 机器人碰撞半径
+        const LOW_BATTERY = 10;   // 低于这个电量就散架
+
+        let stage = null, unit = null, bubble = null, ouch = null;
+        let scaleEl = null;
         let ready = false;
 
         let actionTimer = null;
         let bubbleTimer = null;
         let idleTimer = null;
-        let walkTimer = null;
         let ouchTimer = null;
         let busyUntil = 0;
 
-        let curPct = 0.06;      // 当前横向位置（0~1，占可用宽度）
-        let minPct = 0.04;
-        let maxPct = 0.46;
+        // ---- 世界状态 ----
+        let bx = 0.0, by = 1.15;      // 当前世界坐标（正面空地上，不在任何家具里）
+        let tgtX = bx, tgtY = by;     // 目标世界坐标
+        let walking = false;
+        let rafId = null, lastTs = 0;
+        let ghostTick = 0;
+
+        // ---- 摔倒节流：撞 3~5 次才摔 1 次 ----
+        let hitsSinceFall = 0;
+        let fallEvery = 3 + Math.floor(Math.random() * 3);
+
+        // ---- 电量 ----
+        let broken = false;           // 散架后不再做任何待机动作
 
         const OUCH_LINES = [
             '哎哟！', '别打啦！', '我做错什么了…', '疼疼疼！',
             '抗议暴力！', '再打我要涨价了', '呜…', '手下留情！',
         ];
 
+        const FALL_LINES = [
+            '哎——呀！', '撞到啦…', '我的腰！', '这桌子怎么在这儿…',
+            '扶我一把…', '眼冒金星…',
+        ];
+
+        const GREETINGS = [
+            '需要我做什么吗？',
+            '我在呢～',
+            '随时听候差遣',
+            '要四处看看吗？',
+            '房间已经就绪啦',
+        ];
+
         function $(id) { return document.getElementById(id); }
 
-        // 手机端 .butler-scale 是 0.74，量宽度要乘回去
-        function scaleFactor() {
-            const sc = stage && stage.querySelector('.butler-scale');
-            if (!sc) return 1;
-            const t = getComputedStyle(sc).transform;
-            if (!t || t === 'none') return 1;
-            const m = t.match(/matrix\(([-\d.]+)/);
-            return m ? Math.abs(parseFloat(m[1])) : 1;
-        }
+        // ---------------- 初始化 ----------------
 
         function init() {
             stage = $('butlerStage');
@@ -5742,9 +6672,13 @@
             bubble = $('butlerBubble');
             ouch = $('butlerOuch');
             if (!stage || !unit) return false;
+            scaleEl = stage.querySelector('.butler-scale');
             ready = true;
-            layoutLimits();
-            window.addEventListener('resize', layoutLimits);
+
+            window.addEventListener('resize', function () {
+                World.layout();
+                render();
+            });
 
             // 点机器人 = 打它一下
             unit.addEventListener('pointerdown', function (e) {
@@ -5754,38 +6688,109 @@
             unit.addEventListener('contextmenu', function (e) {
                 e.preventDefault();
             });
+
+            BatteryBus.subs.push(onBattery);
+
+            render();
+            startLoop();
             return true;
         }
 
-        // 走动范围：宽屏只占左半，避免挡中间的对话；窄屏放宽
-        function layoutLimits() {
-            const narrow = window.innerWidth <= 900;
-            minPct = 0.02;
-            if (narrow) {
-                maxPct = 0.5;
-            } else {
-                // 尽量停在对话列左侧之外，既不遮文也方便点
-                const col = document.querySelector('.chat-column');
-                const colLeft = col ? col.getBoundingClientRect().left : window.innerWidth;
-                const w = (stage ? stage.offsetWidth : 120) * scaleFactor();
-                const room = Math.max(0, colLeft - w - 24);
-                maxPct = room > 90
-                    ? Math.min(0.9, room / Math.max(1, window.innerWidth - w - 16))
-                    : 0.4;
+        // ---------------- 位置与投影 ----------------
+
+        function render() {
+            if (!stage) return;
+            const sc = World.botScale();
+            const feet = World.proj(bx, by, 0);
+            // 缩放原点在 50% 100%（脚底中心），所以缩放不会移动这个点
+            stage.style.transform =
+                'translate3d(' + (feet.x - BOT_W / 2).toFixed(1) + 'px,' +
+                                 (feet.y - BOT_H).toFixed(1) + 'px,0)';
+            if (scaleEl) {
+                scaleEl.style.transform = 'scale(' + sc.toFixed(3) + ')';
             }
-            place(curPct);
         }
 
-        function place(pct) {
-            if (!stage) return;
-            const w = (stage.offsetWidth || 120) * scaleFactor();
-            const usable = Math.max(0, window.innerWidth - w - 14);
-            const x = 7 + usable * Math.max(minPct, Math.min(maxPct, pct));
-            stage.style.transform = 'translateX(' + x.toFixed(1) + 'px)';
+        function startLoop() {
+            if (rafId !== null) return;
+            lastTs = 0;
+            rafId = requestAnimationFrame(loop);
         }
+
+        function stopLoop() {
+            if (rafId !== null) {
+                cancelAnimationFrame(rafId);
+                rafId = null;
+            }
+        }
+
+        function loop(ts) {
+            rafId = requestAnimationFrame(loop);
+            if (!lastTs) lastTs = ts;
+            let dt = (ts - lastTs) / 1000;
+            lastTs = ts;
+            // 标签页切回来时 dt 会很大，夹住避免"瞬移穿过家具"
+            if (dt > 0.10) dt = 0.10;
+            if (dt <= 0) return;
+
+            if (walking && !broken) stepMove(dt);
+            render();
+
+            // 遮挡检测比较贵，每 6 帧做一次（约 10Hz）足够
+            if (++ghostTick % 6 === 0) updateGhost();
+        }
+
+        // 返回该世界坐标点上的碰撞体；没有则返回 null
+        function firstHit(x, y) {
+            const B = World.bounds;
+            if (x < B.x0 || x > B.x1 || y < B.y0 || y > B.y1) {
+                return { name: '墙', soft: false };
+            }
+            const obs = World.obstacles;
+            for (let i = 0; i < obs.length; i++) {
+                const o = obs[i];
+                if (x > o.x0 - RADIUS && x < o.x1 + RADIUS &&
+                    y > o.y0 - RADIUS && y < o.y1 + RADIUS) {
+                    return o;
+                }
+            }
+            return null;
+        }
+
+        function stepMove(dt) {
+            const dx = tgtX - bx, dy = tgtY - by;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist < 0.035) { stopWalk(); return; }
+
+            const v = Math.min(SPEED * dt, dist);
+            // 复合运动：x 与 y 同时推进，屏幕上就是一条任意方向的斜线
+            const nx = bx + (dx / dist) * v;
+            const ny = by + (dy / dist) * v;
+
+            const hit = firstHit(nx, ny);
+            if (hit) {
+                // 物理隔离：撞到就停住，不再前进
+                stopWalk();
+                onCollide(hit);
+                return;
+            }
+            bx = nx;
+            by = ny;
+        }
+
+        function stopWalk() {
+            walking = false;
+            if (unit) {
+                unit.classList.remove('is-walking');
+                unit.classList.remove('walk-right');
+            }
+        }
+
+        // ---------------- 动作 ----------------
 
         function play(name, holdMs) {
             if (!ready) return;
+            if (broken && name !== 'idle') return;   // 散架了不响应任何动作
             if (ACTIONS.indexOf(name) < 0) name = 'idle';
             clearTimeout(actionTimer);
             // 一次只留一个动作类，避免「点头 + 挥手」这种矛盾叠加
@@ -5821,35 +6826,91 @@
             }, holdMs || 4200);
         }
 
-        function walkOnce() {
-            if (!ready || document.hidden) return;
-            const next = minPct + Math.random() * (maxPct - minPct);
-            // 距离越远走得越久，节奏自然些
-            const dist = Math.abs(next - curPct);
-            const dur = 2200 + dist * 9000;
-            const goingRight = next > curPct;
+        // ---------------- 走动 ----------------
 
-            // 速度线方向：向右走 → 线拖在左边（默认在左），
-            // 向左走 → 翻到右边。CSS 里用 walk-right 做镜像。
-            unit.classList.toggle('walk-right', goingRight);
-            stage.style.transitionDuration = (dur / 1000).toFixed(2) + 's';
-            unit.classList.add('is-walking');
-            curPct = next;
-            place(curPct);
+        // 在可达范围里随机找一个不撞家具的点
+        // ------------------------------------------------------------
+        // ★ 为什么要有「故意挑一条会被挡住的路线」：
+        //   如果每次都只挑直线走得通的点，机器人永远撞不到任何家具，
+        //   「撞到 → 摔倒」这套动作就再也不会被看到 —— 功能等于没做。
+        //   所以留 30% 的概率故意选一条半路会被挡住的路线：
+        //   走过去、被挡停、触发一次轻撞（bump），累计 3~5 次才摔一次。
+        function pickTarget() {
+            const B = World.bounds;
+            const wantBump = Math.random() < 0.30;
+            let clearPick = null, blockedPick = null;
 
-            clearTimeout(walkTimer);
-            walkTimer = setTimeout(function () {
-                if (unit) {
-                    unit.classList.remove('is-walking');
-                    unit.classList.remove('walk-right');
+            for (let i = 0; i < 40; i++) {
+                const x = B.x0 + Math.random() * (B.x1 - B.x0);
+                const y = B.y0 + Math.random() * (B.y1 - B.y0);
+                if (firstHit(x, y)) continue;              // 目标点本身在家具里
+                if (pathClear(x, y)) {
+                    if (!clearPick) clearPick = { x: x, y: y };
+                    if (!wantBump) return { x: x, y: y };  // 想走顺路，立刻采用
+                } else if (!blockedPick) {
+                    blockedPick = { x: x, y: y };
                 }
-            }, dur);
+            }
+            if (wantBump) return blockedPick || clearPick;
+            return clearPick || blockedPick;
         }
 
-        // ---- 点一下 = 打它（夸张动画 + 吐槽台词）----
+        // 沿直线采样，检查从当前位置走到 (x1,y1) 中途是否会被家具挡住
+        function pathClear(x1, y1) {
+            const dx = x1 - bx, dy = y1 - by;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            const steps = Math.max(2, Math.ceil(dist / 0.10));
+            for (let i = 1; i <= steps; i++) {
+                const t = i / steps;
+                if (firstHit(bx + dx * t, by + dy * t)) return false;
+            }
+            return true;
+        }
+
+        function walkOnce() {
+            if (!ready || document.hidden || broken) return;
+            const t = pickTarget();
+            if (!t) return;
+            if (Math.abs(t.x - bx) + Math.abs(t.y - by) < 0.55) return;  // 太近不值得走
+
+            // 屏幕上的水平方向决定速度线朝向
+            const screenDx = (t.x - bx) + (t.y - by) * Math.SQRT1_2;
+            unit.classList.toggle('walk-right', screenDx > 0);
+            unit.classList.add('is-walking');
+            tgtX = t.x;
+            tgtY = t.y;
+            walking = true;
+            // ★ 这里不要设 busyUntil：走路是否结束由 walking 标志决定。
+            //   设了反而会在被中途挡停后留下一个很远的"忙"时间戳，
+            //   把后面一串待机动作全部压掉。
+        }
+
+        // ---------------- 碰撞 → 摔倒 ----------------
+
+        function onCollide(o) {
+            busyUntil = Date.now() + 1500;
+            // 地毯、窗户是软障碍：能挡住但不算"撞疼了"
+            if (o && o.soft) { play('bump', 620); return; }
+
+            hitsSinceFall++;
+            if (hitsSinceFall >= fallEvery) {
+                hitsSinceFall = 0;
+                fallEvery = 3 + Math.floor(Math.random() * 3);
+                doFall();
+            } else {
+                play('bump', 620);
+            }
+        }
+
+        function doFall() {
+            play('fall', 2100);
+            busyUntil = Date.now() + 2500;
+            say(FALL_LINES[Math.floor(Math.random() * FALL_LINES.length)], 2300);
+        }
+
+        // 点一下 = 打它（夸张动画 + 吐槽台词）
         function hit() {
-            if (!ready) return;
-            // 连点也每次都重新触发：先摘类、强制重排、再加回来
+            if (!ready || broken) return;
             unit.classList.remove('is-hit');
             void unit.offsetWidth;
             unit.classList.add('is-hit');
@@ -5872,21 +6933,94 @@
             }, 980);
         }
 
-        // 待机：每隔几秒换个动作；偶尔走到别处；偶尔打个招呼
+        // ---------------- 遮挡保护 ----------------
+
+        // 机器人 z-index 高于对话（否则点不到），所以走动时可能盖住气泡。
+        // 一旦重叠就整体降到 34% 不透明度 + 轻微模糊，气泡内容仍清晰可读。
+        function updateGhost() {
+            if (!stage || !unit || !ready) return;
+            const r = unit.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) return;
+
+            let overlap = false;
+            const nodes = document.querySelectorAll('.msg-bubble');
+            for (let i = 0; i < nodes.length; i++) {
+                const b = nodes[i].getBoundingClientRect();
+                if (b.width === 0 || b.height === 0) continue;
+                if (b.bottom < 0 || b.top > window.innerHeight) continue;
+                if (r.left < b.right && r.right > b.left &&
+                    r.top < b.bottom && r.bottom > b.top) {
+                    overlap = true;
+                    break;
+                }
+            }
+            stage.classList.toggle('is-ghost', overlap);
+        }
+
+        // ---------------- 低电量散架 ----------------
+
+        function onBattery(pct) {
+            if (pct === null || pct === undefined) return;
+            const p = Number(pct);
+            if (!isFinite(p)) return;
+            if (p < LOW_BATTERY && !broken) collapse();
+            else if (p >= LOW_BATTERY && broken) recover();
+        }
+
+        function collapse() {
+            broken = true;
+            stopWalk();
+            clearTimeout(idleTimer);
+            clearTimeout(actionTimer);
+            if (bubble) bubble.classList.remove('is-show');
+            ACTIONS.forEach(function (a) {
+                if (a !== 'idle') unit.classList.remove('is-' + a);
+            });
+            void unit.offsetWidth;
+            unit.classList.add('is-collapse');
+            setTimeout(function () {
+                if (!unit) return;
+                unit.classList.remove('is-collapse');
+                unit.classList.add('is-broken');
+            }, 1150);
+            busyUntil = Date.now() + 3600000;   // 无限期不做事
+            say('没电了…我先散一会儿…', 4600);
+        }
+
+        function recover() {
+            if (!broken) return;
+            broken = false;
+            unit.classList.remove('is-broken', 'is-collapse');
+            void unit.offsetWidth;
+            busyUntil = Date.now() + 1400;
+            unit.classList.add('is-approve');
+            setTimeout(function () {
+                if (unit) unit.classList.remove('is-approve');
+            }, 1300);
+            say('电量回来了，组装完成！', 3600);
+            scheduleIdle();
+        }
+
+        // ---------------- 待机轮换 ----------------
+
         function scheduleIdle() {
             clearTimeout(idleTimer);
-            const delay = 5200 + Math.random() * 5200;
+            // 2026-11-01 用户要求「略微提高待机动作的执行频率」：
+            // 原来是 5.2~10.4s，现在 3.6~6.8s，观感更"活"但不至于手忙脚乱。
+            const delay = 3600 + Math.random() * 3200;
             idleTimer = setTimeout(function () {
                 if (!ready || document.hidden) { scheduleIdle(); return; }
-                // 正在被用户交互占用时不抢动作
+                if (broken) { scheduleIdle(); return; }
+                if (walking) { scheduleIdle(); return; }        // 别打断走路
                 if (Date.now() < busyUntil) { scheduleIdle(); return; }
 
                 const roll = Math.random();
-                if (roll < 0.42) {
+                if (roll < 0.40) {
                     walkOnce();
-                } else if (roll < 0.92) {
+                } else if (roll < 0.93) {
                     const act = IDLE_POOL[Math.floor(Math.random() * IDLE_POOL.length)];
-                    play(act, 1500 + Math.random() * 700);
+                    // 倒红酒是个长动作（取出→倒→摇→放回），停留要久一点
+                    play(act, act === 'wine' ? 4700 : 1500 + Math.random() * 700);
                 } else {
                     play('wave', 2200);
                     say(GREETINGS[Math.floor(Math.random() * GREETINGS.length)], 3800);
@@ -5895,23 +7029,15 @@
             }, delay);
         }
 
-        const GREETINGS = [
-            '需要我做什么吗？',
-            '我在呢～',
-            '随时听候差遣',
-            '要四处看看吗？',
-            '房间已经就绪啦',
-        ];
-
         function start() {
             if (!ready) return;
             stop();
-            place(curPct);
+            render();
             scheduleIdle();
             setTimeout(function () {
-                if (!ready) return;
+                if (!ready || broken) return;
                 play('wave', 2400);
-                say('我是管家 Bouteillier', 3800);
+                say('我是管家 Bouteiller', 3800);
             }, 900);
         }
 
@@ -5919,9 +7045,9 @@
             clearTimeout(idleTimer);
             clearTimeout(actionTimer);
             clearTimeout(bubbleTimer);
-            clearTimeout(walkTimer);
             clearTimeout(ouchTimer);
-            idleTimer = actionTimer = bubbleTimer = walkTimer = ouchTimer = null;
+            idleTimer = actionTimer = bubbleTimer = ouchTimer = null;
+            stopWalk();
             if (bubble) bubble.classList.remove('is-show');
             if (ouch) ouch.classList.remove('is-show');
             if (unit) {
@@ -5936,17 +7062,17 @@
 
         // ---- 对话联动：用户说话 → 认可 → 思考；得到回复 → 开心 ----
         function onUserSpeak() {
-            if (!ready) return;
+            if (!ready || broken) return;
             play('approve', 700);
             setTimeout(function () {
                 // 700ms 后已经点头完了，接着摆出思考姿势等回复
-                if (ready) play('think', 12000);
+                if (ready && !broken) play('think', 12000);
             }, 720);
             say('', 0);
         }
 
         function onBotReply(text) {
-            if (!ready) return;
+            if (!ready || broken) return;
             play('happy', 1500);
             // 从回复里挑一句短话当气泡，太长就不显示（避免遮住对话区）
             const t = (text || '').replace(/\s+/g, ' ').trim();
@@ -5955,7 +7081,7 @@
         }
 
         function onBotError() {
-            if (!ready) return;
+            if (!ready || broken) return;
             play('deny', 1600);
             say('好像不太顺利…', 3600);
         }
@@ -5963,6 +7089,8 @@
         // ---- 供后端 AI 工具调用 ----
         function remote(action, text) {
             if (!ready) return;
+            // AI 显式要求时，即使散架也允许它"被修好"再表演
+            if (broken && action && action !== 'idle') recover();
             play(action || 'idle', 2200);
             if (text) say(text, 4600);
         }
@@ -5974,6 +7102,8 @@
             onBotReply: onBotReply,
             onBotError: onBotError,
             remote: remote,
+            setBattery: onBattery,
+            isBroken: function () { return broken; },
         };
     })();
 
@@ -6038,7 +7168,21 @@
         initWidgetResize();
         initSettingsDock();
         initGestureLock();
+
+        // ★ 2026-11-01：先把斜二轴测世界算出来，机器人才能知道
+        //   桌子/沙发在哪、自己该站在哪。顺序不能反 —— Butler.init()
+        //   里会立刻投影一次自己的初始位置。
+        World.layout();
         Butler.init();
+
+        // 定位条默认先显示「定位未启动」，不用等 /localization_status
+        renderLocStatus(null);
+
+        // 窗口尺寸变化：房间要重新按新的 k/原点生成，
+        // 否则地板会跟机器人脱节（机器人按旧 k 算、背景按新 k 画）。
+        window.addEventListener('resize', function () {
+            World.layout();
+        });
 
         // ★ 2026-11-01：原来这里有一个每秒刷新右上角实时时钟的 setInterval。
         //   用户要求把时钟换成电池百分比 —— 时钟对巡检场景没有信息量，
