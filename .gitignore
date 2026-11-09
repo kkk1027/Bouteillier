@@ -59,3 +59,15 @@ Makefile
 # 源：guide_map.py 的 render_dir()，用 scripts/render_guide.py 重出
 # 不提交是因为它们完全由地图 + 区域标注推导，重新跑一遍就有
 src/fishbot_navigation2/maps/guide_render/
+
+# ---- 地图与户型数据（隐私，绝不入库）----
+# 这些是家里的实际户型扫描结果：.pgm 是占据栅格图（等于一张平面图），
+# .pbstream 是 cartographer 的完整建图数据（1.6MB，能还原整个房间）。
+# 一旦推到公开仓库就等于公开了住址布局。
+# 仓库里只保留代码，使用者自己建图后放进来即可。
+# （历史里的旧地图已于 2026-11-09 通过 git filter-repo 彻底清除）
+src/fishbot_navigation2/maps/*.pgm
+src/fishbot_navigation2/maps/*.yaml
+src/fishbot_navigation2/maps/*.pbstream
+src/fishbot_navigation2/maps/*_regions.json
+src/fishbot_navigation2/maps/*.png
