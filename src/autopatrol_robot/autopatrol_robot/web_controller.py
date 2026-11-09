@@ -31,6 +31,7 @@ from autopatrol_robot.navigation_service import (
     NavigationService,
     set_global_nav_service,
 )
+import guide_map as guide_mod
 
 ros_available = threading.Lock()
 ros_busy = False
@@ -2209,6 +2210,437 @@ def pwa_service_worker():
     resp.headers['Service-Worker-Allowed'] = '/'
     resp.headers['Cache-Control'] = 'no-cache'
     return resp
+
+
+# ==================== 初次建图引导（guide_map.py） ====================
+# 两页引导流程的后端：判断要不要引导 / 三态渲染 / 自动描边 /
+# 区域标签存取 / 导出。
+#
+# ★ 安全约束：这一整组接口**完全只读原地图**。
+#   room1.pgm / room1.yaml 不会被写入，所有新产物都是新增文件
+#   （room1_regions.json、room1_render.png）。因为用户手画的边
+#   不可能和真实墙体像素级对齐，写回去会让 Nav2 认为那里有墙，
+#   直接把可通行区堵死。
+
+def _guide_map_name(raw):
+    """把前端传的 map 名收敛成安全的纯文件名（防目录穿越）。"""
+    name = (raw or DEFAULT_MAP_NAME).strip()
+    name = os.path.basename(name)
+    if name.endswith('.yaml') or name.endswith('.pgm'):
+        name = os.path.splitext(name)[0]
+    if not name or name in ('.', '..'):
+        name = DEFAULT_MAP_NAME
+    return name
+
+
+def _guide_map_files(map_name):
+    """返回 (yaml_path, pgm_path, has_yaml, has_pgm)。
+
+    pgm 的**真实**文件名从 yaml 的 image 字段读，不假设就叫
+    <map_name>.pgm —— map_saver_cli 允许自定义 image 名。
+    yaml 不存在时才回落成 <map_name>.pgm。
+    """
+    mdir = _maps_dir(WORKSPACE_DIR)
+    yaml_path = os.path.join(mdir, map_name + '.yaml')
+    has_yaml = os.path.isfile(yaml_path)
+
+    pgm_path = os.path.join(mdir, map_name + '.pgm')
+    if has_yaml:
+        meta, _err = guide_mod.read_yaml_meta(yaml_path)
+        image = (meta.get('image') or '').strip()
+        if image:
+            # yaml 里的 image 是相对 yaml 自身目录的路径
+            cand = image if os.path.isabs(image) else os.path.join(mdir, image)
+            pgm_path = os.path.normpath(cand)
+    return yaml_path, pgm_path, has_yaml, os.path.isfile(pgm_path)
+
+
+@app.route('/guide/status', methods=['GET'])
+def guide_status():
+    """引导页是否需要进入 —— 这是整个流程的唯一判断依据。
+
+    判定：**yaml 和 pgm 都存在** 才算「已经有地图」。
+    只有 yaml 没有 pgm 时 map_server 根本加载不了，所以那种状态仍
+    旧当作「没有地图」，应当引导用户重新建一张。
+
+    ?guide=1  强制进入（用户没地图也想重跑一遍流程）
+    ?guide=0  强制跳过（调试/演示时不想被拦）
+    """
+    try:
+        map_name = _guide_map_name(request.args.get('map'))
+        _yaml_p, _pgm_p, has_yaml, has_pgm = _guide_map_files(map_name)
+        complete = has_yaml and has_pgm
+
+        raw = (request.args.get('guide') or '').strip().lower()
+        forced = raw in ('1', 'true', 'yes', 'on')
+        skipped = raw in ('0', 'false', 'no', 'off')
+
+        if skipped:
+            needs = False
+            reason = 'URL 参数强制跳过'
+        elif forced:
+            needs = True
+            reason = 'URL 参数强制进入'
+        elif complete:
+            needs = False
+            reason = '已有完整地图 %s' % map_name
+        elif has_yaml or has_pgm:
+            needs = True
+            reason = '地图不完整（yaml=%s, pgm=%s）' % (has_yaml, has_pgm)
+        else:
+            needs = True
+            reason = '还没有地图 %s' % map_name
+
+        return jsonify({
+            'status': 'success',
+            'needs_guide': needs,
+            'reason': reason,
+            'map': map_name,
+            'has_yaml': has_yaml,
+            'has_pgm': has_pgm,
+            'forced': forced,
+        })
+    except Exception as exc:                     # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        return jsonify({'status': 'error', 'message': str(exc)}), 500
+
+
+@app.route('/guide/map', methods=['GET'])
+def guide_map_image():
+    """返回三态渲染图 + 元数据 + 自动描边结果。
+
+    query:
+      map    地图名（默认 room1）
+      block  自动描边的块降采样倍数（默认 3）
+      trace  传 0 可只要图不要描边（导出时用，省算力）
+    """
+    try:
+        map_name = _guide_map_name(request.args.get('map'))
+        _yaml_p, pgm_path, has_yaml, has_pgm = _guide_map_files(map_name)
+        if not has_pgm:
+            return jsonify({
+                'status': 'error',
+                'message': '找不到地图图片: %s。请先完成建图并保存。'
+                           % os.path.basename(pgm_path),
+                'map': map_name,
+                'has_yaml': has_yaml,
+            }), 404
+
+        arr, err = guide_mod.read_pgm(pgm_path)
+        if arr is None:
+            return jsonify({'status': 'error', 'message': err}), 500
+
+        meta, _meta_err = guide_mod.read_yaml_meta(_yaml_p) if has_yaml else (
+            {'resolution': 0.05, 'origin': [0.0, 0.0, 0.0],
+             'negate': 0, 'occupied_thresh': 0.65, 'free_thresh': 0.196}, '')
+
+        cls = guide_mod.classify(
+            arr, meta.get('occupied_thresh', 0.65),
+            meta.get('free_thresh', 0.196), meta.get('negate', 0))
+
+        try:
+            block = int(request.args.get('block', 3))
+        except (TypeError, ValueError):
+            block = 3
+        block = max(1, min(block, 16))
+
+        payload = {
+            'status': 'success',
+            'map': map_name,
+            'image': guide_mod.render_png_base64(cls),
+            'width': int(cls.shape[1]),
+            'height': int(cls.shape[0]),
+            'resolution': meta.get('resolution', 0.05),
+            'origin': meta.get('origin', [0.0, 0.0, 0.0]),
+            'counts': {
+                'occupied': int((cls == guide_mod.OCC).sum()),
+                'free': int((cls == guide_mod.FREE).sum()),
+                'unknown': int((cls == guide_mod.UNK).sum()),
+            },
+            'palette': {str(k): '#%02x%02x%02x' % v
+                        for k, v in guide_mod.DEFAULT_PALETTE.items()},
+        }
+
+        if (request.args.get('trace') or '1') != '0':
+            payload['trace'] = guide_mod.auto_trace(cls, block=block)
+        return jsonify(payload)
+
+    except Exception as exc:                     # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        return jsonify({'status': 'error', 'message': str(exc)}), 500
+
+
+@app.route('/guide/regions', methods=['GET', 'POST'])
+def guide_regions():
+    """读写区域标签。
+
+    GET  → 取 room1_regions.json（不存在时返回空结构，不是错误）
+    POST → 保存。**世界坐标由后端算**，不信前端传的（前端可能漏原点
+           偏移或用错分辨率，而 AI 导航直接吃这个坐标，错一点就
+           会导到墙里）。
+    """
+    try:
+        if request.method == 'GET':
+            map_name = _guide_map_name(request.args.get('map'))
+            mdir = _maps_dir(WORKSPACE_DIR)
+            data, err = guide_mod.load_regions(mdir, map_name)
+            if err:
+                return jsonify({'status': 'error', 'message': err}), 500
+            return jsonify({'status': 'success', 'data': data})
+
+        # ---------- POST ----------
+        body = request.get_json(silent=True) or {}
+        map_name = _guide_map_name(body.get('map'))
+        mdir = _maps_dir(WORKSPACE_DIR)
+        _yaml_p, pgm_path, has_yaml, _has_pgm = _guide_map_files(map_name)
+
+        # 取分辨率与原点：以磁盘上的 yaml 为准，避免前端用过期值
+        if has_yaml:
+            meta, _e = guide_mod.read_yaml_meta(_yaml_p)
+        else:
+            meta = {'resolution': 0.05, 'origin': [0.0, 0.0, 0.0]}
+        resolution = meta.get('resolution', 0.05)
+        origin = meta.get('origin', [0.0, 0.0, 0.0])
+
+        # 地图尺寸：从 pgm 读，拿不到时才用前端传的
+        map_size = None
+        if os.path.isfile(pgm_path):
+            arr, _err = guide_mod.read_pgm(pgm_path)
+            if arr is not None:
+                map_size = (int(arr.shape[1]), int(arr.shape[0]))
+        if map_size is None:
+            try:
+                map_size = (int(body.get('width', 0)), int(body.get('height', 0)))
+            except (TypeError, ValueError):
+                map_size = (0, 0)
+            if map_size[0] <= 0 or map_size[1] <= 0:
+                return jsonify({
+                    'status': 'error',
+                    'message': '无法确定地图尺寸，请先保存地图',
+                }), 400
+
+        regions, warns = guide_mod.normalize_regions(
+            body.get('regions'), origin, resolution, map_size)
+        strokes = guide_mod.normalize_strokes(body.get('strokes'), map_size)
+
+        data = {
+            'map': map_name,
+            'resolution': resolution,
+            'origin': origin,
+            'width': map_size[0],
+            'height': map_size[1],
+            'regions': regions,
+            'strokes': strokes,
+        }
+        ok, result = guide_mod.save_regions(mdir, map_name, data)
+        if not ok:
+            return jsonify({'status': 'error', 'message': result}), 500
+
+        print('[Guide] 已保存 %d 个区域 / %d 条线 → %s'
+              % (len(regions), len(strokes), result))
+        return jsonify({
+            'status': 'success',
+            'saved': result,
+            'regions': regions,
+            'strokes': strokes,
+            'warnings': warns,
+        })
+
+    except Exception as exc:                     # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        return jsonify({'status': 'error', 'message': str(exc)}), 500
+
+
+@app.route('/guide/export', methods=['POST'])
+def guide_export():
+    """导出：一次生成三份图，各有用处。
+
+    **输出到独立目录 maps/guide_render/**，不污染 maps/ 根目录：
+      <map>_render_vector.png   纯线稿（用户要的「手绘地图」成品）
+                                只有标签 + 手画线 + 自动描边线，无源地图栅格
+      <map>_render.png          三态栅格底图 + 标注，给答辩 / 文档
+      <map>_render_clean.png    纯三态栅格底图（备查）
+      <map>_regions.json        标注数据（世界坐标由后端算好）
+
+    ★ 依旧**完全不碰 room1.pgm / room1.yaml**。
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        map_name = _guide_map_name(body.get('map'))
+        _yaml_p, pgm_path, has_yaml, has_pgm = _guide_map_files(map_name)
+        if not has_pgm:
+            return jsonify({'status': 'error',
+                            'message': '找不到地图图片，无法导出'}), 404
+
+        arr, err = guide_mod.read_pgm(pgm_path)
+        if arr is None:
+            return jsonify({'status': 'error', 'message': err}), 500
+        map_size = (int(arr.shape[1]), int(arr.shape[0]))
+
+        meta = (guide_mod.read_yaml_meta(_yaml_p)[0] if has_yaml
+                else {'occupied_thresh': 0.65, 'free_thresh': 0.196,
+                      'negate': 0})
+        cls = guide_mod.classify(
+            arr, meta.get('occupied_thresh', 0.65),
+            meta.get('free_thresh', 0.196), meta.get('negate', 0))
+
+        mdir = _maps_dir(WORKSPACE_DIR)
+        regions_data, _e = guide_mod.load_regions(mdir, map_name)
+        regions = regions_data.get('regions', [])
+        strokes = regions_data.get('strokes', [])
+
+        # ① 纯线稿 —— 这是主产物，用户要看的就是它
+        vector = guide_mod.render_png_path(mdir, map_name, 'vector')
+        ok_v, msg_v = guide_mod.export_vector_png(
+            regions, strokes, vector, map_size, scale=4)
+
+        # ② 带标注的三态图（答辩 / 文档，能看出原始扫描）
+        #
+        # ★ 未安装中文字体时 PIL 画不出中文，会变成方块或者直接抛错。
+        #   这里先探测可用字体，找不到就**跳过文字**只画框 ——
+        #   宁可导出的图没名字，也不能因为字体问题整个接口 500。
+        annotated = guide_mod.render_png_path(mdir, map_name, 'annotated')
+        ok_a, msg_a = guide_mod.export_render_png(
+            cls, regions, strokes, annotated, scale=4)
+
+        # ③ 纯三态底图（备查）
+        clean = guide_mod.render_png_path(mdir, map_name, 'clean')
+        ok_c, msg_c = guide_mod.export_clean_png(cls, clean, scale=1)
+
+        if not ok_v:
+            return jsonify({'status': 'error',
+                            'message': '线稿导出失败: %s' % msg_v}), 500
+
+        return jsonify({
+            'status': 'success',
+            'png': vector,              # 主产物放 png 字段，保持向后兼容
+            'png_vector': vector if ok_v else None,
+            'png_annotated': annotated if ok_a else None,
+            'png_clean': clean if ok_c else None,
+            'dir': guide_mod.render_dir(mdir),
+            'regions': len(regions),
+            'strokes': len(strokes),
+            'auto_strokes': sum(1 for s in strokes if s.get('auto')),
+            'message': msg_v,
+        })
+    except Exception as exc:                     # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        return jsonify({'status': 'error', 'message': str(exc)}), 500
+
+
+@app.route('/guide/render', methods=['GET'])
+def guide_render_image():
+    """取导出的图（base64）+ 地图元数据，供「地图」面板当底图显示。
+
+    query:
+      map   地图名（默认 room1）
+      kind  vector（默认，纯线稿）/ annotated / clean
+
+    ★ 默认给线稿：用户明确要求面板显示「手绘地图」= 抽象线条 + 标签，
+      而不是粗糙的源地图栅格。
+    ★ 不写文件、不重新渲染：只读已经导出好的 PNG。
+    """
+    try:
+        map_name = _guide_map_name(request.args.get('map'))
+        kind = (request.args.get('kind') or 'vector').strip().lower()
+
+        mdir = _maps_dir(WORKSPACE_DIR)
+
+        # 按优先级尝试，全都没有才 404。
+        # 兜底顺序的道理：线稿是主产物；annotated 也带线条（只是背景脏）；
+        # clean 全是栅格、没有线条，放最后只当"总比空白强"。
+        order = {
+            'vector': ['vector', 'annotated', 'clean'],
+            'annotated': ['annotated', 'vector', 'clean'],
+            'clean': ['clean', 'annotated', 'vector'],
+        }.get(kind, ['vector', 'annotated', 'clean'])
+
+        png_path = None
+        used = None
+        for k in order:
+            p = guide_mod.render_png_path(mdir, map_name, k)
+            if os.path.isfile(p):
+                png_path, used = p, k
+                break
+
+        if not png_path:
+            return jsonify({
+                'status': 'error',
+                'message': '还没有导出的手绘地图。请先在引导页完成绘制并点「导出」。',
+                'dir': guide_mod.render_dir(mdir),
+            }), 404
+
+        with open(png_path, 'rb') as f:
+            b64 = base64.b64encode(f.read()).decode('ascii')
+
+        # 元数据用于坐标换算：和 /map 的 OccupancyGrid 完全一致
+        _yaml_p, pgm_path, has_yaml, has_pgm = _guide_map_files(map_name)
+        if has_yaml:
+            meta, _err = guide_mod.read_yaml_meta(_yaml_p)
+        else:
+            meta = {'resolution': 0.05, 'origin': [0.0, 0.0, 0.0]}
+
+        # 尺寸以 pgm 为准（导出图是它的放大版）
+        w = h = 0
+        if has_pgm:
+            arr, _e = guide_mod.read_pgm(pgm_path)
+            if arr is not None:
+                h, w = int(arr.shape[0]), int(arr.shape[1])
+
+        # 连带把标注数据也返回：面板上想画区域名字时不用再请求一次
+        regions_data, _re = guide_mod.load_regions(mdir, map_name)
+
+        return jsonify({
+            'status': 'success',
+            'map': map_name,
+            'image': b64,
+            'file': png_path,
+            'kind': used,
+            'width': w,
+            'height': h,
+            'resolution': meta.get('resolution', 0.05),
+            'origin': meta.get('origin', [0.0, 0.0, 0.0]),
+            'regions': regions_data.get('regions', []),
+            'strokes_count': len(regions_data.get('strokes', [])),
+        })
+    except Exception as exc:                     # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        return jsonify({'status': 'error', 'message': str(exc)}), 500
+
+
+@app.route('/guide/exports', methods=['GET'])
+def guide_exports():
+    """列出手绘渲染导出目录里的文件（调试用，方便确认导到哪了）。"""
+    try:
+        mdir = _maps_dir(WORKSPACE_DIR)
+        rdir = guide_mod.render_dir(mdir)
+        items = []
+        if os.path.isdir(rdir):
+            for fn in sorted(os.listdir(rdir)):
+                if not fn.lower().endswith('.png'):
+                    continue
+                full = os.path.join(rdir, fn)
+                st = os.stat(full)
+                items.append({
+                    'name': fn,
+                    'size': st.st_size,
+                    'mtime': int(st.st_mtime),
+                    'path': full,
+                })
+        return jsonify({
+            'status': 'success',
+            'dir': rdir,
+            'exists': os.path.isdir(rdir),
+            'files': items,
+        })
+    except Exception as exc:                     # noqa: BLE001
+        return jsonify({'status': 'error', 'message': str(exc)}), 500
+
 
 @app.route('/control', methods=['POST'])
 def control():

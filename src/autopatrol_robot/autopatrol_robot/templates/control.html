@@ -3746,6 +3746,549 @@
             width: 12px;
             height: 12px;
         }
+
+        /* ============================================================
+           初次建图引导（两页）
+           ------------------------------------------------------------
+           页面流：连接页 →① 引导建图 →② 手动渲染 → 操作页
+
+           ① 引导建图页**不切换视图**，就停在连接页上：
+              用户明确要求「第一页的机器人图标不消失，作为引导 icon」
+              —— 那个 .butler 是 inline SVG，换视图就没了。
+              所以这一步只在连接页上叠一个气泡 + 弹出浮层。
+
+           ② 手动渲染页需要整屏画布，所以做成独立 view。
+             它自己的机器人由 JS 把连接页那个 SVG 复制过来。
+           ============================================================ */
+
+        /* ---- 机器人引导气泡（连接页）---- */
+        .butler-bubble {
+            position: absolute;
+            left: 50%;
+            bottom: 100%;
+            margin-bottom: 10px;
+            transform: translate(-50%, 6px) scale(0.9);
+            transform-origin: 50% 100%;
+            padding: 9px 14px;
+            border-radius: 14px;
+            background: var(--w-card);
+            border: 1px solid var(--w-line);
+            box-shadow: 0 8px 22px rgba(120, 82, 48, 0.18);
+            color: var(--w-ink);
+            font-size: 13px;
+            font-weight: 600;
+            line-height: 1.35;
+            white-space: nowrap;
+            max-width: 62vw;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity .22s ease, transform .22s cubic-bezier(.34,1.4,.44,1);
+        }
+
+        /* 小尖角，让气泡看起来是从机器人头顶冒出来的 */
+        .butler-bubble::after {
+            content: '';
+            position: absolute;
+            left: 50%;
+            top: 100%;
+            width: 9px;
+            height: 9px;
+            margin-left: -4px;
+            margin-top: -5px;
+            background: var(--w-card);
+            border-right: 1px solid var(--w-line);
+            border-bottom: 1px solid var(--w-line);
+            transform: rotate(45deg);
+        }
+
+        .butler-bubble.is-show {
+            opacity: 1;
+            transform: translate(-50%, 0) scale(1);
+        }
+
+        /* ---- 步骤 2 的独立视图 ---- */
+        .view-guide {
+            display: flex;
+            flex-direction: column;
+            background: var(--w-bg);
+            /* 顶栏 54px + 底部工具栏；用 flex 自然分配，不写死高度 */
+        }
+
+        .guide-topbar {
+            flex: 0 0 auto;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 12px;
+            background: rgba(255, 255, 255, 0.9);
+            backdrop-filter: blur(12px);
+            border-bottom: 1px solid var(--w-line);
+        }
+
+        .guide-step {
+            font-size: 10.5px;
+            font-weight: 700;
+            letter-spacing: .5px;
+            padding: 2px 8px;
+            border-radius: 999px;
+            background: var(--w-brand-soft);
+            color: #b06a24;
+            white-space: nowrap;
+        }
+
+        .guide-title {
+            flex: 1;
+            min-width: 0;
+            font-size: 13px;
+            font-weight: 700;
+            color: var(--w-ink);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .guide-skip {
+            flex: 0 0 auto;
+            padding: 5px 10px;
+            border-radius: 9px;
+            border: 1px solid var(--w-line);
+            background: transparent;
+            color: var(--w-sub);
+            font-family: inherit;
+            font-size: 11.5px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        .guide-skip:active { transform: scale(.96); }
+
+        /* ---- 画布区 ---- */
+        .guide-stage {
+            flex: 1 1 auto;
+            position: relative;
+            min-height: 0;          /* ★ flex 子项要想内部滚动/缩放必须写 */
+            /* ★★ 不用 flex 居中，也不用 overflow:auto 滚动。
+               原因：画布比容器宽时，滚动能到达的左边界是固定的
+               （内容右边缘对齐视口右边缘），如果要把画面再往左推，
+               根本推不过去 —— 实测光标下的地图点会横移 95~190px，
+               越放大越严重。
+               改成：容器 overflow:hidden + 画布 absolute 定位，
+               位置完全由 JS 的 offsetX/offsetY 控制，
+               想摆哪就摆哪，不被滚动范围限制。 */
+            display: block;
+            overflow: hidden;
+            /* 双指缩放由 JS 的 pointer 事件接管 */
+            touch-action: none;
+            background:
+                repeating-conic-gradient(
+                    rgba(240, 224, 204, .45) 0% 25%, transparent 0% 50%)
+                50% / 18px 18px,
+                var(--w-bg);
+        }
+
+        /* ---- 步骤 2 的引导机器人 ---- */
+        .guide-bot-stage {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            pointer-events: none;
+            z-index: 4;
+            transition: opacity .45s ease;
+        }
+
+        .guide-bot-stage.is-gone {
+            opacity: 0;
+            pointer-events: none;
+        }
+
+        .guide-bot {
+            position: relative;
+            width: clamp(80px, 22vw, 130px);
+            filter: drop-shadow(0 14px 22px rgba(150, 105, 62, 0.28));
+        }
+
+        .guide-bot svg { display: block; width: 100%; height: auto; }
+
+        /* 气泡要允许换行（机器人居中时空间比连接页宽） */
+        .guide-bot .butler-bubble {
+            white-space: normal;
+            text-align: center;
+            max-width: 60vw;
+        }
+
+        /* 画布撑满容器：内部按图片比例 contain 居中，
+           多出来的区域就是 checkboard 背景，视觉上像「贴图台」 */
+        #guideCanvas {
+            display: block;
+            /* 绝对定位 + JS 控制 left/top：位置不受父容器滚动范围限制，
+               缩放时才能把光标下的点精确定住。 */
+            position: absolute;
+            left: 0;
+            top: 0;
+            touch-action: none;      /* 禁止滚动/缩放，否则拖动会误触页面 */
+            border-radius: 10px;
+            box-shadow: 0 10px 30px rgba(120, 82, 48, 0.22);
+            /* 地图是像素图，放大时必须保持硬边，不能糊成渐变 */
+            image-rendering: pixelated;
+            cursor: crosshair;
+        }
+
+        /* 等待/提示遮罩，盖在画布上 */
+        .guide-mask {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            background: rgba(253, 244, 232, 0.92);
+            backdrop-filter: blur(3px);
+            color: var(--w-sub);
+            font-size: 13px;
+            font-weight: 600;
+            z-index: 3;
+            transition: opacity .3s ease;
+        }
+
+        .guide-mask.is-gone { opacity: 0; pointer-events: none; }
+
+        .guide-spinner {
+            width: 26px;
+            height: 26px;
+            border-radius: 50%;
+            border: 3px solid var(--w-brand-soft);
+            border-top-color: var(--w-brand);
+            animation: guideSpin .8s linear infinite;
+        }
+
+        @keyframes guideSpin { to { transform: rotate(360deg); } }
+
+        /* ---- 底部工具栏 ---- */
+        .guide-toolbar {
+            flex: 0 0 auto;
+            padding: 8px 10px calc(8px + env(safe-area-inset-bottom, 0px));
+            background: rgba(255, 255, 255, 0.94);
+            backdrop-filter: blur(12px);
+            border-top: 1px solid var(--w-line);
+        }
+
+        .guide-tools-row {
+            display: flex;
+            gap: 6px;
+            overflow-x: auto;
+            scrollbar-width: none;
+            padding-bottom: 6px;
+        }
+
+        .guide-tools-row::-webkit-scrollbar { display: none; }
+
+        .guide-tool {
+            flex: 0 0 auto;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 2px;
+            min-width: 52px;
+            padding: 6px 8px;
+            border-radius: 11px;
+            border: 1px solid var(--w-line);
+            background: var(--w-card);
+            color: var(--w-ink);
+            font-family: inherit;
+            font-size: 10px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform .1s ease, background .12s ease;
+        }
+
+        .guide-tool .ico { font-size: 16px; line-height: 1; }
+
+        .guide-tool:active { transform: scale(.94); }
+
+        .guide-tool.is-active {
+            background: var(--w-brand);
+            border-color: var(--w-brand);
+            color: #fff;
+        }
+
+        .guide-tool:disabled {
+            opacity: .42;
+            cursor: default;
+        }
+
+        .guide-tool.ghost {
+            background: transparent;
+            color: var(--w-sub);
+        }
+
+        .guide-actions {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            margin-top: 2px;
+        }
+
+        .guide-primary {
+            flex: 1;
+            padding: 11px 16px;
+            border: none;
+            border-radius: 13px;
+            background: linear-gradient(180deg, #ffa75e 0%, #f08c3c 100%);
+            box-shadow: 0 4px 0 #cd7128, 0 10px 20px rgba(200, 125, 50, .3);
+            color: #fff;
+            font-family: inherit;
+            font-size: 14px;
+            font-weight: 700;
+            letter-spacing: .5px;
+            cursor: pointer;
+        }
+
+        .guide-primary:active {
+            transform: translateY(2px);
+            box-shadow: 0 2px 0 #cd7128, 0 6px 12px rgba(200, 125, 50, .28);
+        }
+
+        .guide-primary:disabled {
+            filter: grayscale(.5);
+            opacity: .6;
+            cursor: default;
+            transform: none;
+        }
+
+        .guide-hint {
+            flex: 0 0 auto;
+            font-size: 10.5px;
+            color: var(--w-sub);
+            padding: 0 2px;
+            line-height: 1.4;
+        }
+
+        /* ---- 区域命名弹窗 ---- */
+        .guide-dialog {
+            position: fixed;
+            inset: 0;
+            z-index: 200;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 22px;
+            background: rgba(90, 58, 34, 0.34);
+            backdrop-filter: blur(4px);
+            opacity: 0;
+            /* ★ 单靠 opacity:0 + pointer-events:none 不够：
+               dom 仍在无障碍树里，Tab 键能聚焦到输入框，
+               屏幕阅读器也会把隐藏的弹窗读出来（实测 tab 会卡在
+               隐藏的输入框上）。visibility 才能把它真正藏起来。 */
+            visibility: hidden;
+            pointer-events: none;
+            transition: opacity .18s ease, visibility 0s linear .18s;
+        }
+
+        .guide-dialog.is-show {
+            opacity: 1;
+            visibility: visible;
+            pointer-events: auto;
+            transition: opacity .18s ease, visibility 0s;
+        }
+
+        .guide-dialog-card {
+            width: 100%;
+            max-width: 340px;
+            padding: 16px;
+            border-radius: 18px;
+            background: var(--w-card);
+            box-shadow: 0 20px 52px rgba(120, 82, 48, .3);
+            transform: scale(.94);
+            transition: transform .18s cubic-bezier(.34,1.4,.44,1);
+        }
+
+        .guide-dialog.is-show .guide-dialog-card { transform: scale(1); }
+
+        .guide-dialog-title {
+            font-size: 14px;
+            font-weight: 700;
+            color: var(--w-ink);
+            margin-bottom: 10px;
+        }
+
+        .guide-dialog input {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 10px 12px;
+            border-radius: 11px;
+            border: 1px solid var(--w-line);
+            background: #fff;
+            color: var(--w-ink);
+            font-family: inherit;
+            font-size: 14px;
+            outline: none;
+        }
+
+        .guide-dialog input:focus { border-color: var(--w-brand); }
+
+        .guide-quick-names {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-top: 10px;
+        }
+
+        .guide-quick-name {
+            padding: 5px 11px;
+            border-radius: 999px;
+            border: 1px solid var(--w-line);
+            background: var(--w-brand-soft);
+            color: #a5621f;
+            font-family: inherit;
+            font-size: 11.5px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        .guide-quick-name:active { transform: scale(.95); }
+
+        .guide-dialog-actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 14px;
+        }
+
+        .guide-dialog-actions button {
+            flex: 1;
+            padding: 10px;
+            border-radius: 11px;
+            font-family: inherit;
+            font-size: 13px;
+            font-weight: 700;
+            cursor: pointer;
+        }
+
+        .guide-dialog-cancel {
+            border: 1px solid var(--w-line);
+            background: transparent;
+            color: var(--w-sub);
+        }
+
+        .guide-dialog-ok {
+            border: none;
+            background: var(--w-brand);
+            color: #fff;
+        }
+
+        /* 已命名区域的列表（顶栏下方一条，可横向滑） */
+        .guide-tags {
+            flex: 0 0 auto;
+            display: flex;
+            gap: 6px;
+            padding: 6px 12px;
+            overflow-x: auto;
+            scrollbar-width: none;
+            background: rgba(255, 250, 243, .9);
+            border-bottom: 1px solid var(--w-line);
+        }
+
+        .guide-tags::-webkit-scrollbar { display: none; }
+        .guide-tags:empty { display: none; }
+
+        .guide-tag {
+            flex: 0 0 auto;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            padding: 3px 9px;
+            border-radius: 999px;
+            background: var(--w-brand-soft);
+            color: #a5621f;
+            font-size: 11px;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+
+        .guide-tag button {
+            border: none;
+            background: transparent;
+            color: #c9863c;
+            font-size: 12px;
+            line-height: 1;
+            padding: 0;
+            cursor: pointer;
+        }
+
+        /* 窄屏（手机竖屏）微调 */
+        @media (max-width: 480px) {
+            .butler-bubble { font-size: 12px; padding: 7px 12px; }
+            .guide-title { font-size: 12px; }
+            .guide-tool { min-width: 48px; padding: 5px 7px; font-size: 9.5px; }
+            .guide-tool .ico { font-size: 15px; }
+            .guide-primary { font-size: 13px; padding: 10px 14px; }
+        }
+
+        /* ---- 引导模式下隐藏地图浮层的「导航地图」段落 ----
+           初次建图时地图还没存盘，那三个按钮（载入/关闭/导航地图）
+           没有意义，摆在界面上只会让人误以为要先去载图。 */
+        .widget.is-guide-mode .nav-map-sect { display: none; }
+
+        /* 引导模式下的提示：强调“保存”才会进入下一步 */
+        .widget.is-guide-mode .save-panel .save-hint {
+            color: #b06a24;
+            font-weight: 600;
+        }
+
+        /* ---- 引导步骤 1：只留机器人 icon，其余全部隐藏 ----
+           原始布局依赖三件事：
+             1. .home-hero 的 padding-left 给机器人留出位置
+             2. .home-title 的 z-index:3 + 不透明胶囊底盖住机器人
+             3. .butler 的 left:0 + butlerOut 动画把它滑到位
+           三者是配套的，单独把标题设成 visibility:hidden 会留下
+           一个空胶囊位，机器人偏在左侧而不居中。
+
+           所以引导模式下要整体改成另一套布局：
+           padding 归零、标题不再占位、机器人回到普通流里居中。
+
+           
+★ 连按钮和状态文字一起隐藏：
+             用户要求「只保留机器人 icon」。此时车已经连上了，
+             「连接以开始」再摆在那里既是错的语义，也会吸引点击。
+             用 display:none 而不是 visibility/opacity —— 后者仍然
+             占位，会让机器人整体上移不到正中心。
+
+           
+★ 必须同时覆盖 animation：
+             .butler 的进场动画带 fill: both，最终状态锁在
+             translateX(0) scale(1)。只覆盖 transform 会被动画的
+             填充状态直接压回去，看起来“没生效”。 */
+        .view-home.is-guide .home-hero {
+            padding-left: 0;
+        }
+
+        .view-home.is-guide .home-title {
+            display: none;
+        }
+
+        /* 已经连上了，不需要再点一次；隐藏后 home-stage 的 gap
+           也不再产生多余间距，机器人正好居中 */
+        .view-home.is-guide .home-start,
+        .view-home.is-guide .home-status {
+            display: none;
+        }
+
+        .view-home.is-guide .butler {
+            position: relative;
+            left: auto;
+            top: auto;
+            transform: none;
+            margin: 0 auto;
+            opacity: 1;
+            animation: guideBotIn .55s cubic-bezier(0.34, 1.3, 0.5, 1) both;
+        }
+
+        @keyframes guideBotIn {
+            from { opacity: 0; transform: scale(.84); }
+            to   { opacity: 1; transform: scale(1); }
+        }
     </style>
     <!-- ==================== Socket.IO 客户端 ====================
          原来直连 cdn.socket.io。问题：手机开热点时如果蜂窝信号差/被墙，
@@ -3825,6 +4368,11 @@
                     <circle cx="47" cy="136" r="6" fill="#6d4c36"/>
                     <circle cx="73" cy="136" r="6" fill="#6d4c36"/>
                 </svg>
+                <!-- 引导气泡：初始隐藏，由 Guide 模块控制显隐。
+                     放在 .butler 内部才能用 bottom:100% 定位到头顶，
+                     而 .butler 自身带了 drop-shadow，气泡会继承一点投影，
+                     反而更像飘在场景里。 -->
+                <div class="butler-bubble" id="butlerBubble"></div>
             </div>
             <h1 class="home-title">BOUTEILLIER</h1>
         </div>
@@ -3833,6 +4381,120 @@
         <div class="home-status" id="homeStatus"></div>
     </div>
 </section>
+
+<!-- ==================== 引导页：2/2 手动渲染 ====================
+     步骤 1（引导建图）不单独开页 —— 用户要求「第一页的机器人
+     图标不消失，作为引导 icon」，所以那一步就停在连接页上，
+     只叠气泡 + 弹出浮层。本视图只负责步骤 2。
+
+     机器人图标由 JS 从 #butler 复制 innerHTML 过来（同一张 SVG，
+     不重复维护一份 40 行的 blob）。
+     ============================================================ -->
+<section class="view view-guide is-gone" id="viewGuide">
+    <div class="guide-topbar">
+        <span class="guide-step" id="guideStepBadge">2 / 2</span>
+        <span class="guide-title">绘制属于自己的地图</span>
+        <button class="guide-skip" id="guideSkip2">跳过</button>
+    </div>
+
+    <!-- 已命名区域（横向滑，空时自动隐藏） -->
+    <div class="guide-tags" id="guideTags"></div>
+
+    <div class="guide-stage">
+        <canvas id="guideCanvas" width="126" height="207"></canvas>
+
+        <!-- 步骤 2 的引导机器人：只出现 2 秒，说完「绘制属于自己的
+             地图吧」就淡出，随后才露出地图（用户要求「两秒后消失，
+             上面的渲染图才张贴出来」）。
+             图标由 JS 从 #butler 复制 innerHTML 过来。 -->
+        <div class="guide-bot-stage" id="guideBotStage">
+            <div class="guide-bot" id="guideBot">
+                <div class="butler-bubble" id="guideBotBubble"></div>
+            </div>
+        </div>
+
+        <div class="guide-mask" id="guideMask">
+            <div class="guide-spinner"></div>
+            <span id="guideMaskText">正在加载地图…</span>
+        </div>
+    </div>
+
+    <div class="guide-toolbar">
+        <div class="guide-tools-row">
+            <button class="guide-tool is-active" data-guide-tool="pan"
+                    title="拖动查看">
+                <span class="ico">✋</span><span>拖动</span>
+            </button>
+            <button class="guide-tool" data-guide-tool="line" title="直线">
+                <span class="ico">📐</span><span>直线</span>
+            </button>
+            <button class="guide-tool" data-guide-tool="rect" title="矩形">
+                <span class="ico">⬜</span><span>矩形</span>
+            </button>
+            <button class="guide-tool" data-guide-tool="circle" title="圆">
+                <span class="ico">⭕</span><span>圆</span>
+            </button>
+            <button class="guide-tool" id="guideToolRegion"
+                    data-guide-tool="region" title="框选并命名区域">
+                <span class="ico">🏷️</span><span>标区域</span>
+            </button>
+            <button class="guide-tool" data-guide-tool="eraser"
+                    title="擦除线段的突出部分">
+                <span class="ico">🧽</span><span>橡皮擦</span>
+            </button>
+            <button class="guide-tool ghost" id="guideToolUndo"
+                    title="撤销上一步">
+                <span class="ico">↶</span><span>撤销</span>
+            </button>
+            <button class="guide-tool ghost" id="guideToolClear"
+                    title="清空所有绘制">
+                <span class="ico">🗑️</span><span>清空</span>
+            </button>
+            <button class="guide-tool ghost" id="guideToolTrace"
+                    title="根据地图重新自动描边">
+                <span class="ico">✨</span><span>重描边</span>
+            </button>
+            <button class="guide-tool ghost" id="guideToolZoom"
+                    title="切换显示大小">
+                <span class="ico">🔍</span><span>放大</span>
+            </button>
+        </div>
+
+        <div class="guide-actions">
+            <button class="guide-primary" id="guideExport" disabled>
+                导出并进入操控页
+            </button>
+        </div>
+        <div class="guide-hint" id="guideHint">
+            描边只是视觉标注，不会改动导航地图。
+        </div>
+    </div>
+</section>
+
+<!-- 区域命名弹窗 -->
+<div class="guide-dialog" id="guideDialog">
+    <div class="guide-dialog-card">
+        <div class="guide-dialog-title">给这个区域起个名字</div>
+        <input type="text" id="guideDialogInput" maxlength="12"
+               placeholder="例如：客厅" class="allow-select">
+        <div class="guide-quick-names">
+            <button class="guide-quick-name" data-name="客厅">客厅</button>
+            <button class="guide-quick-name" data-name="厨房">厨房</button>
+            <button class="guide-quick-name" data-name="卧室">卧室</button>
+            <button class="guide-quick-name" data-name="书房">书房</button>
+            <button class="guide-quick-name" data-name="卫生间">卫生间</button>
+            <button class="guide-quick-name" data-name="影音房">影音房</button>
+            <button class="guide-quick-name" data-name="走廊">走廊</button>
+        </div>
+        <div class="guide-hint" style="margin-top:10px;">
+            名字会存进地图标注，以后可以直接跟 AI 说「去客厅」。
+        </div>
+        <div class="guide-dialog-actions">
+            <button class="guide-dialog-cancel" id="guideDialogCancel">取消</button>
+            <button class="guide-dialog-ok" id="guideDialogOk">确定</button>
+        </div>
+    </div>
+</div>
 
 <!-- ==================== 操作页 ==================== -->
 <section class="view view-app is-gone" id="viewApp">
@@ -4097,11 +4759,30 @@
                     <div class="map-status-line" id="map-status-line"></div>
                 </div>
 
-                <div class="tool-sect">
+                <div class="tool-sect nav-map-sect">
                     <div class="tool-sect-title">导航地图（room1）</div>
                     <div class="tool-row">
                         <button class="tool-btn" id="load-map">📂 载入地图</button>
                         <button class="tool-btn" id="close-map" disabled>✕ 关闭地图</button>
+                    </div>
+                </div>
+
+                <!-- 手绘渲染图：把引导页导出的 PNG 当底图显示。
+                     ★ 与「载入地图」是两条独立路径：
+                       载入地图 → 走 ROS map_server，会影响导航；
+                       这个     → 纯前端换底图，不碰 ROS、不影响导航。 -->
+                <div class="tool-sect">
+                    <div class="tool-sect-title">手绘渲染图</div>
+                    <div class="tool-row">
+                        <button class="tool-btn go" id="btn-view-render">
+                            🎨 看手绘地图
+                        </button>
+                        <button class="tool-btn" id="btn-view-live" disabled>
+                            📡 回到实时图
+                        </button>
+                    </div>
+                    <div class="save-hint" id="render-hint">
+                        先把引导页的绘制结果「导出」，就能在这里看到效果。
                     </div>
                 </div>
             </div>
@@ -4140,6 +4821,8 @@
         <div class="settings-menu" id="settingsMenu">
             <button class="settings-item danger" id="force-cleanup">🧹 强制清理</button>
             <button class="settings-item" id="soft-reboot">🔄 软重启</button>
+            <button class="settings-item" id="replay-guide">🧭 重新引导建图</button>
+            <button class="settings-item" id="open-draw-debug">🎨 绘制调试（免连接）</button>
             <div class="settings-log" id="log-container">系统就绪</div>
         </div>
     </div>
@@ -4330,7 +5013,110 @@
         window.addEventListener('touchcancel', onPointerEnd);
     }
     
+    // ==================== 手绘渲染图预览 ====================
+
+    function setRenderHint(text, tone) {
+        const el = document.getElementById('render-hint');
+        if (!el) return;
+        el.textContent = text;
+        el.style.color = tone === 'ok' ? '#2e7d32'
+                       : tone === 'err' ? '#c62828' : '';
+    }
+
+    // 把引导页导出的 PNG 当底图显示。
+    //
+    // ★ 与「载入地图」是两条完全独立的路径：
+    //   载入地图 → 调 ROS map_server，会重启导航栈、影响定位
+    //   这里     → 纯前端换一张底图，不碰 ROS、不影响导航
+    //   所以即使车正在跑，点这个也完全安全。
+    function showRenderMap() {
+        // ★ 不检查 mapWidth/mapHeight。
+        //   上一版在这里加了「必须已经收到过 /map」的守卫，结果把
+        //   最主要的调试场景堵死了：没连机器人时永远没有 /map，
+        //   于是渲染图一直点不开。
+        //   /guide/render 自己就带着 width/height/resolution/origin
+        //   （和 /map 的 OccupancyGrid 完全同源），够用了。
+        setRenderHint('正在读取手绘地图…');
+        fetch('/guide/render?map=room1&kind=vector')
+            .then((r) => r.json().then((d) => ({ ok: r.ok, d })))
+            .then(({ ok, d }) => {
+                if (!ok || d.status !== 'success') {
+                    setRenderHint(d.message || '读取失败', 'err');
+                    toast(d.message || '还没有导出的渲染图', 'warn', 3600);
+                    return;
+                }
+                const im = new Image();
+                im.onload = () => {
+                    renderImage = im;
+                    mapSource = 'render';
+                    // 用后端给的几何覆盖一次：渲染图与 /map 同源，
+                    // 但万一 /map 还没来，也能先看到图
+                    mapResolution = d.resolution;
+                    mapOriginX = d.origin[0];
+                    mapOriginY = d.origin[1];
+                    mapWidth = d.width;
+                    mapHeight = d.height;
+                    resetView();
+                    drawMap();
+                    document.getElementById('btn-view-live').disabled = false;
+                    document.getElementById('btn-view-render').disabled = true;
+                    document.getElementById('map-state-text').textContent = '手绘图';
+                    const coords = document.getElementById('map-coords');
+                    if (coords) {
+                        coords.textContent = mapWidth + '×' + mapHeight +
+                            ' @' + mapResolution.toFixed(2) + 'm · ' +
+                            (d.strokes_count || 0) + ' 条线';
+                    }
+                    const badge = document.getElementById('map-badge');
+                    if (badge) { badge.textContent = '手绘图'; badge.className = 'widget-badge'; }
+                    // kind 是后端实际给的那份（vector / annotated / clean），
+                    // 回退时实话告知，不让用户以为看到的是线稿
+                    var kindLabel = d.kind === 'vector' ? '手绘线稿'
+                                  : d.kind === 'annotated' ? '带标注的扫描图'
+                                  : '扫描底图（还没导出过线稿）';
+                    setRenderHint('已显示' + kindLabel + '（不影响导航）',
+                                  d.kind === 'vector' ? 'ok' : undefined);
+                    addLog('已显示' + kindLabel + ': ' + (d.file || ''), 'success');
+                };
+                im.onerror = () => {
+                    setRenderHint('图片解码失败', 'err');
+                };
+                im.src = 'data:image/png;base64,' + d.image;
+            })
+            .catch((e) => {
+                setRenderHint('请求失败: ' + e.message, 'err');
+            });
+    }
+
+    function showLiveMap() {
+        if (!mapImage) {
+            toast('实时地图还没就绪', 'warn');
+            return;
+        }
+        mapSource = 'live';
+        resetView();
+        drawMap();
+        document.getElementById('btn-view-live').disabled = true;
+        document.getElementById('btn-view-render').disabled = false;
+        document.getElementById('map-state-text').textContent = '已加载';
+        const badge = document.getElementById('map-badge');
+        if (badge) { badge.textContent = '已加载'; badge.className = 'widget-badge'; }
+        setRenderHint('已回到实时 SLAM 图', 'ok');
+    }
+
     // ==================== 地图功能 ====================
+
+    // 地图底图来源：'live' = SLAM 的 /map；'render' = 引导页导出的手绘图。
+    // 两者共用同一套 mapWidth/mapHeight/origin/resolution，所以切底图时
+    // 位姿叠加、坐标换算一行都不用改。
+    let mapSource = 'live';
+    let renderImage = null;
+
+    function currentMapImage() {
+        if (mapSource === 'render' && renderImage) return renderImage;
+        return mapImage;
+    }
+
     function worldToPixel(worldX, worldY) {
         let px = (worldX - mapOriginX) / mapResolution;
         let py = (worldY - mapOriginY) / mapResolution;
@@ -4338,21 +5124,31 @@
     }
     
     function drawMap() {
-        if (!mapImage) {
-            ctx.fillStyle = '#0a0e1a';
+        const img = currentMapImage();
+
+        // 底图颜色跟着底图来源走：
+        //   实时 SLAM 图是深色（黑底灰墙），用 #0a0e1a 包着才连贯；
+        //   手绘线稿是奶白底，再包一圈黑边就像贴了张纸，很突兵。
+        const bgColor = (mapSource === 'render') ? '#fdf4e8' : '#0a0e1a';
+
+        if (!img) {
+            ctx.fillStyle = bgColor;
             ctx.fillRect(0, 0, canvas.width, canvas.height);
-            ctx.fillStyle = '#aaa';
+            ctx.fillStyle = (mapSource === 'render') ? '#a4826a' : '#aaa';
             ctx.font = '14px monospace';
             ctx.textAlign = 'center';
             ctx.fillText('等待地图数据...', canvas.width/2, canvas.height/2);
             return;
         }
-        ctx.fillStyle = '#0a0e1a';
+        ctx.fillStyle = bgColor;
         ctx.fillRect(0, 0, canvas.width, canvas.height);
         ctx.save();
         ctx.translate(offsetX, offsetY);
         ctx.scale(scale, scale);
-        ctx.drawImage(mapImage, 0, 0, mapWidth, mapHeight);
+        // 注意这里是 drawImage(img, 0,0, mapWidth, mapHeight)：
+        // 不管图片本身多大，都会被压到 mapWidth×mapHeight 的地图像素格上，
+        // 所以 4x 的带标注版也能直接用，不用另外算比例。
+        ctx.drawImage(img, 0, 0, mapWidth, mapHeight);
         if (robotX !== 0 || robotY !== 0) {
             let pixel = worldToPixel(robotX, robotY);
             let robotRadius = Math.max(5, 8 / scale);
@@ -4375,7 +5171,8 @@
     }
     
     function resetView() {
-        if (!mapImage) return;
+        const img = currentMapImage();
+        if (!img) return;
         // 地图组件可能处于收起状态（display:none），此时父容器尺寸是 0。
         // 直接套用会把 canvas 压成 0x0，之后再打开也画不出来 ——
         // 所以这里必须提前退出，留到 afterWidgetOpen 里再算。
@@ -4397,24 +5194,30 @@
     // 视图切换（主页 ↔ 操作页）
     // ============================================================
     function switchView(which) {
-        const home = document.getElementById('viewHome');
-        const app = document.getElementById('viewApp');
+        var home = document.getElementById('viewHome');
+        var guide = document.getElementById('viewGuide');
+        var app = document.getElementById('viewApp');
         if (!home || !app) return;
-        // 背景虚化：连接页虚化，进工作台后取消（详见 .room-scene.is-blur）
-        const scene = document.getElementById('roomScene');
+
+        // 背景虚化：只有在工作台才取消（引导页自己有全屏不透明背景，
+        // 看不看得见背景无所谓，但保持和连接页一致更简单）
+        var scene = document.getElementById('roomScene');
         if (scene) scene.classList.toggle('is-blur', which !== 'app');
+
+        var map = { home: home, guide: guide, app: app };
+        Object.keys(map).forEach(function (k) {
+            var el = map[k];
+            if (!el) return;
+            el.classList.toggle('is-gone', k !== which);
+        });
+
         if (which === 'app') {
-            home.classList.add('is-gone');
-            app.classList.remove('is-gone');
             // 切页后 canvas / 摇杆才量得到真实尺寸（之前父级是 opacity/scale
             // 变化，但仍在布局里，所以这里再算一次确保准确）
             requestAnimationFrame(function () {
                 if (mapImage) resetView();
                 updateJoystickGeometry();
             });
-        } else {
-            app.classList.add('is-gone');
-            home.classList.remove('is-gone');
         }
     }
 
@@ -4474,8 +5277,11 @@
                 btn.textContent = '已连接';
                 addLog('机器人连接成功', 'success');
                 syncPhraseActive();
-                // 停一下让人看到「成功」，再切页，避免瞬间跳转
-                setTimeout(enterApp, 850);
+                // 停一下让人看到「成功」，再切页，避免瞬间跳转。
+                // 接下来进哪个页面由 Guide 决定：
+                //   本机没有 room1 地图 → 先进两页引导流程
+                //   已有地图             → 直接进工作台
+                setTimeout(function () { Guide.afterConnect(); }, 850);
                 return;
             }
             clearInterval(timer);
@@ -5491,6 +6297,12 @@
                 toast('地图已保存：' + name, 'ok');
                 addLog('地图已保存: ' + data.message, 'success');
                 setMapStatusLine('✅ ' + data.message, 'ok');
+                // ★ 初次建图引导：保存成功就是「建图结束」的判据。
+                //   用户确认过这个交互（不另加「下一步」按钮）。
+                //   延迟一点，让 toast 和成功状态能看见。
+                if (Guide.isAwaitingMap() && name === 'room1') {
+                    setTimeout(function () { Guide.enterStep2(name); }, 900);
+                }
             } else {
                 toast(data.message || '保存失败', 'err');
                 addLog('地图保存失败: ' + data.message, 'error');
@@ -5572,6 +6384,23 @@
         bind('btn-map-save', openSavePanel);
         bind('save-confirm', confirmSaveMapping);
         bind('save-cancel', closeSavePanel);
+
+        // 「重新引导建图」：从设置菜单里重跑两页引导。
+        // 不直接调 Guide.enterStep1，因为那一步假定界面还在连接页；
+        // 这里先切回连接页，再走一遍，视觉上和首次流程一致。
+        bind('replay-guide', function () {
+            if (!confirm('重新走一遍建图引导？会先回到连接页。')) return;
+            switchView('home');
+            var bs = document.getElementById('btnStart');
+            if (bs) { bs.textContent = '已连接'; bs.disabled = true; }
+            setTimeout(function () { Guide.enterStep1(); }, 600);
+        });
+
+        // 「绘制调试」：不连机器人、不要求有地图，直接进绘制页。
+        // 开发时改样式/交互用，画完能导出到 maps/guide_render/ 预览。
+        bind('open-draw-debug', function () {
+            Guide.startDrawDebug();
+        });
     }
 
     // ============================================================
@@ -7899,6 +8728,22 @@
 
         bindButton('load-map', loadMap);
         bindButton('close-map', closeMap);
+        bindButton('btn-view-render', showRenderMap);
+        bindButton('btn-view-live', showLiveMap);
+
+        // 页面加载后探一下有没有导出的渲染图，有就把提示改成“可以点”
+        (function probeRenderExport() {
+            fetch('/guide/exports')
+                .then((r) => r.json())
+                .then((d) => {
+                    if (d && d.status === 'success' && d.files && d.files.length) {
+                        setRenderHint('已有手绘渲染图，点上方按钮预览。', 'ok');
+                    } else {
+                        setRenderHint('先在引导页「导出绘制结果」，就能在这里看到效果。');
+                    }
+                })
+                .catch(() => { /* 探不到就保持默认文案 */ });
+        })();
         bindButton('toggleCameraBtn', () => cameraActive ? stopCamera() : startCamera());
         bindButton('sendChatBtn', sendChatMessage);
 
@@ -7969,8 +8814,1633 @@
         });
         
         addLog('系统就绪，请连接机器人', 'info');
+
+        // 引导流程初始化（绑定事件、把浮层提到 body 级）
+        Guide.init();
+
+        // ★ ?guide=2：开发者调试，直接进绘制页。
+        //   放在 init 末尾而不是更早，因为 enterStep2 依赖
+        //   Guide.init 里做的那几件事（浮层提升、按钮绑定、指针事件）。
+        //   延迟一拍让浏览器完成首帧布局，否则 layoutCanvas 量到 0 宽。
+        (function autoOpenDrawDebug() {
+            try {
+                var qs = new URLSearchParams(location.search);
+                if (qs.get('guide') !== '2') return;
+            } catch (e) {
+                return;
+            }
+            setTimeout(function () {
+                Guide.startDrawDebug();
+            }, 120);
+        })();
     }
     
+    // ============================================================
+    // 初次建图引导（两页）
+    // ------------------------------------------------------------
+    // 流程：连接页 --连接--> ①引导建图 --保存地图--> ②手动渲染 --> 操作页
+    //
+    // 进入条件（由后端 /guide/status 判定，不在前端猜）：
+    //   maps/room1.yaml 和 room1.pgm **都存在** → 跳过引导
+    //   任缺一个                               → 进引导
+    //   ?guide=1 强制进 / ?guide=0 强制跳过
+    //
+    // 两个页面形态不同：
+    //   ① 不切视图，就停在连接页。因为用户要求「第一页的机器人图标
+    //     不消失，作为引导 icon」——那个 .butler 是连接页的 inline
+    //     SVG，切走就没了。
+    //   ② 需要整屏画布，所以是独立 view（#viewGuide）。
+    //
+    // 安全约束：手画的线和区域只存 room1_regions.json + 导出 PNG，
+    //         **绝不写回 room1.pgm**。手画不可能和真实墙体像素级对齐，
+    //         写回去会让 Nav2 认为那里有墙，直接把路堵死。
+    // ============================================================
+    const Guide = (function () {
+        var MAP_NAME = 'room1';
+        var STROKE_COLOR = '#b8562a';
+        var REGION_COLOR = '#f0a75c';
+
+        // 状态
+        var st = {
+            active: false,
+            step: 0,             // 0=未开始 1=引导建图 2=手动渲染
+            data: null,          // /guide/map 的响应
+            img: null,           // 已加载的 Image
+            strokes: [],         // 手绘线 [{type, pts, w, color}]
+            regions: [],         // 区域 [{name, bbox_px, color}]
+            tool: 'pan',
+            undo: [],            // 撤销栈：['stroke', idx] / ['region', idx]
+            zoom: 1,
+            drag: null,          // 正在拖拽 {x0, y0, x1, y1}
+            pending: null,       // 等命名的区域框
+            busy: false,
+
+            // ---- 直线锚点锁定 ----
+            // 自动描边出来的线是一堆小台阶，手画一条干净的线去盖住它时，
+            // 端点必须**精确落在线段端点上**，否则差一两个像素就对不齐，
+            // 放大后看着像没连上。所以给所有线段的端点做成可吸附的锚点。
+            anchor: {
+                anchors: [],     // [{x, y}] 当前所有可吸附点（已去重）
+                hover: null,     // 鼠标悬停 → 预锁定的索引
+                pending: null,   // 触屏：已预锁定、等第二次点确认的索引
+                start: null,     // 已正式锁定的起点 {x, y, idx}
+                cursor: null,    // 光标位置，用于画锁定后的预览线
+                snap: true,      // 总开关
+            },
+
+            // ---- 橡皮擦 ----
+            // 擦的是「线段的突出部分」，所以不能整条删，必须把线
+            // 从圆形范围里切掉、保留两边剩下的。
+            eraser: {
+                radiusScreen: 14,  // 半径（屏幕像素），换算时按当前缩放
+                erasing: false,
+                cursor: null,      // {x, y} 地图像素坐标
+            },
+
+            // ---- 多指缩放 ----
+            // pointers 记录当前压在画布上的所有指针，用来识别双指。
+            // pinch 仅在两根手指同时按下时非 null。
+            pointers: {},
+            pinch: null,
+
+            // ---- 视图位置（画布左上角相对空白容器的偏移）----
+            // init=false 表示还没首次摆位，layoutCanvas 会做居中
+            view: { x: 0, y: 0, init: false },
+            fitScale: 1,
+            panDrag: null,      // 拖动平移中的描点
+        };
+
+        var canvas = null, ctx = null;
+        var dpr = 1;
+
+        // ---------------- 气泡 ----------------
+        function showBubble(text, holdMs) {
+            var el = document.getElementById('butlerBubble');
+            if (!el) return;
+            el.textContent = text;
+            el.classList.add('is-show');
+            if (holdMs) {
+                clearTimeout(showBubble._t);
+                showBubble._t = setTimeout(function () {
+                    el.classList.remove('is-show');
+                }, holdMs);
+            }
+        }
+
+        function hideBubble() {
+            var el = document.getElementById('butlerBubble');
+            if (el) el.classList.remove('is-show');
+            var g = document.getElementById('guideBotBubble');
+            if (g) g.classList.remove('is-show');
+        }
+
+        // ---------------- 步骤 1：引导建图 ----------------
+        function enterStep1() {
+            st.active = true;
+            st.step = 1;
+
+            // 机器人就在连接页上，不切视图，只加气泡。
+            // ★ 先给连接页加上 is-guide：隐藏 BOUTEILLIER 标题、
+            //   把机器人从「标题旁的装饰」改成居中的引导 icon。
+            //   用户明确要求「标题要消失，只保留机器人 icon」。
+            var home = document.getElementById('viewHome');
+            if (home) home.classList.add('is-guide');
+
+            showBubble('开始第一次建图吧', 2000);
+            addLog('引导：开始第一次建图', 'info');
+
+            // 气泡 2 秒后消失，此时才弹组件（用户要求的顺序）
+            setTimeout(function () {
+                if (st.step !== 1) return;
+                openWidgets(['joystick', 'map']);
+                var mw = document.getElementById('widget-map');
+                if (mw) {
+                    mw.classList.add('is-guide-mode');
+                    // 手机上左右两个浮层会重叠，把地图往下错开
+                    mw.style.left = '';
+                    mw.style.right = '10px';
+                    mw.style.top = (window.innerWidth < 900 ? 300 : 96) + 'px';
+                }
+                var jw = document.getElementById('widget-joystick');
+                if (jw) {
+                    jw.style.left = '10px';
+                    jw.style.top = '86px';
+                }
+                toast('用遥控走一圈，建完点「保存地图」', 'ok', 5200);
+            }, 2000);
+        }
+
+        // ---------------- 步骤 2：手动渲染 ----------------
+        async function enterStep2(savedName) {
+            st.step = 2;
+            st.active = true;
+
+            // ★ 重置缩放与工具状态。
+            //   上一次若停在 2.4x，重新进入时画布会超出可视区，
+            //   用户看到的是“莫名被裁掉一角的地图”，而且拖画时
+            //   坐标也对不上。每次都从「拖动 + 1x」开始。
+            st.zoom = 1;
+            st.drag = null;
+            st.pointers = {};
+            st.pinch = null;
+            st.view = { x: 0, y: 0, init: false };
+            var zoomBtn = document.getElementById('guideToolZoom');
+            if (zoomBtn) {
+                var lbl = zoomBtn.querySelector('span:last-child');
+                if (lbl) lbl.textContent = '放大';
+            }
+            setTool('pan');
+            updateZoomLabel();
+
+            // 收起步骤 1 的组件（它们在工作台上才有意义）
+            ['joystick', 'map'].forEach(function (k) {
+                try { closeWidget(k); } catch (e) { /* 忽略 */ }
+            });
+            hideBubble();
+            switchView('guide');
+
+            // 把连接页那张 SVG 复制过来当引导 icon（不重复维护两份）
+            var src = document.querySelector('#butler svg');
+            var dst = document.getElementById('guideBot');
+            if (src && dst) {
+                // 保留气泡元素，只替换 svg
+                var keep = dst.querySelector('.butler-bubble');
+                dst.innerHTML = '';
+                dst.appendChild(src.cloneNode(true));
+                if (keep) dst.appendChild(keep);
+            }
+
+            var botStage = document.getElementById('guideBotStage');
+            if (botStage) botStage.classList.remove('is-gone');
+
+            showMask('正在整理地图…');
+            renderTags();
+
+            // 先发请求（异步），同时让气泡说话
+            var bubble = document.getElementById('guideBotBubble');
+            if (bubble) {
+                bubble.textContent = '绘制属于自己的地图吧';
+                bubble.classList.add('is-show');
+            }
+
+            var t0 = Date.now();
+            var data = null, errMsg = '';
+
+            try {
+                var res = await fetch('/guide/map?map=' + encodeURIComponent(MAP_NAME)
+                                      + '&block=3');
+                data = await res.json();
+                if (!res.ok || data.status !== 'success') {
+                    errMsg = data.message || ('HTTP ' + res.status);
+                    data = null;
+                }
+            } catch (e) {
+                errMsg = e.message || '网络错误';
+            }
+
+            if (data) {
+                var im = await loadImage('data:image/png;base64,' + data.image);
+                st.data = data;
+                st.img = im;
+                // 把自动描边作为**初始线条**放进 strokes，用户可以直接在上面改
+                var segs = (data.trace && data.trace.segments) || [];
+                st.strokes = segs.map(function (s) {
+                    return {
+                        type: 'line',
+                        pts: [[s[0], s[1]], [s[2], s[3]]],
+                        w: 1.5,
+                        color: STROKE_COLOR,
+                        auto: true,
+                    };
+                });
+                // 自动描边出来的线段端点就是初始锚点表
+                buildAnchors();
+            }
+
+            // 用户要求「机器人提示…两秒后消失，上面的渲染图才张贴出来」
+            var wait = Math.max(0, 2000 - (Date.now() - t0));
+            setTimeout(function () {
+                if (bubble) bubble.classList.remove('is-show');
+                if (botStage) botStage.classList.add('is-gone');
+
+                if (!data) {
+                    showMask('地图还不可用：' + errMsg, true);
+                    return;
+                }
+                hideMask();
+                layoutCanvas();
+                updateExportButton();
+            }, wait);
+
+            // 拉一下已保存的区域（重新引导时可能已经有标注）
+            try {
+                var r2 = await fetch('/guide/regions?map=' + encodeURIComponent(MAP_NAME));
+                var d2 = await r2.json();
+                if (d2.status === 'success' && d2.data) {
+                    st.regions = d2.data.regions || [];
+                    renderTags();
+                }
+            } catch (e) { /* 忽略 */ }
+        }
+
+        // ---------------- 遮罩 ----------------
+        function showMask(text, keepSpinnerOff) {
+            var m = document.getElementById('guideMask');
+            var t = document.getElementById('guideMaskText');
+            if (t && text) t.textContent = text;
+            if (m) {
+                m.classList.remove('is-gone');
+                var sp = m.querySelector('.guide-spinner');
+                if (sp) sp.style.display = keepSpinnerOff ? 'none' : '';
+            }
+        }
+
+        function hideMask() {
+            var m = document.getElementById('guideMask');
+            if (m) m.classList.add('is-gone');
+        }
+
+        function loadImage(src) {
+            return new Promise(function (resolve, reject) {
+                var im = new Image();
+                im.onload = function () { resolve(im); };
+                im.onerror = function () { reject(new Error('图片解码失败')); };
+                im.src = src;
+            });
+        }
+
+        // ---------------- 画布几何 ----------------
+        // 坐标系：所有绘制都用「地图图片的像素坐标」
+        // ctx.setTransform 一次性把逻辑坐标映射到设备像素，
+        // 之后不用在每处绘制里再算比例。
+        function layoutCanvas() {
+            if (!st.data || !canvas) return;
+            var stage = canvas.parentElement;
+            var pad = 10;
+            var availW = Math.max(60, stage.clientWidth - pad * 2);
+            var availH = Math.max(60, stage.clientHeight - pad * 2);
+            var w = st.data.width, h = st.data.height;
+
+            var fit = Math.min(availW / w, availH / h);
+            var s = fit * st.zoom;
+            st.fitScale = fit;
+
+            dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+            var cw = Math.round(w * s), chh = Math.round(h * s);
+            canvas.style.width = cw + 'px';
+            canvas.style.height = chh + 'px';
+            canvas.width = Math.round(w * s * dpr);
+            canvas.height = Math.round(h * s * dpr);
+
+            ctx = canvas.getContext('2d');
+            ctx.setTransform(s * dpr, 0, 0, s * dpr, 0, 0);
+            ctx.imageSmoothingEnabled = false;
+
+            // 首次布局时把画布居中；之后保持用户当前看到的区域
+            if (!st.view.init) {
+                centerCanvas();
+            } else {
+                clampView();
+                applyView();
+            }
+            render();
+        }
+
+        // ---------------- 视图偏移（平移/缩放的核心状态） ----------------
+        //
+        // 画布是 absolute 定位，用 st.view.x/y 控制它的位置。
+        // 不用 scrollLeft：滚动能到达的边界是固定的（内容右边缘对齐
+        // 视口右边缘），想把画面再往左推就推不动 —— 实测会导致
+        // 缩放时光标下的点横移几百像素。绝对定位没有这个限制。
+        function applyView() {
+            canvas.style.left = Math.round(st.view.x) + 'px';
+            canvas.style.top = Math.round(st.view.y) + 'px';
+        }
+
+        function centerCanvas() {
+            var stage = canvas.parentElement;
+            var cw = canvas.offsetWidth, ch = canvas.offsetHeight;
+            st.view.x = (stage.clientWidth - cw) / 2;
+            st.view.y = (stage.clientHeight - ch) / 2;
+            st.view.init = true;
+            applyView();
+        }
+
+        // 别让画面完全跑出可视区：至少露出 keep 像素，否则就“丢了”
+        //
+        // ★ 边界推导（上一版写错过，导致缩放仍会漂移）：
+        //   要求「画布至少有 keep 像素落在容器内」，即
+        //     x + cw >= keep        → x >= keep - cw     （露右边）
+        //     x <= clientWidth - keep                    （露左边）
+        //   上一版写成 x >= clientWidth - cw - keep，
+        //   那是在强制右侧留 keep 像素空白 —— 比要求的严得多，
+        //   放大到边缘时会被提前夹住，于是光标下的点又开始漂。
+        function clampView() {
+            var stage = canvas.parentElement;
+            var cw = canvas.offsetWidth, ch = canvas.offsetHeight;
+            var keep = Math.min(60, Math.min(cw, ch) / 2);
+            var minX = keep - cw;
+            var maxX = stage.clientWidth - keep;
+            var minY = keep - ch;
+            var maxY = stage.clientHeight - keep;
+            st.view.x = Math.min(Math.max(st.view.x, minX), maxX);
+            st.view.y = Math.min(Math.max(st.view.y, minY), maxY);
+        }
+
+        // 屏幕坐标 → 地图像素坐标
+        function toLocal(ev) {
+            var r = canvas.getBoundingClientRect();
+            return {
+                x: (ev.clientX - r.left) / r.width * st.data.width,
+                y: (ev.clientY - r.top) / r.height * st.data.height,
+            };
+        }
+
+        // ---------------- 缩放 ----------------
+        //
+        // 两个入口：桌面滚轮、手机双指捏合，都走 setZoomAt()。
+        //
+        // 关键不是「把比例改大」，而是**光标（或梱心）下方的那个
+        // 地图点原地不动**。否则一滚就飞走，完全没法用。
+        //
+        // 算起来很直接：
+        //   缩放前：cursor = view.x + mapX * k     （k = 每像素屏幕宽）
+        //   缩放后仍成立 → view.x' = cursor - mapX * k'
+        // 一次乘法就完事，没有误差累积，也不依赖任何容器边界。
+        var ZOOM_MIN = 0.5, ZOOM_MAX = 8;
+
+        function setZoomAt(targetZoom, clientX, clientY) {
+            if (!st.data || !canvas) return;
+
+            var z = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, targetZoom));
+            if (Math.abs(z - st.zoom) < 1e-4) return;
+
+            var stage = canvas.parentElement;
+            var sr = stage.getBoundingClientRect();
+            var cr = canvas.getBoundingClientRect();
+
+            // 光标落在画布外时按视口中心算（例如用缩放按钮触发）
+            var inside = clientX >= cr.left && clientX <= cr.right
+                      && clientY >= cr.top && clientY <= cr.bottom;
+            if (!inside) {
+                clientX = sr.left + sr.width / 2;
+                clientY = sr.top + sr.height / 2;
+            }
+
+            // 缩放前：光标落在哪个地图像素上（按地图像素算，与实现无关）
+            var mapX = (clientX - cr.left) / cr.width * st.data.width;
+            var mapY = (clientY - cr.top) / cr.height * st.data.height;
+
+            st.zoom = z;
+            layoutCanvas();          // 会重设 canvas 尺寸，并把 view 夹回可视区
+
+            // 缩放后：反算 view，使同一个地图像素重新落在光标下
+            var cw = canvas.offsetWidth, ch = canvas.offsetHeight;
+            var kx = cw / st.data.width;
+            var ky = ch / st.data.height;
+
+            st.view.x = (clientX - sr.left) - mapX * kx;
+            st.view.y = (clientY - sr.top) - mapY * ky;
+            clampView();
+            applyView();
+            updateZoomLabel();
+
+            // 锚点/橡皮擦的命中半径是按屏幕像素换算的，缩放后
+            // 要重算一次悬停，否则鼠标没动却“跟丢”了锚点
+            if (st.tool === 'line' && st.anchor.cursor) {
+                st.anchor.hover = findAnchor(
+                    st.anchor.cursor,
+                    st.anchor.start ? st.anchor.start.idx : undefined);
+            }
+            requestRender();
+        }
+
+        function currentZoomLabel() {
+            // 1.00x / 2.40x 这种，两位小数在 0.5~8 区间里够了
+            return (Math.round(st.zoom * 100) / 100).toFixed(2) + 'x';
+        }
+
+        function updateZoomLabel() {
+            var btn = document.getElementById('guideToolZoom');
+            if (!btn) return;
+            var lbl = btn.querySelector('span:last-child');
+            if (lbl) lbl.textContent = currentZoomLabel();
+        }
+
+        // 缩放按钮（无鼠标/无触屏时的傅助入口）：在「适应」「2x」间切
+        function cycleZoom() {
+            if (!canvas) return;
+            var r = canvas.getBoundingClientRect();
+            var cx = r.left + r.width / 2;
+            var cy = r.top + r.height / 2;
+            var next = st.zoom < 1.01 ? 2 : (st.zoom < 2.01 ? 4 : 1);
+            setZoomAt(next, cx, cy);
+        }
+
+        // 适配窗口：回到 1x 并重新居中
+        function resetZoom() {
+            st.zoom = 1;
+            st.view.init = false;    // 让 layoutCanvas 走居中分支
+            layoutCanvas();
+            updateZoomLabel();
+            requestRender();
+        }
+
+        // 1 个地图像素 = 多少屏幕像素。用于把「屏幕上的手感」
+        // 换算成地图坐标：锚点大小、判定半径、虚线间距都要用。
+        function mapPerScreen() {
+            if (!canvas || !st.data) return 1;
+            var r = canvas.getBoundingClientRect();
+            return r.width ? st.data.width / r.width : 1;
+        }
+
+        // ---------------- 锚点 ----------------
+        // 从所有线段的**两端**收集锚点。
+        // 自动描边出来的相邻线段本来就共用端点，所以去重能滤掉一大批。
+        function buildAnchors() {
+            var out = [], seen = {};
+            st.strokes.forEach(function (s) {
+                var p = s.pts;
+                if (!p || p.length < 2) return;
+                // 只取首尾：矩形/圆也有 pts，但端点意义不同，跳过
+                if (s.type !== 'line' && s.type !== 'poly') return;
+                [p[0], p[p.length - 1]].forEach(function (q) {
+                    // 半像素取整做去重键：比这更近的点视为同一个锚点
+                    var k = Math.round(q[0] * 2) + ':' + Math.round(q[1] * 2);
+                    if (seen[k]) return;
+                    seen[k] = true;
+                    out.push({ x: q[0], y: q[1] });
+                });
+            });
+            // 上限保护：锚点太多时光标一移就到处发光，反而难选
+            if (out.length > 240) out = out.slice(0, 240);
+            st.anchor.anchors = out;
+
+            // 清掉失效的引用（撤销/清空后索引会变）
+            if (st.anchor.start && st.anchor.start.idx >= out.length) {
+                st.anchor.start = null;
+            }
+            st.anchor.hover = null;
+            st.anchor.pending = null;
+        }
+
+        // 找离 pt 最近的锚点，超出阈值返回 null。
+        // 阈值按**屏幕像素**算（9px），这样放大/缩小后「好点中」的手感一致。
+        function findAnchor(pt, excludeIdx) {
+            var a = st.anchor;
+            if (!a.snap || !a.anchors.length) return null;
+            var limit = 9 * mapPerScreen();
+            var best = null, bestD = Infinity;
+            for (var i = 0; i < a.anchors.length; i++) {
+                if (i === excludeIdx) continue;
+                var p = a.anchors[i];
+                var dx = p.x - pt.x, dy = p.y - pt.y;
+                var d = dx * dx + dy * dy;
+                if (d < bestD) { bestD = d; best = i; }
+            }
+            return (best !== null && bestD <= limit * limit) ? best : null;
+        }
+
+        // 取消锁定（不影响已生成的线）
+        function cancelAnchor() {
+            st.anchor.start = null;
+            st.anchor.pending = null;
+            st.anchor.hover = null;
+            requestRender();
+        }
+
+        // ---------------- 橡皮擦 ----------------
+        //
+        // 需求是「擦除预描线段的**突出部分**」，不是整条删。
+        // 自动描边出来的线常常会比实际墙角多伸出去一小截，用户想要的是
+        // 「把多出来的那截刷掉，剩下的还留着」。
+        //
+        // 所以这里的做法是**按圆形范围切分线段**：
+        //   1. 解「线段与圆」的交点，得到参数区间 [t0, t1]
+        //   2. 把 [t0, t1] 从线段上剪掉
+        //   3. [0, t0] 和 [t1, 1] 各自成为新线段（太短的丢弃）
+        //
+        // 矩形/圆没法“擦一半”（留下半个矩形没有语义），命中就整条删。
+        //
+        // 为什么不用 canvas 的 destination-out 直接擦像素：
+        //   那只是把画面擦花了，数据结构里线段还在，导出时又全部回来；
+        //   而且一重绘（改缩放、切工具）擦痕就没了。必须改数据。
+
+        function eraserRadiusMap() {
+            return st.eraser.radiusScreen * mapPerScreen();
+        }
+
+        // 线段 A→B 与圆 (C, r) 相交的参数区间。
+        // 返回 [t0, t1]（都在 0..1 内，可能被夹到边界），不相交返回 null。
+        function segCircleRange(ax, ay, bx, by, cx, cy, r) {
+            var dx = bx - ax, dy = by - ay;
+            var fx = ax - cx, fy = ay - cy;
+            var a = dx * dx + dy * dy;
+            if (a < 1e-12) return null;              // 退化成一个点
+
+            var b = 2 * (fx * dx + fy * dy);
+            var c = fx * fx + fy * fy - r * r;
+            var disc = b * b - 4 * a * c;
+            if (disc <= 0) return null;              // 不相交或只擦到一点
+
+            var sq = Math.sqrt(disc);
+            var t0 = (-b - sq) / (2 * a);
+            var t1 = (-b + sq) / (2 * a);
+            if (t1 < 0 || t0 > 1) return null;       // 圆在段外
+
+            return [Math.max(0, t0), Math.min(1, t1)];
+        }
+
+        // 在 pt 处擦一下。返回是否真的改动了内容。
+        function eraseAt(pt) {
+            var r = eraserRadiusMap();
+            // 半径下限：太小时在小地图上几乎擦不动
+            r = Math.max(r, 0.8);
+
+            var kept = [];
+            var changed = false;
+
+            st.strokes.forEach(function (s) {
+                var p = s.pts;
+                if (!p || p.length < 2) { kept.push(s); return; }
+
+                // --- 线段：支持切分 ---
+                if (s.type === 'line' || s.type === 'poly') {
+                    var isLine = (s.type === 'line');
+                    // poly 只处理单段的情况，多段保持原样（少见）
+                    if (s.type === 'poly' && p.length > 2) {
+                        kept.push(s);
+                        return;
+                    }
+                    var ax = p[0][0], ay = p[0][1];
+                    var bx = p[p.length - 1][0], by = p[p.length - 1][1];
+                    var rg = segCircleRange(ax, ay, bx, by, pt.x, pt.y, r);
+
+                    if (!rg) { kept.push(s); return; }
+                    changed = true;
+
+                    var t0 = rg[0], t1 = rg[1];
+                    // 最小保留长度（地图像素）：短于这个就当全被擦掉，
+                    // 避免留下一堆肉眼看不见的碎线头
+                    var minLen = Math.max(0.8, 1.6 * mapPerScreen());
+                    var vx = bx - ax, vy = by - ay;
+                    var fullLen = Math.sqrt(vx * vx + vy * vy);
+
+                    // 左段 [0, t0]
+                    if (t0 * fullLen >= minLen) {
+                        kept.push({
+                            type: isLine ? 'line' : 'poly',
+                            pts: [[ax, ay],
+                                  [ax + vx * t0, ay + vy * t0]],
+                            w: s.w, color: s.color,
+                            auto: s.auto, snapped: s.snapped,
+                        });
+                    }
+                    // 右段 [t1, 1]
+                    if ((1 - t1) * fullLen >= minLen) {
+                        kept.push({
+                            type: isLine ? 'line' : 'poly',
+                            pts: [[ax + vx * t1, ay + vy * t1],
+                                  [bx, by]],
+                            w: s.w, color: s.color,
+                            auto: s.auto, snapped: s.snapped,
+                        });
+                    }
+                    return;
+                }
+
+                // --- 矩形 / 圆：命中即整条删 ---
+                var hit = false;
+                if (s.type === 'rect') {
+                    var x0 = Math.min(p[0][0], p[1][0]), x1 = Math.max(p[0][0], p[1][0]);
+                    var y0 = Math.min(p[0][1], p[1][1]), y1 = Math.max(p[0][1], p[1][1]);
+                    // 判断圆与矩形边框是否接近：先夹取到矩形上最近点
+                    var nx = Math.max(x0, Math.min(pt.x, x1));
+                    var ny = Math.max(y0, Math.min(pt.y, y1));
+                    // 点落在矩形内部时 nx/ny 就是 pt 本身，距离 0 → 算命中
+                    var inside = (pt.x >= x0 && pt.x <= x1 && pt.y >= y0 && pt.y <= y1);
+                    hit = inside || Math.hypot(pt.x - nx, pt.y - ny) <= r;
+                } else if (s.type === 'circle') {
+                    var cx = p[0][0], cy = p[0][1];
+                    var rad = Math.hypot(p[1][0] - cx, p[1][1] - cy);
+                    var d = Math.hypot(pt.x - cx, pt.y - cy);
+                    // 命中圆环（圆周附近）或者擦到圆心附近也算
+                    hit = Math.abs(d - rad) <= r || d <= r;
+                }
+
+                if (hit) { changed = true; return; }
+                kept.push(s);
+            });
+
+            if (changed) st.strokes = kept;
+            return changed;
+        }
+
+        function setEraserCursor(pt) {
+            st.eraser.cursor = pt;
+        }
+
+        // 深拷贝线段表。只拷贝需要的东西（pts 是二维数组，必须重建，
+        // 否则切分后的新数组会反过来改到快照的数据）。
+        function cloneStrokes() {
+            return st.strokes.map(function (s) {
+                return {
+                    type: s.type,
+                    pts: s.pts.map(function (q) { return [q[0], q[1]]; }),
+                    w: s.w, color: s.color,
+                    auto: s.auto, snapped: s.snapped,
+                };
+            });
+        }
+
+        function drawEraserCursor() {
+            var e = st.eraser;
+            if (!e.cursor) return;
+            var r = Math.max(eraserRadiusMap(), 0.8);
+            var mps = mapPerScreen();
+
+            ctx.save();
+            ctx.beginPath();
+            ctx.arc(e.cursor.x, e.cursor.y, r, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(232, 112, 95, 0.18)';
+            ctx.fill();
+            ctx.lineWidth = Math.max(0.6, 1.2 * mps);
+            ctx.strokeStyle = '#e8705f';
+            ctx.setLineDash([3 * mps, 2 * mps]);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.restore();
+        }
+
+        // ---------------- 绘制 ----------------
+        var rafPending = false;
+
+        function requestRender() {
+            if (rafPending) return;
+            rafPending = true;
+            requestAnimationFrame(function () {
+                rafPending = false;
+                render();
+            });
+        }
+
+        function render() {
+            if (!st.data || !ctx) return;
+            var w = st.data.width, h = st.data.height;
+
+            ctx.save();
+            ctx.clearRect(0, 0, w, h);
+
+            // 1) 地图底图
+            if (st.img) {
+                ctx.imageSmoothingEnabled = false;
+                ctx.drawImage(st.img, 0, 0, w, h);
+            }
+
+            // 2) 手绘线（含自动描边生成的初始线）
+            st.strokes.forEach(function (s) { drawStroke(s); });
+
+            // 3) 区域框 + 名字
+            st.regions.forEach(function (r) { drawRegion(r); });
+
+            // 4) 锚点：只在直线工具下显示。
+            //    其他工具下把锚点画出来只会变成一片雪花点。
+            if (st.tool === 'line') drawAnchors();
+
+            // 4b) 橡皮擦光标圈
+            if (st.tool === 'eraser') drawEraserCursor();
+
+            // 5) 已锁定起点 → 一条跟手的预览线
+            if (st.anchor.start) drawAnchorPreview();
+
+            // 6) 正在拖拽的预览
+            if (st.drag) drawPreview();
+
+            ctx.restore();
+        }
+
+        function drawStroke(s) {
+            var p = s.pts;
+            if (!p || p.length < 2) return;
+            ctx.strokeStyle = s.color || STROKE_COLOR;
+            ctx.lineWidth = s.w || 1.5;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.beginPath();
+            if (s.type === 'line') {
+                ctx.moveTo(p[0][0], p[0][1]);
+                ctx.lineTo(p[p.length - 1][0], p[p.length - 1][1]);
+            } else if (s.type === 'rect') {
+                ctx.rect(p[0][0], p[0][1], p[1][0] - p[0][0], p[1][1] - p[0][1]);
+            } else if (s.type === 'circle') {
+                var rr = Math.hypot(p[1][0] - p[0][0], p[1][1] - p[0][1]);
+                ctx.arc(p[0][0], p[0][1], rr, 0, Math.PI * 2);
+            } else {
+                ctx.moveTo(p[0][0], p[0][1]);
+                for (var i = 1; i < p.length; i++) ctx.lineTo(p[i][0], p[i][1]);
+            }
+            ctx.stroke();
+        }
+
+        function drawRegion(r) {
+            var b = r.bbox_px;
+            if (!b || b.length !== 4) return;
+            var x0 = Math.min(b[0], b[2]), x1 = Math.max(b[0], b[2]);
+            var y0 = Math.min(b[1], b[3]), y1 = Math.max(b[1], b[3]);
+
+            ctx.save();
+            ctx.fillStyle = 'rgba(240, 167, 92, 0.22)';
+            ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+            ctx.strokeStyle = r.color || REGION_COLOR;
+            ctx.lineWidth = 1.6;
+            ctx.setLineDash([4, 3]);
+            ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+            ctx.setLineDash([]);
+
+            // 名字：字号跟地图尺寸挂钩，小图小字
+            var fs = Math.max(6, Math.min(st.data.width, st.data.height) * 0.055);
+            ctx.font = '700 ' + fs + 'px "PingFang SC", "Noto Sans CJK SC", sans-serif';
+            ctx.textBaseline = 'top';
+            var tx = x0 + fs * 0.35, ty = y0 + fs * 0.35;
+            // 先描白边，深色底上也看得清
+            ctx.lineWidth = Math.max(1, fs * 0.28);
+            ctx.strokeStyle = 'rgba(255,255,255,0.92)';
+            ctx.lineJoin = 'round';
+            ctx.strokeText(r.name, tx, ty);
+            ctx.fillStyle = '#6b3f1e';
+            ctx.fillText(r.name, tx, ty);
+            ctx.restore();
+        }
+
+        function drawPreview() {
+            var d = st.drag;
+            var x0 = Math.min(d.x0, d.x1), x1 = Math.max(d.x0, d.x1);
+            var y0 = Math.min(d.y0, d.y1), y1 = Math.max(d.y0, d.y1);
+
+            ctx.save();
+            ctx.strokeStyle = st.tool === 'region' ? REGION_COLOR : '#f08c3c';
+            ctx.lineWidth = 1.6;
+            ctx.setLineDash([5, 3]);
+            ctx.beginPath();
+            if (st.tool === 'line') {
+                ctx.moveTo(d.x0, d.y0);
+                ctx.lineTo(d.x1, d.y1);
+            } else if (st.tool === 'circle') {
+                ctx.arc(d.x0, d.y0, Math.hypot(d.x1 - d.x0, d.y1 - d.y0),
+                        0, Math.PI * 2);
+            } else {
+                ctx.rect(x0, y0, x1 - x0, y1 - y0);
+            }
+            ctx.stroke();
+            ctx.restore();
+        }
+
+        // 锚点手柄。三种状态一眼要能分清：
+        //   普通   → 白底棕边小圆（提示“这里可吸附”但不要太抢眼）
+        //   预锁定 → 放大 + 橙色光晕（鼠标悬停 / 触屏第一次点）
+        //   已锁定 → 实心橙 + 深橙边（正式定住，作为线段起点）
+        function drawAnchors() {
+            var a = st.anchor;
+            if (!a.snap || !a.anchors.length) return;
+
+            var mps = mapPerScreen();   // 地图像素 / 屏幕像素
+            var rIdle = 3.2 * mps;      // 直径约 6.4 屏幕像素
+            var rHot = 5.5 * mps;
+            var lw = Math.max(0.6, 1.1 * mps);
+
+            for (var i = 0; i < a.anchors.length; i++) {
+                var p = a.anchors[i];
+                var locked = !!(a.start && a.start.idx === i);
+                var hot = (a.hover === i) || (a.pending === i) || locked;
+
+                if (hot) {
+                    // 外圈光晕：比本体大一圈，在密集区也能看出是哪一颗
+                    ctx.beginPath();
+                    ctx.arc(p.x, p.y, rHot * 2.1, 0, Math.PI * 2);
+                    ctx.fillStyle = locked
+                        ? 'rgba(240, 140, 60, 0.30)'
+                        : 'rgba(240, 140, 60, 0.20)';
+                    ctx.fill();
+                }
+
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, hot ? rHot : rIdle, 0, Math.PI * 2);
+                ctx.fillStyle = locked ? '#f08c3c' : '#ffffff';
+                ctx.fill();
+                ctx.lineWidth = locked ? lw * 1.6 : lw;
+                ctx.strokeStyle = locked ? '#b8562a' : '#c9863c';
+                ctx.stroke();
+            }
+        }
+
+        // 锁定起点后，从它拉一条虚线到光标，并高亮即将锁定的终点
+        function drawAnchorPreview() {
+            var a = st.anchor;
+            var s = a.start;
+            if (!s) return;
+            var c = a.cursor || s;
+
+            var mps = mapPerScreen();
+
+            ctx.save();
+            ctx.strokeStyle = '#f08c3c';
+            ctx.lineWidth = Math.max(0.8, 1.5 * mps);
+            ctx.setLineDash([4 * mps, 3 * mps]);
+            ctx.beginPath();
+            ctx.moveTo(s.x, s.y);
+            ctx.lineTo(c.x, c.y);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            // 起点加一个实心小点，明确“这一头已经定住了”
+            ctx.beginPath();
+            ctx.arc(s.x, s.y, Math.max(1, 2.2 * mps), 0, Math.PI * 2);
+            ctx.fillStyle = '#b8562a';
+            ctx.fill();
+            ctx.restore();
+        }
+
+        // ---------------- 指针交互 ----------------
+        //
+        // 直线工具相比其他工具多了一套「锚点锁定」流程：
+        //
+        //   鼠标：悬停在锚点附近 → 自动预锁定（高亮）
+        //         按下 → 正式锁定为起点
+        //         再悬停另一个锚点 → 预锁定
+        //         按下 → 锁定终点并生成线段
+        //
+        //   触屏：没有 hover，所以靠点按分两步：
+        //         第一次点 → 预锁定；再点同一个锚点 → 正式锁定
+        //         （与鼠标行为对齐，只是把 hover 换成了一次点按）
+        //
+        // 没命中任何锚点时退回原来的「拖动画线」，不损失旧用法。
+        function onDown(ev) {
+            if (!st.data) return;
+            ev.preventDefault();
+
+            // ---- 多指：第二根手指落下就进入捏合模式，并中断当前绘制 ----
+            // 为什么必须中断：用户本来可能正在画线，这时想放大看图，
+            // 顺手再放一根手指 —— 如果不中断，那根手指会被当成
+            // “拖动画线”，凭空拉出一条线出来。
+            st.pointers[ev.pointerId] = { x: ev.clientX, y: ev.clientY };
+            if (Object.keys(st.pointers).length >= 2) {
+                beginPinch();
+                return;
+            }
+
+            if (st.tool === 'pan') {
+                // 拖动平移。放大后必须能平移，否则只能看到图的一小块。
+                // 注意：这里不调用 ev.preventDefault() 之前已经调过了。
+                st.panDrag = { x: ev.clientX, y: ev.clientY,
+                               vx: st.view.x, vy: st.view.y };
+                if (canvas) canvas.style.cursor = 'grabbing';
+                try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* 忽略 */ }
+                return;
+            }
+
+            var pt = toLocal(ev);
+            var isTouch = (ev.pointerType === 'touch');
+
+            // ---- 橡皮擦：按下开擦，全程只压一次快照 ----
+            // 每移动一下就压快照会把撤销栈爆掉（几十步擦除要按几十次
+            // 撤销才能退回去），所以一次手势只记一个快照。
+            if (st.tool === 'eraser') {
+                st.undo.push({ kind: 'snapshot', strokes: cloneStrokes() });
+                st.eraser.erasing = true;
+                setEraserCursor(pt);
+                if (eraseAt(pt)) buildAnchors();
+                try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* 忽略 */ }
+                render();
+                return;
+            }
+
+            if (st.tool === 'line' && st.anchor.snap) {
+                // 再点一次「已锁定的起点」→ 取消锁定。
+                // 这是最自然的反悔手势：不用去找 Esc，也不用切换工具。
+                if (st.anchor.start) {
+                    var selfHit = findAnchor(pt);
+                    if (selfHit === st.anchor.start.idx) {
+                        cancelAnchor();
+                        return;
+                    }
+                }
+
+                // 找起点时不排除任何点；找终点时排除已锁定的起点
+                var hit = findAnchor(pt, st.anchor.start ? st.anchor.start.idx : undefined);
+
+                if (!st.anchor.start) {
+                    if (hit !== null) {
+                        if (isTouch && st.anchor.pending !== hit) {
+                            // 触屏第一次点：只预锁定，等第二次点确认
+                            st.anchor.pending = hit;
+                            st.anchor.hover = hit;
+                            requestRender();
+                            return;
+                        }
+                        var p0 = st.anchor.anchors[hit];
+                        st.anchor.start = { x: p0.x, y: p0.y, idx: hit };
+                        st.anchor.pending = null;
+                        st.anchor.hover = hit;
+                        st.anchor.cursor = { x: p0.x, y: p0.y };
+                        try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* 忽略 */ }
+                        requestRender();
+                        return;
+                    }
+                    // 没命中锚点 → 走下面的普通拖拽
+                } else {
+                    var end;
+                    if (hit !== null) {
+                        if (isTouch && st.anchor.pending !== hit) {
+                            st.anchor.pending = hit;
+                            st.anchor.hover = hit;
+                            requestRender();
+                            return;
+                        }
+                        var p1 = st.anchor.anchors[hit];
+                        end = { x: p1.x, y: p1.y };
+                    } else {
+                        // 第二头点空地：按点下的位置结束，不强行吸到锚点
+                        end = { x: pt.x, y: pt.y };
+                    }
+                    commitAnchorLine(end);
+                    return;
+                }
+            }
+
+            st.drag = { x0: pt.x, y0: pt.y, x1: pt.x, y1: pt.y };
+            try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* 忽略 */ }
+            requestRender();
+        }
+
+        function onMove(ev) {
+            if (!st.data) return;
+
+            // 更新指针位置，如果正在捏合就只处理缩放
+            if (st.pointers[ev.pointerId]) {
+                st.pointers[ev.pointerId] = { x: ev.clientX, y: ev.clientY };
+            }
+            if (st.pinch) {
+                ev.preventDefault();
+                updatePinch();
+                return;
+            }
+
+            // 拖动平移
+            if (st.panDrag) {
+                ev.preventDefault();
+                st.view.x = st.panDrag.vx + (ev.clientX - st.panDrag.x);
+                st.view.y = st.panDrag.vy + (ev.clientY - st.panDrag.y);
+                clampView();
+                applyView();
+                return;
+            }
+
+            var pt = toLocal(ev);
+            // 橡皮擦：擦除中就跟手连续擦；没按下时只更新光标圈
+            if (st.tool === 'eraser') {
+                setEraserCursor(pt);
+                if (st.eraser.erasing) {
+                    ev.preventDefault();
+                    if (eraseAt(pt)) buildAnchors();
+                }
+                requestRender();
+                return;
+            }
+
+            // 直线工具：跟踪光标并做悬停预锁定
+            if (st.tool === 'line' && st.anchor.snap) {
+                st.anchor.cursor = { x: pt.x, y: pt.y };
+
+                // 触屏没有 hover 语义：不自动改 hover，交给点按控制
+                if (ev.pointerType !== 'touch') {
+                    var exclude = st.anchor.start ? st.anchor.start.idx : undefined;
+                    var hit = findAnchor(pt, exclude);
+                    if (hit !== st.anchor.hover) {
+                        st.anchor.hover = hit;
+                        requestRender();
+                    }
+                }
+                // 已锁定起点时，移动就要重绘预览线
+                if (st.anchor.start && !st.drag) {
+                    requestRender();
+                }
+            }
+
+            if (!st.drag) return;
+            ev.preventDefault();
+            st.drag.x1 = pt.x;
+            st.drag.y1 = pt.y;
+            requestRender();
+        }
+
+        // 锁定两头后生成线段
+        function commitAnchorLine(end) {
+            var s = st.anchor.start;
+            if (!s) return;
+
+            // 两端几乎重合时不要生成零长度线段（它会变成看不见的
+            // 脏数据，而且会让锚点表里多出一堆重复点）
+            if (Math.hypot(end.x - s.x, end.y - s.y) < 0.6) {
+                cancelAnchor();
+                return;
+            }
+
+            st.strokes.push({
+                type: 'line',
+                pts: [[s.x, s.y], [end.x, end.y]],
+                w: 1.8,
+                color: STROKE_COLOR,
+                snapped: true,          // 标记“由锚点锁定生成”，方便日后区分
+            });
+            st.undo.push({ kind: 'stroke' });
+
+            st.anchor.start = null;
+            st.anchor.pending = null;
+            st.anchor.hover = null;
+            buildAnchors();             // 新线段的两端也变成可吸附点
+            updateExportButton();
+            render();
+        }
+
+        // ---------------- 双指捏合 ----------------
+        //
+        // 捏合开始时把「两指距离」和「当前缩放」都记下来，之后每帧
+        // 用「新距离 / 初始距离」算倍数。这样即使渲染慢、掉帧，
+        // 缩放量也不会累积漂移。
+        function beginPinch() {
+            var ids = Object.keys(st.pointers);
+            if (ids.length < 2) return;
+            var p1 = st.pointers[ids[0]], p2 = st.pointers[ids[1]];
+
+            // 正在画线/擦除/平移 → 全部作废，避免手指一多就画出一堆怪线
+            st.drag = null;
+            st.panDrag = null;
+            if (st.eraser.erasing) {
+                st.eraser.erasing = false;
+                buildAnchors();
+            }
+            cancelAnchor();
+
+            st.pinch = {
+                startDist: Math.max(1, Math.hypot(p1.x - p2.x, p1.y - p2.y)),
+                startZoom: st.zoom,
+            };
+            if (canvas) canvas.style.cursor = 'grabbing';
+            requestRender();
+        }
+
+        function updatePinch() {
+            var ids = Object.keys(st.pointers);
+            if (ids.length < 2 || !st.pinch) return;
+            var p1 = st.pointers[ids[0]], p2 = st.pointers[ids[1]];
+
+            var dist = Math.max(1, Math.hypot(p1.x - p2.x, p1.y - p2.y));
+            var midX = (p1.x + p2.x) / 2;
+            var midY = (p1.y + p2.y) / 2;
+
+            // 用**初始**缩放 × 当前比值，不是在上一次结果上累乘 ——
+            // 后者在掉帧时会把误差累积起来，松手后缩放跑到离谱的值。
+            setZoomAt(st.pinch.startZoom * (dist / st.pinch.startDist), midX, midY);
+        }
+
+        function onUp(ev) {
+            // ---- 多指收尾 ----
+            // 捏合结束时可能还剩一根手指没抬，不能直接回到画线状态，
+            // 否则会从那一根的位置开始拖出线条。先把状态清干净，
+            // 等下一轮完整按下再工作。
+            if (st.pointers) delete st.pointers[ev.pointerId];
+            if (st.pinch) {
+                if (Object.keys(st.pointers).length < 2) st.pinch = null;
+                return;
+            }
+
+            // 拖动平移收尾
+            if (st.panDrag) {
+                st.panDrag = null;
+                if (canvas) canvas.style.cursor = st.tool === 'pan' ? 'grab' : 'crosshair';
+                return;
+            }
+
+            // 橡皮擦收尾：结束擦除、清光标、重建锚点
+            if (st.tool === 'eraser') {
+                if (st.eraser.erasing) {
+                    st.eraser.erasing = false;
+                    buildAnchors();
+                    updateExportButton();
+                    render();
+                }
+                return;
+            }
+
+            if (!st.drag) return;
+            ev.preventDefault();
+            var d = st.drag;
+            st.drag = null;
+
+            var dx = Math.abs(d.x1 - d.x0);
+            var dy = Math.abs(d.y1 - d.y0);
+            // 放大后一个像素可能就几 px，阈值给 1.5 个地图像素，
+            // 避免「手指稳不住→满屏乱线」
+            var minLen = Math.max(1.5, Math.min(st.data.width, st.data.height) * 0.012);
+
+            if (st.tool === 'region') {
+                if (dx < minLen || dy < minLen) { requestRender(); return; }
+                st.pending = {
+                    bbox: [Math.min(d.x0, d.x1), Math.min(d.y0, d.y1),
+                           Math.max(d.x0, d.x1), Math.max(d.y0, d.y1)],
+                };
+                openDialog('');
+                return;
+            }
+
+            if (Math.hypot(dx, dy) < minLen) { requestRender(); return; }
+
+            var stroke = { type: st.tool, pts: [], w: 1.8, color: STROKE_COLOR };
+            if (st.tool === 'line') {
+                stroke.pts = [[d.x0, d.y0], [d.x1, d.y1]];
+            } else if (st.tool === 'rect' || st.tool === 'circle') {
+                stroke.pts = [[d.x0, d.y0], [d.x1, d.y1]];
+            } else {
+                stroke.pts = [[d.x0, d.y0], [d.x1, d.y1]];
+            }
+            st.strokes.push(stroke);
+            st.undo.push({ kind: 'stroke' });
+            buildAnchors();
+            updateExportButton();
+            render();
+        }
+
+        // ---------------- 工具切换 ----------------
+        var TOOL_HINTS = {
+            pan: '拖动平移；滚轮或双指可缩放，双击回到适应窗口。',
+            line: '点锚点锁起点 → 再点另一端连线；鼠标悬停会自动预锁定。',
+            rect: '按住拖动画矩形。',
+            circle: '按住拖动画圆。',
+            region: '按住拖出范围，松手给这块区域起名字。',
+            eraser: '按住拖动擦掉多出来的线段；只擦掉笔迹，不影响地图。',
+        };
+
+        function setTool(name) {
+            // 离开直线工具时清掉锁定状态，否则再切回来看见一条
+            // “停在半空的虚线”会让人不知所措
+            if (st.tool !== name) cancelAnchor();
+            // 离开橡皮擦时把光标圈抹掉
+            if (st.tool === 'eraser' && name !== 'eraser') {
+                st.eraser.cursor = null;
+                st.eraser.erasing = false;
+            }
+
+            st.tool = name;
+            document.querySelectorAll('[data-guide-tool]').forEach(function (b) {
+                b.classList.toggle('is-active', b.getAttribute('data-guide-tool') === name);
+            });
+            if (canvas) {
+                canvas.style.cursor = name === 'pan' ? 'grab' : 'crosshair';
+            }
+            var hint = document.getElementById('guideHint');
+            if (hint && TOOL_HINTS[name]) hint.textContent = TOOL_HINTS[name];
+            requestRender();
+        }
+        function undo() {
+            var last = st.undo.pop();
+            if (!last) { toast('没有可撤销的操作', 'warn'); return; }
+            if (last.kind === 'stroke') {
+                st.strokes.pop();
+            } else if (last.kind === 'region') {
+                st.regions.pop();
+                renderTags();
+            } else if (last.kind === 'snapshot') {
+                // 橡皮擦：整表恢复。一次手势一个快照，所以撤销一下
+                // 就把整段擦除动作退回去了。
+                st.strokes = last.strokes;
+            }
+            // 线段变了 → 锚点表也要重建，否则会吸附到不存在的点
+            cancelAnchor();
+            buildAnchors();
+            updateExportButton();
+            render();
+        }
+
+        function clearAll() {
+            if (!st.strokes.length && !st.regions.length) {
+                toast('画布已经是空的', 'warn');
+                return;
+            }
+            if (!confirm('清空所有绘制线条和区域标注？')) return;
+            st.strokes = [];
+            st.regions = [];
+            st.undo = [];
+            cancelAnchor();
+            buildAnchors();
+            renderTags();
+            updateExportButton();
+            render();
+        }
+
+        async function retrace() {
+            if (!st.data) return;
+            toast('正在重新描边…', 'ok', 1500);
+            try {
+                var res = await fetch('/guide/map?map=' + encodeURIComponent(MAP_NAME) + '&block=3');
+                var d = await res.json();
+                if (d.status !== 'success') { toast(d.message || '描边失败', 'err'); return; }
+                var segs = (d.trace && d.trace.segments) || [];
+                // 只替换自动生成的线，用户手画的不动
+                st.strokes = st.strokes.filter(function (s) { return !s.auto; });
+                segs.forEach(function (s) {
+                    st.strokes.push({
+                        type: 'line', pts: [[s[0], s[1]], [s[2], s[3]]],
+                        w: 1.5, color: STROKE_COLOR, auto: true,
+                    });
+                    st.undo.push({ kind: 'stroke' });
+                });
+                buildAnchors();
+                updateExportButton();
+                render();
+                toast('已重新描边（' + segs.length + ' 段）', 'ok');
+            } catch (e) {
+                toast('描边失败: ' + e.message, 'err');
+            }
+        }
+
+        // ---------------- 区域命名 ----------------
+        function openDialog(defaultText) {
+            var dlg = document.getElementById('guideDialog');
+            var inp = document.getElementById('guideDialogInput');
+            if (inp) inp.value = defaultText || '';
+            if (dlg) dlg.classList.add('is-show');
+            // 稍等一下再 focus，否则移动端键盘会把弹窗顶上去了又缩回来
+            setTimeout(function () { if (inp) inp.focus(); }, 120);
+        }
+
+        function closeDialog() {
+            var dlg = document.getElementById('guideDialog');
+            if (dlg) dlg.classList.remove('is-show');
+            st.pending = null;
+            render();
+        }
+
+        function confirmDialog(forceName) {
+            var inp = document.getElementById('guideDialogInput');
+            var name = (forceName !== undefined ? forceName
+                        : (inp ? inp.value : '')).trim();
+            if (!name) { toast('请输入区域名字', 'warn'); return; }
+            if (st.regions.some(function (r) { return r.name === name; })) {
+                toast('已经有叫「' + name + '」的区域了', 'warn');
+                return;
+            }
+            if (!st.pending) { closeDialog(); return; }
+            st.regions.push({
+                name: name,
+                bbox_px: st.pending.bbox,
+                color: REGION_COLOR,
+            });
+            st.undo.push({ kind: 'region' });
+            closeDialog();
+            renderTags();
+            updateExportButton();
+            render();
+            toast('已标注「' + name + '」', 'ok');
+        }
+
+        function renderTags() {
+            var box = document.getElementById('guideTags');
+            if (!box) return;
+            box.innerHTML = '';
+            st.regions.forEach(function (r, i) {
+                var el = document.createElement('span');
+                el.className = 'guide-tag';
+                el.innerHTML = '<span>🏷️ ' + escapeHtml(r.name) + '</span>';
+                var btn = document.createElement('button');
+                btn.textContent = '✕';
+                btn.title = '删除这个区域';
+                btn.addEventListener('click', function () {
+                    st.regions.splice(i, 1);
+                    renderTags();
+                    updateExportButton();
+                    render();
+                });
+                el.appendChild(btn);
+                box.appendChild(el);
+            });
+        }
+
+        function escapeHtml(s) {
+            return String(s).replace(/[&<>"']/g, function (c) {
+                return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;',
+                          '"': '&quot;', "'": '&#39;' })[c];
+            });
+        }
+
+        // ---------------- 导出 ----------------
+        function updateExportButton() {
+            var btn = document.getElementById('guideExport');
+            if (!btn) return;
+            btn.disabled = !st.data;
+            btn.textContent = st.data ? '导出并进入操控页' : '地图未就绪';
+        }
+
+        async function doExport() {
+            if (st.busy || !st.data) return;
+            st.busy = true;
+            var btn = document.getElementById('guideExport');
+            if (btn) { btn.disabled = true; btn.textContent = '正在导出…'; }
+
+            try {
+                // ① 先存标注（后端会重算世界坐标）
+                var r1 = await fetch('/guide/regions', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        map: MAP_NAME,
+                        width: st.data.width,
+                        height: st.data.height,
+                        regions: st.regions,
+                        // ★ 传**全部**线条，包括自动描边（auto: true）。
+                        //   旧版这里是 filter(s => !s.auto)，把预描线排除掉了 ——
+                        //   结果导出的线稿里只剩手画的那几条，预描的墙全部消失。
+                        //   用户明确要求三样都要：①标签 ②人工描的线 ③预描的线。
+                        //   auto 标记会原样存进 JSON，后端靠它分深浅两色。
+                        strokes: st.strokes,
+                    }),
+                });
+                var d1 = await r1.json();
+                if (d1.status !== 'success') throw new Error(d1.message || '保存标注失败');
+
+                // ② 再导出 PNG（答辩/文档用）
+                var r2 = await fetch('/guide/export', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ map: MAP_NAME }),
+                });
+                var d2 = await r2.json();
+
+                addLog('引导完成：' + st.regions.length + ' 个区域已标注', 'success');
+                if (d2.status === 'success') {
+                    toast('已导出：' + d2.png, 'ok', 4200);
+                } else {
+                    toast('标注已保存，但图片导出失败', 'warn');
+                }
+                if (d1.warnings && d1.warnings.length) {
+                    addLog('标注提示: ' + d1.warnings.join('；'), 'warn');
+                }
+
+                finish();
+            } catch (e) {
+                toast('导出失败：' + e.message, 'err');
+                if (btn) { btn.disabled = false; btn.textContent = '导出并进入操控页'; }
+            } finally {
+                st.busy = false;
+            }
+        }
+
+        // ---------------- 收尾 / 跳过 ----------------
+        function finish() {
+            st.step = 0;
+            st.active = false;
+            hideBubble();
+            restoreHome();
+            // 把导出按钮恢复成未点击状态。
+            // 不复位的话，下次（比如从设置里重新引导）进来会看到
+            // 按钮停在「正在导出…」且是 disabled，像是卡死了。
+            var btn = document.getElementById('guideExport');
+            if (btn) {
+                btn.disabled = !st.data;
+                btn.textContent = '导出并进入操控页';
+            }
+            enterApp();
+        }
+
+        // 退出引导时把连接页恢复成原样，
+        // 否则下次（或重新引导重入时）标题还是不见了
+        function restoreHome() {
+            var home = document.getElementById('viewHome');
+            if (home) home.classList.remove('is-guide');
+            var mw = document.getElementById('widget-map');
+            if (mw) mw.classList.remove('is-guide-mode');
+        }
+
+        function skipAll() {
+            var ok = st.step === 1
+                ? confirm('跳过引导建图？下次进来还会提示。')
+                : confirm('跳过绘制？标注和导出都会丢失。');
+            if (!ok) return;
+            st.step = 0;
+            st.active = false;
+            hideBubble();
+            ['joystick', 'map'].forEach(function (k) {
+                try { closeWidget(k); } catch (e) { /* 忽略 */ }
+            });
+            restoreHome();
+            enterApp();
+        }
+
+        // ---------------- 开发者调试入口 ----------------
+        //
+        // 不连机器人、不要求有地图，直接跳到「手动绘制页」。
+        // 存在的意义：绘制工具的交互（锚点/橡皮/缩放/命名）
+        // 跟建图、跟机器人状态完全无关，但正常流程必须先连接 + 建图
+        // 才能走到这一步 —— 调一个线条描边要先把车开起来，太痛苦。
+        //
+        // 两个入口：
+        //   1. URL 加 ?guide=2（页面加载时自动进，适合反复刷新调试）
+        //   2. 设置菜单的「绘制调试（免连接）」
+        function startDrawDebug() {
+            hashBustCaches();
+            enterStep2(MAP_NAME);
+        }
+
+        // 调试时反复改样式，浏览器很容易拿缓存的 control.html/png。
+        // 这里只对本次会话做一次轻量提醒（不真的改 URL，避免刷新循环）。
+        function hashBustCaches() {
+            addLog('绘制调试模式：数据取自 ' + MAP_NAME + '，导出到 maps/guide_render/', 'info');
+        }
+
+        // ---------------- 连接后分流 ----------------
+        async function afterConnect() {            // ★ 调试直入：URL 带 guide=2 时直接跳到「手动绘制页」，
+            //   不连机器人、不要求有地图。开发调试绘制工具用。
+            var qs = new URLSearchParams(location.search);
+            if (qs.get('guide') === '2') {
+                addLog('调试模式：直接进入绘制页', 'info');
+                enterStep2(MAP_NAME);
+                return;
+            }
+
+            var needs = false;
+            try {
+                var res = await fetch('/guide/status');
+                var d = await res.json();
+                needs = !!d.needs_guide;
+                addLog('引导判断: ' + (d.reason || ''), 'info');
+            } catch (e) {
+                // 判断失败就按「不需要引导」走，不能让一个附加功能
+                // 把主流程卡死
+                needs = false;
+            }
+
+            if (needs) enterStep1();
+            else enterApp();
+        }
+
+        // ---------------- 初始化 ----------------
+        function init() {
+            canvas = document.getElementById('guideCanvas');
+
+            // ① 把浮层提到 body 级
+            //    #widget-layer 原本在 #viewApp 内部，而 viewApp 在连接页是
+            //    is-gone（opacity:0 + visibility:hidden），子元素全部不可见。
+            //    引导步骤 1 停在连接页却要弹遥控/建图组件，所以必须提出来。
+            //    顺带一个好处：widget 的 getBoundingClientRect 不再受
+            //    #viewApp 的 scale(0.985) 影响，摇杆几何算得更准。
+            var layer = document.getElementById('widget-layer');
+            if (layer && layer.parentElement !== document.body) {
+                document.body.appendChild(layer);
+            }
+
+            // ② 工具按钮
+            document.querySelectorAll('[data-guide-tool]').forEach(function (b) {
+                b.addEventListener('click', function () {
+                    setTool(b.getAttribute('data-guide-tool'));
+                });
+            });
+            var byId = function (id, fn) {
+                var el = document.getElementById(id);
+                if (el) el.addEventListener('click', fn);
+            };
+            byId('guideToolUndo', undo);
+            byId('guideToolClear', clearAll);
+            byId('guideToolTrace', retrace);
+            byId('guideToolZoom', cycleZoom);
+            byId('guideExport', doExport);
+            byId('guideSkip2', skipAll);
+
+            // 双击画布 = 重置到适应窗口（放得太大找不到北时的快捷出口）
+            if (canvas) {
+                canvas.addEventListener('dblclick', function (e) {
+                    e.preventDefault();
+                    resetZoom();
+                });
+            }
+
+            // ③ 画布指针事件
+            //    用 pointer 事件而不是 touch+mouse 两套：iOS Safari 13+
+            //    都支持，一份代码同时覆盖手和鼠标。
+            if (canvas) {
+                canvas.addEventListener('pointerdown', onDown);
+                canvas.addEventListener('pointermove', onMove);
+                canvas.addEventListener('pointerup', onUp);
+                canvas.addEventListener('pointercancel', onUp);
+                // 指针在画布外抬起时也要收尾，否则 drag 不会清空，
+                // 下次进画布会从上次的位置连一条线出来。
+                window.addEventListener('pointerup', function (e) {
+                    if (st.drag && e.target !== canvas) onUp(e);
+                });
+
+                // ---- 桌面：滚轮缩放 ----
+                // passive:false 必须写，否则 preventDefault() 无效，
+                // 页面会跟着一起滚，滚轮缩放完全不可用。
+                canvas.addEventListener('wheel', function (e) {
+                    if (!st.data) return;
+                    e.preventDefault();
+
+                    // 触控板双指滑动也会走 wheel（且带控制位），
+                    // ctrlKey=true 时步长更小，手感更接近原生。
+                    var step = e.ctrlKey ? 0.012 : 0.0022;
+                    var factor = Math.exp(-e.deltaY * step * 60);
+                    // 单次滚轮不要跳太多，夹到 0.5~2 之间
+                    factor = Math.min(2, Math.max(0.5, factor));
+                    setZoomAt(st.zoom * factor, e.clientX, e.clientY);
+                }, { passive: false });
+            }
+
+            // ④ 命名弹窗
+            byId('guideDialogCancel', closeDialog);
+            byId('guideDialogOk', function () { confirmDialog(); });
+            var inp = document.getElementById('guideDialogInput');
+            if (inp) {
+                inp.addEventListener('keydown', function (e) {
+                    if (e.key === 'Enter') { e.preventDefault(); confirmDialog(); }
+                    else if (e.key === 'Escape') { closeDialog(); }
+                });
+            }
+
+            // Esc 取消锚点锁定（桌面上最自然的退出方式），
+            // 触屏用户则直接切回「拖动」工具或者再点一次同一个锚点。
+            document.addEventListener('keydown', function (e) {
+                if (e.key === 'Escape' && st.anchor.start) {
+                    cancelAnchor();
+                    toast('已取消锚点锁定', 'ok', 1200);
+                }
+            });
+            document.querySelectorAll('.guide-quick-name').forEach(function (b) {
+                b.addEventListener('click', function () {
+                    confirmDialog(b.getAttribute('data-name'));
+                });
+            });
+
+            // ⑤ 尺寸变化时重排（手机横竖屏切换）
+            var rzTimer = null;
+            window.addEventListener('resize', function () {
+                if (st.step !== 2 || !st.data) return;
+                clearTimeout(rzTimer);
+                rzTimer = setTimeout(layoutCanvas, 180);
+            });
+
+            setTool('pan');
+        }
+
+        return {
+            init: init,
+            afterConnect: afterConnect,
+            enterStep1: enterStep1,
+            enterStep2: enterStep2,
+            isAwaitingMap: function () { return st.active && st.step === 1; },
+            skip: skipAll,
+            startDrawDebug: startDrawDebug,
+        };
+    })();
+
     window.onload = init;
 </script>
 </body>

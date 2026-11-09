@@ -30,6 +30,69 @@ LOCATION_MAP = {
 
 
 # ============================================================
+# 引导页区域标签 → 地图坐标
+# ============================================================
+def _lookup_region(location):
+    """在当前地图的区域标签里找同名区域，返回 (x, y) 或 None。
+
+    这是「初次建图引导」和「AI 语义导航」之间的桥：用户在引导页框出
+    「客厅」并起名后，说「去客厅」就能直接导航过去，**AI 侧不用改任何
+    prompt** —— 命名地点本来就是自然语言，模型本来就是这么理解的。
+
+    数据来源：maps/<map>_regions.json，由 web_controller 的
+    /guide/regions 写入，坐标已在后端算好（像素 → 世界坐标）。
+
+    ★ 为什么这个比 LOCATION_MAP 优先：
+      LOCATION_MAP 指向 patrol_config.yaml 的 target_points，而那些
+      坐标是**相对某一张具体地图**的。用户重新建图后原点/分辨率
+      都可能变，旧坐标全部失效，导过去就是撞墙。
+      而区域标签是基于**当前这张地图**画的，一定对得上。
+
+    ★ 为什么延迟 import：
+      web_controller 在启动时 import 了 tools 包（ALL_TOOLS），
+      如果在模块顶层 import web_controller 会形成循环导入。
+      butler_tools.py 也是同样的处理方式。
+    """
+    if not location:
+        return None
+    try:
+        from autopatrol_robot import guide_map as gm
+        from autopatrol_robot import web_controller as wc
+    except Exception:                     # noqa: BLE001
+        return None
+
+    try:
+        mdir = wc._maps_dir(wc.WORKSPACE_DIR)
+        data, _err = gm.load_regions(mdir, wc.DEFAULT_MAP_NAME)
+    except Exception:                     # noqa: BLE001
+        return None
+
+    target = str(location).strip()
+    for item in data.get('regions', []):
+        if str(item.get('name', '')).strip() != target:
+            continue
+        world = item.get('world') or {}
+        try:
+            return float(world['x']), float(world['y'])
+        except (KeyError, TypeError, ValueError):
+            return None
+    return None
+
+
+def _region_names():
+    """列出当前地图上所有区域名（给失败提示用）。"""
+    try:
+        from autopatrol_robot import guide_map as gm
+        from autopatrol_robot import web_controller as wc
+        mdir = wc._maps_dir(wc.WORKSPACE_DIR)
+        data, _err = gm.load_regions(mdir, wc.DEFAULT_MAP_NAME)
+        return [str(r.get('name')) for r in data.get('regions', [])
+                if r.get('name')]
+    except Exception:                     # noqa: BLE001
+        return []
+
+
+# ============================================================
 # 参数模型
 # ============================================================
 class NavToPoseInput(BaseModel):
@@ -83,14 +146,29 @@ def _navigate_to(index: int, name: str) -> str:
 
 @tool(args_schema=NavigateToLocationInput)
 def navigate_to_location(location: str) -> str:
-    """导航到命名地点（预定义：起点/厨房/客厅/影音房）。
+    """导航到命名地点。
 
-    当用户说"去厨房"、"去客厅"时使用此工具。
+    当用户说"去厨房"、"去客厅"、"去书房"时使用此工具。
     **只去，不自动回起点。**
+
+    地点来源按优先级：
+      1. 用户在引导页画并命名的区域（任意名字，基于当前地图，最可靠）
+      2. 预定义地点（起点/厨房/客厅/影音房）
     """
+    # ① 先查引导页画的区域标签 —— 基于当前地图，坐标一定有效
+    region = _lookup_region(location)
+    if region is not None:
+        x, y = region
+        return launch_navigate_xy(x, y, 0.0)
+
+    # ② 再查硬编码的预定义地点
     index = LOCATION_MAP.get(location)
     if index is None:
-        return f"❌ 未找到预定义地点: {location}。可用地点：{', '.join(LOCATION_MAP.keys())}"
+        names = _region_names()
+        hint = ("、".join(names[:8]) if names else "暂无（可在引导页框选区域并命名）")
+        return (f"❌ 未找到地点: {location}。\n"
+                f"已标注区域：{hint}\n"
+                f"预定义地点：{', '.join(LOCATION_MAP.keys())}")
     return _navigate_to(index, location)
 
 
